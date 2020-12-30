@@ -29,13 +29,15 @@ GLZAencode encodes the grammar using a variation of the Grammatical Ziv-Lempel f
 GLZAdecode decodes the data.
 
 Usage:
-   GLZA c|d [-c#] [-d#] [-l#] [-m#] [-p#] [-r#] [-t#] [-v#] [-w0] [-x] [-C#] [-D#] <infilename> <outfilename>
+   GLZA c|d [-c#] [-d0] [-l0] [-m#] [-p#] [-r#] [-t#] [-v#] [-w0] [-x] [-C#] [-D#] <infilename> <outfilename>
      where
        -c# sets the production cost (default is to estimate it)
        -d0 disables delta transformation
        -l0 disables capital letter lock transformation
        -m0 disables "selective" MTF dictionary coding
        -m1 forces "selective" MTF dictionary encoding
+       -o# sets the dedupication candidate score order model.  0.0 is order 0 based, 1.0 is order 1 trailing
+           character/leading character based.  Intermediate values are a blend.
        -p# sets the score profit ratio weighting power, where the profit ratio is the profit per substitution divided
            by the order 0 entropy of the string.  The score (estimated profit from creating the rule) is multiplied
            by the profit ratio to the (p) power.  Default is 2.0 for capital encoded or UTF8 compliant files, 0.0 for
@@ -48,7 +50,7 @@ Usage:
        -v1 prints the dictionary to stdout, most frequent first
        -v2 prints the dicitonary to stdout, simple symbols followed by complex symbols in the order they were created
        -w0 disables the first cycle word only search
-       -f  enables extreme compression mode
+       -x  enables extreme compression mode
        -C0 disables capital letter transformation
        -C1 forces text processing and capital encoding
        -D# sets an upper limit for the number of grammar rules created

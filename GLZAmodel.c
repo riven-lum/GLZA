@@ -17,47 +17,116 @@ limitations under the License.
 ***********************************************************************/
 
 #include <inttypes.h>
-#include <math.h>
 #include "GLZAmodel.h"
 
 uint32_t InCharNum, OutCharNum, RangeLow, RangeHigh, count, code, low, range;
-uint16_t last_queue_size, last_queue_size_cap, unused_queue_freq, unused_queue_freq_cap;
+uint16_t last_queue_size, last_queue_size_az, last_queue_size_space, last_queue_size_other;
+uint16_t rescale_queue_size, rescale_queue_size_az, rescale_queue_size_space, rescale_queue_size_other;
+uint16_t unused_queue_freq, unused_queue_freq_az, unused_queue_freq_space, unused_queue_freq_other;
 uint16_t RangeScaleSID[2], FreqSID[2][16], RangeScaleINST[2][16], FreqINST[2][16][38];
 uint16_t RangeScaleFirstCharSection[0x100][7], FreqFirstCharBinary[0x100][0x100];
-uint16_t RangeScaleFirstChar[4][0x100], FreqFirstChar[4][0x100][0x100];
-uint16_t RangeScaleMtfPos[2], FreqMtfPos[2][0x100], FreqSymType[4][3];
-uint8_t SymbolFirstChar[4][0x100][0x100], RangeScaleERG[17], FreqERG[17], RangeScaleGoMtf[40][3], FreqGoMtf[40][3];
-uint8_t RangeScaleWordTag, FreqWordTag, MaxBaseCode, MaxInstCode, *InBuffer, *OutBuffer;
+uint16_t RangeScaleFirstChar[4][0x100], FreqFirstChar[4][0x100][0x100], FreqWordTag[0x100], FreqERG[341], FreqGoMtf[0x5A0];
+uint16_t RangeScaleMtfPos[4], FreqMtfPos[4][0x100], FreqSymTypePriorType[0x34][2], FreqSymTypePriorEnd[0x100][2];
+uint16_t FreqMtfFirst[2][3];
+uint8_t SymbolFirstChar[4][0x100][0x100];
+uint8_t MaxBaseCode, MaxInstCode, *InBuffer, *OutBuffer;
 
 uint32_t ReadLow() {return(low);}
 uint32_t ReadRange() {return(range);}
 
-void StartModelSymType(uint8_t use_mtf) {
-  uint8_t i = 3;
-  do {
-    if (use_mtf != 0) {
-      FreqSymType[i][0] = 0x1C00;
-      FreqSymType[i][1] = 0x2000;
-      FreqSymType[i][2] = 0x400;
+
+void StartModelSymType(uint8_t use_mtf, uint8_t cap_encoded) {
+  if (cap_encoded == 0) {
+    uint8_t i = 1;
+    do {
+      if (use_mtf != 0) {
+        FreqSymTypePriorType[i][0] = 0x1C00;
+        FreqSymTypePriorType[i][1] = 0x2000;
       }
-    else {
-      FreqSymType[i][0] = 0x2000;
-      FreqSymType[i][1] = 0x2000;
-      FreqSymType[i][2] = 0;
-    }
-  } while (i-- != 0);
+      else {
+        FreqSymTypePriorType[i][0] = 0x2000;
+        FreqSymTypePriorType[i][1] = 0x2000;
+      }
+    } while (i-- != 0);
+  }
+  else {
+    uint8_t i = 0x33;
+    do {
+      if (use_mtf != 0) {
+        FreqSymTypePriorType[i][0] = 0xE00;
+        FreqSymTypePriorType[i][1] = 0x1000;
+      }
+      else {
+        FreqSymTypePriorType[i][0] = 0x1000;
+        FreqSymTypePriorType[i][1] = 0x1000;
+      }
+    } while (i-- != 0x2C);
+    do {
+      if (use_mtf != 0) {
+        FreqSymTypePriorType[i][0] = 0x1500;
+        FreqSymTypePriorType[i][1] = 0x1800;
+      }
+      else {
+        FreqSymTypePriorType[i][0] = 0x1800;
+        FreqSymTypePriorType[i][1] = 0x1800;
+      }
+    } while (i-- != 4);
+    do {
+      if (use_mtf != 0) {
+        FreqSymTypePriorType[i][0] = 0xE00;
+        FreqSymTypePriorType[i][1] = 0x1000;
+      }
+      else {
+        FreqSymTypePriorType[i][0] = 0x1000;
+        FreqSymTypePriorType[i][1] = 0x1000;
+      }
+    } while (i-- != 2);
+    do {
+      if (use_mtf != 0) {
+        FreqSymTypePriorType[i][0] = 0x1500;
+        FreqSymTypePriorType[i][1] = 0x1800;
+      }
+      else {
+        FreqSymTypePriorType[i][0] = 0x1800;
+        FreqSymTypePriorType[i][1] = 0x1800;
+      }
+    } while (i-- != 0);
+    i = 0xFF;
+    do {
+      if (use_mtf != 0) {
+        FreqSymTypePriorEnd[i][0] = 0xE00;
+        FreqSymTypePriorEnd[i][1] = 0x1000;
+      }
+      else {
+        FreqSymTypePriorEnd[i][0] = 0x1000;
+        FreqSymTypePriorEnd[i][1] = 0x1000;
+      }
+    } while (i-- != 0);
+  }
   return;
 }
 
+void StartModelMtfFirst() {
+    FreqMtfFirst[0][0] = 0x900;
+    FreqMtfFirst[0][1] = 0x500;
+    FreqMtfFirst[0][2] = 0x200;
+    FreqMtfFirst[1][0] = 0x100;
+    FreqMtfFirst[1][1] = 0xE00;
+    FreqMtfFirst[1][2] = 0x100;
+}
+
 void StartModelMtfQueuePos(uint8_t max_code_length) {
-  RangeScaleMtfPos[0] = RangeScaleMtfPos[1] = 0;
+  RangeScaleMtfPos[0] = 0;
   uint16_t j = 0;
   do {
-    FreqMtfPos[0][j] = FreqMtfPos[1][j] = 0x200 / (j + 2);
-    RangeScaleMtfPos[0] = RangeScaleMtfPos[1] += FreqMtfPos[0][j];
+    FreqMtfPos[0][j] = FreqMtfPos[1][j] = FreqMtfPos[2][j] = FreqMtfPos[3][j] = 0x200 / (j + 2);
+    RangeScaleMtfPos[0] += FreqMtfPos[0][j];
   } while (++j != 0x100);
-  last_queue_size = last_queue_size_cap = 0;
-  unused_queue_freq_cap = unused_queue_freq = RangeScaleMtfPos[0];
+  RangeScaleMtfPos[1] = RangeScaleMtfPos[2] = RangeScaleMtfPos[3] = RangeScaleMtfPos[0];
+  unused_queue_freq = unused_queue_freq_az = unused_queue_freq_space = unused_queue_freq_other = RangeScaleMtfPos[0];
+  last_queue_size = last_queue_size_az = last_queue_size_space = last_queue_size_other = 0;
+  rescale_queue_size = rescale_queue_size_az = rescale_queue_size_space = rescale_queue_size_other = 0;
+
   return;
 }
 
@@ -67,8 +136,19 @@ void StartModelSID() {
     uint8_t j = 15;
     do {
       FreqSID[i][j] = 1;
+    } while (j-- != 8);
+    do {
+      FreqSID[i][j] = 2;
+    } while (j-- != 4);
+    FreqSID[i][3] = 4;
+    FreqSID[i][2] = 6;
+    FreqSID[i][1] = 8;
+    FreqSID[i][0] = 4;
+    RangeScaleSID[i] = 0;
+    j = 15;
+    do {
+      RangeScaleSID[i] += FreqSID[i][j];
     } while (j-- != 0);
-    RangeScaleSID[i] = 16;
   } while (i-- != 0);
   return;
 }
@@ -91,29 +171,30 @@ void StartModelINST(uint8_t num_inst_codes) {
 }
 
 void StartModelERG() {
-  uint8_t i = 16;
+  uint16_t i = 340;
   do {
-    FreqERG[i] = 1;
-    RangeScaleERG[i] = 2;
-  } while (i-- != 0);
+    FreqERG[i] = 0x600;
+  } while (i-- != 240);
+  do {
+    FreqERG[i] = 0x800;
+  } while (i-- != 1);
+  FreqERG[i] = 0x200;
   return;
 }
 
 void StartModelGoQueue() {
-  uint8_t i = 39;
+  uint16_t i = 0x59F;
   do {
-    uint8_t j = 2;
-    do {
-      FreqGoMtf[i][j] = 1;
-      RangeScaleGoMtf[i][j] = 2;
-    } while (j-- != 0);
+    FreqGoMtf[i] = 0x555;
   } while (i-- != 0);
   return;
 }
 
 void StartModelWordTag() {
-  FreqWordTag = 1;
-  RangeScaleWordTag = 2;
+  uint8_t i = 0xFF;
+  do {
+    FreqWordTag[i] = 0x800;
+  } while (i-- != 0);
   return;
 }
 
@@ -163,14 +244,28 @@ void rescaleMtfQueuePos(uint8_t Context) {
   } while (++i != 0);
   uint8_t qp = 0xFF;
   if (Context == 0) {
+    rescale_queue_size = last_queue_size;
     unused_queue_freq = 0;
     while (qp >= last_queue_size)
       unused_queue_freq += FreqMtfPos[0][qp--];
   }
+  else if (Context == 1) {
+    rescale_queue_size_az = last_queue_size_az;
+    unused_queue_freq_az = 0;
+    while (qp >= last_queue_size_az)
+      unused_queue_freq_az += FreqMtfPos[1][qp--];
+  }
+  else if (Context == 2) {
+    rescale_queue_size_space = last_queue_size_space;
+    unused_queue_freq_space = 0;
+    while (qp >= last_queue_size_space)
+      unused_queue_freq_space += FreqMtfPos[2][qp--];
+  }
   else {
-    unused_queue_freq_cap = 0;
-    while (qp >= last_queue_size_cap)
-      unused_queue_freq_cap += FreqMtfPos[1][qp--];
+    rescale_queue_size_other = last_queue_size_other;
+    unused_queue_freq_other = 0;
+    while (qp >= last_queue_size_other)
+      unused_queue_freq_other += FreqMtfPos[3][qp--];
   }
   return;
 }
@@ -436,115 +531,429 @@ void NormalizeEncoder(uint32_t bot) {
   return;
 }
 
-void EncodeDictType(uint8_t Context) {
-  NormalizeEncoder(FREQ_SYM_TYPE_BOT);
-  uint32_t extra_range = range & (FREQ_SYM_TYPE_BOT - 1);
-  range = FreqSymType[Context][0] * (range >> 14) + extra_range;
-  uint16_t sum = FreqSymType[Context][1] >> 6;
-  FreqSymType[Context][0] += sum + ((FREQ_SYM_TYPE_BOT - FreqSymType[Context][0] - FreqSymType[Context][1]) >> 6);
-  FreqSymType[Context][1] -= sum;
+void EncodeDictType1(uint8_t Context1) {
+  NormalizeEncoder(FREQ_SYM_TYPE_BOT1);
+  uint32_t extra_range = range & (FREQ_SYM_TYPE_BOT1 - 1);
+  range = FreqSymTypePriorType[Context1][0] * (range >> 14) + extra_range;
+  uint16_t sum = FreqSymTypePriorType[Context1][1] >> 6;
+  FreqSymTypePriorType[Context1][0]
+      += sum + ((FREQ_SYM_TYPE_BOT1 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 6);
+  FreqSymTypePriorType[Context1][1] -= sum;
   return;
 }
 
-void EncodeNewType(uint8_t Context) {
-  NormalizeEncoder(FREQ_SYM_TYPE_BOT);
-  uint32_t extra_range = range & (FREQ_SYM_TYPE_BOT - 1);
-  low += FreqSymType[Context][0] * (range >>= 14) + extra_range;
-  range *= FreqSymType[Context][1];
-  uint16_t sum = FreqSymType[Context][0] >> 6;
-  FreqSymType[Context][1] += sum + ((FREQ_SYM_TYPE_BOT - FreqSymType[Context][0] - FreqSymType[Context][1]) >> 6);
-  FreqSymType[Context][0] -= sum;
+void EncodeDictType2(uint8_t Context1, uint8_t Context2) {
+  NormalizeEncoder(2 * FREQ_SYM_TYPE_BOT2);
+  uint32_t extra_range = range & (2 * FREQ_SYM_TYPE_BOT2 - 1);
+  range = (FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context2][0]) * (range >> 14) + extra_range;
+  uint16_t sum = FreqSymTypePriorType[Context1][1] >> 4;
+  FreqSymTypePriorType[Context1][0]
+      += sum + ((FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 4);
+  FreqSymTypePriorType[Context1][1] -= sum;
+  sum = FreqSymTypePriorType[Context2][1] >> 7;
+  FreqSymTypePriorType[Context2][0]
+      += sum + ((FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context2][0] - FreqSymTypePriorType[Context2][1]) >> 7);
+  FreqSymTypePriorType[Context2][1] -= sum;
   return;
 }
 
-void EncodeMtfType(uint8_t Context) {
-  NormalizeEncoder(FREQ_SYM_TYPE_BOT);
-  uint32_t extra_range = range & (FREQ_SYM_TYPE_BOT - 1);
-  uint16_t sum = FreqSymType[Context][0] + FreqSymType[Context][1];
+void EncodeDictType3(uint8_t Context1, uint8_t Context2, uint8_t Context3) {
+  NormalizeEncoder(8 * FREQ_SYM_TYPE_BOT3);
+  uint32_t extra_range = range & (8 * FREQ_SYM_TYPE_BOT3 - 1);
+  range = (FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context2][0] + FreqSymTypePriorEnd[Context3][0])
+      * (range >> 15) + extra_range;
+  uint16_t sum = FreqSymTypePriorType[Context1][1] >> 4;
+  FreqSymTypePriorType[Context1][0]
+      += sum + ((3 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 4);
+  FreqSymTypePriorType[Context1][1] -= sum;
+  sum = FreqSymTypePriorType[Context2][1] >> 7;
+  FreqSymTypePriorType[Context2][0]
+      += sum + ((3 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorType[Context2][0] - FreqSymTypePriorType[Context2][1]) >> 7);
+  FreqSymTypePriorType[Context2][1] -= sum;
+  sum = FreqSymTypePriorEnd[Context3][1] >> 3;
+  FreqSymTypePriorEnd[Context3][0]
+      += sum + ((2 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorEnd[Context3][0] - FreqSymTypePriorEnd[Context3][1]) >> 3);
+  FreqSymTypePriorEnd[Context3][1] -= sum;
+  return;
+}
+
+void EncodeNewType1(uint8_t Context1) {
+  NormalizeEncoder(FREQ_SYM_TYPE_BOT1);
+  uint32_t extra_range = range & (FREQ_SYM_TYPE_BOT1 - 1);
+  low += FreqSymTypePriorType[Context1][0] * (range >>= 14) + extra_range;
+  range *= FreqSymTypePriorType[Context1][1];
+  uint16_t sum = FreqSymTypePriorType[Context1][0] >> 6;
+  FreqSymTypePriorType[Context1][1]
+      += sum + ((FREQ_SYM_TYPE_BOT1 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 6);
+  FreqSymTypePriorType[Context1][0] -= sum;
+  return;
+}
+
+void EncodeNewType2(uint8_t Context1, uint8_t Context2) {
+  NormalizeEncoder(2 * FREQ_SYM_TYPE_BOT2);
+  uint32_t extra_range = range & (2 * FREQ_SYM_TYPE_BOT2 - 1);
+  low += (FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context2][0]) * (range >>= 14) + extra_range;
+  range *= (FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1]);
+  uint16_t sum = FreqSymTypePriorType[Context1][0] >> 4;
+  FreqSymTypePriorType[Context1][1]
+      += sum + ((FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 4);
+  FreqSymTypePriorType[Context1][0] -= sum;
+  sum = FreqSymTypePriorType[Context2][0] >> 7;
+  FreqSymTypePriorType[Context2][1]
+      += sum + ((FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context2][0] - FreqSymTypePriorType[Context2][1]) >> 7);
+  FreqSymTypePriorType[Context2][0] -= sum;
+  return;
+}
+
+void EncodeNewType3(uint8_t Context1, uint8_t Context2, uint8_t Context3) {
+  NormalizeEncoder(8 * FREQ_SYM_TYPE_BOT3);
+  uint32_t extra_range = range & (8 * FREQ_SYM_TYPE_BOT3 - 1);
+  low += (FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context2][0] + FreqSymTypePriorEnd[Context3][0])
+      * (range >>= 15) + extra_range;
+  range *= FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1] + FreqSymTypePriorEnd[Context3][1];
+  uint16_t sum = FreqSymTypePriorType[Context1][0] >> 4;
+  FreqSymTypePriorType[Context1][1]
+      += sum + ((3 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 4);
+  FreqSymTypePriorType[Context1][0] -= sum;
+  sum = FreqSymTypePriorType[Context2][0] >> 7;
+  FreqSymTypePriorType[Context2][1]
+      += sum + ((3 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorType[Context2][0] - FreqSymTypePriorType[Context2][1]) >> 7);
+  FreqSymTypePriorType[Context2][0] -= sum;
+  sum = FreqSymTypePriorEnd[Context3][0] >> 3;
+  FreqSymTypePriorEnd[Context3][1]
+      += sum + ((2 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorEnd[Context3][0] - FreqSymTypePriorEnd[Context3][1]) >> 3);
+  FreqSymTypePriorEnd[Context3][0] -= sum;
+  return;
+}
+
+void EncodeMtfType1(uint8_t Context1) {
+  NormalizeEncoder(FREQ_SYM_TYPE_BOT1);
+  uint32_t extra_range = range & (FREQ_SYM_TYPE_BOT1 - 1);
+  uint16_t sum = FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context1][1];
   low += sum * (range >>= 14) + extra_range;
-  range *= FREQ_SYM_TYPE_BOT - sum;
-  FreqSymType[Context][0] -= FreqSymType[Context][0] >> 6;
-  FreqSymType[Context][1] -= FreqSymType[Context][1] >> 6;
+  range *= FREQ_SYM_TYPE_BOT1 - sum;
+  FreqSymTypePriorType[Context1][0] -= FreqSymTypePriorType[Context1][0] >> 6;
+  FreqSymTypePriorType[Context1][1] -= FreqSymTypePriorType[Context1][1] >> 6;
   return;
 }
 
-void EncodeMtfPos(uint8_t Context, uint8_t position, uint16_t QueueSize) {
+void EncodeMtfType2(uint8_t Context1, uint8_t Context2) {
+  NormalizeEncoder(2 * FREQ_SYM_TYPE_BOT2);
+  uint32_t extra_range = range & (2 * FREQ_SYM_TYPE_BOT2 - 1);
+  uint16_t sum = FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context2][0]
+      + FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1];
+  low += sum * (range >>= 14) + extra_range;
+  range *= 2 * FREQ_SYM_TYPE_BOT2 - sum;
+  FreqSymTypePriorType[Context1][0] -= FreqSymTypePriorType[Context1][0] >> 4;
+  FreqSymTypePriorType[Context1][1] -= FreqSymTypePriorType[Context1][1] >> 4;
+  FreqSymTypePriorType[Context2][0] -= FreqSymTypePriorType[Context2][0] >> 7;
+  FreqSymTypePriorType[Context2][1] -= FreqSymTypePriorType[Context2][1] >> 7;
+  return;
+}
+
+void EncodeMtfType3(uint8_t Context1, uint8_t Context2, uint8_t Context3) {
+  NormalizeEncoder(8 * FREQ_SYM_TYPE_BOT3);
+  uint32_t extra_range = range & (8 * FREQ_SYM_TYPE_BOT3 - 1);  // JUST ADD "extra_range" to low!!!
+  uint32_t sum = FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context1][1]
+      + FreqSymTypePriorType[Context2][0] + FreqSymTypePriorType[Context2][1]
+      + FreqSymTypePriorEnd[Context3][0] + FreqSymTypePriorEnd[Context3][1];
+  low += sum * (range >>= 15) + extra_range;
+  range *= 8 * FREQ_SYM_TYPE_BOT3 - sum;
+  FreqSymTypePriorType[Context1][0] -= FreqSymTypePriorType[Context1][0] >> 4;
+  FreqSymTypePriorType[Context1][1] -= FreqSymTypePriorType[Context1][1] >> 4;
+  FreqSymTypePriorType[Context2][0] -= FreqSymTypePriorType[Context2][0] >> 7;
+  FreqSymTypePriorType[Context2][1] -= FreqSymTypePriorType[Context2][1] >> 7;
+  FreqSymTypePriorEnd[Context3][0] -= FreqSymTypePriorEnd[Context3][0] >> 3;
+  FreqSymTypePriorEnd[Context3][1] -= FreqSymTypePriorEnd[Context3][1] >> 3;
+  return;
+}
+
+void EncodeMtfFirst(uint8_t Context, uint8_t First) {
+  uint32_t delta;
+  NormalizeEncoder(0x1000);
+  uint32_t extra_range = range & 0xFFF;
+  if (First == 0) {
+    range = FreqMtfFirst[Context][0] * (range >> 12) + extra_range;
+    delta = FreqMtfFirst[Context][1] >> 7;
+    FreqMtfFirst[Context][1] -= delta;
+    FreqMtfFirst[Context][0] += delta;
+    delta = FreqMtfFirst[Context][2] >> 7;
+    FreqMtfFirst[Context][2] -= delta;
+    FreqMtfFirst[Context][0] += delta;
+  }
+  else if (First == 1) {
+    low += FreqMtfFirst[Context][0] * (range >>= 12) + extra_range;
+    range *= FreqMtfFirst[Context][1];
+    delta = FreqMtfFirst[Context][0] >> 7;
+    FreqMtfFirst[Context][0] -= delta;
+    FreqMtfFirst[Context][1] += delta;
+    delta = FreqMtfFirst[Context][2] >> 7;
+    FreqMtfFirst[Context][2] -= delta;
+    FreqMtfFirst[Context][1] += delta;
+  }
+  else {
+    low += (FreqMtfFirst[Context][0] + FreqMtfFirst[Context][1]) * (range >>= 12) + extra_range;
+    range *= FreqMtfFirst[Context][2];
+    delta = FreqMtfFirst[Context][0] >> 7;
+    FreqMtfFirst[Context][0] -= delta;
+    FreqMtfFirst[Context][2] += delta;
+    delta = FreqMtfFirst[Context][1] >> 7;
+    FreqMtfFirst[Context][1] -= delta;
+    FreqMtfFirst[Context][2] += delta;
+  }
+}
+
+void EncodeMtfPos(uint8_t position, uint16_t QueueSize) {
   NormalizeEncoder(FREQ_MTF_POS_BOT);
-  if (Context == 0) {
-    if (last_queue_size > QueueSize) {
-      do {
-        unused_queue_freq += FreqMtfPos[0][--last_queue_size];
-      } while (last_queue_size != QueueSize);
-    }
-    else if (last_queue_size < QueueSize) {
-      do {
-        unused_queue_freq -= FreqMtfPos[0][last_queue_size++];
-      } while (last_queue_size != QueueSize);
-    }
+  if (last_queue_size > QueueSize) {
+    do {
+      unused_queue_freq += FreqMtfPos[0][--last_queue_size];
+    } while (last_queue_size != QueueSize);
   }
-  else {
-    if (last_queue_size_cap > QueueSize) {
-      do {
-        unused_queue_freq_cap += FreqMtfPos[1][--last_queue_size_cap];
-      } while (last_queue_size_cap != QueueSize);
-    }
-    else if (last_queue_size_cap < QueueSize) {
-      do {
-        unused_queue_freq_cap -= FreqMtfPos[1][last_queue_size_cap++];
-      } while (last_queue_size_cap != QueueSize);
-    }
+  else if (last_queue_size < QueueSize) {
+    do {
+      unused_queue_freq -= FreqMtfPos[0][last_queue_size++];
+      if (last_queue_size > rescale_queue_size) {
+        rescale_queue_size++;
+        FreqMtfPos[0][last_queue_size - 1] += 8;
+        RangeScaleMtfPos[0] += 8;
+      }
+      else {
+        FreqMtfPos[0][last_queue_size - 1] += 2;
+        RangeScaleMtfPos[0] += 2;
+      }
+    } while (last_queue_size != QueueSize);
   }
+  if (RangeScaleMtfPos[0] > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(0);
   if (position == 0) {
-    if (Context == 0)
-      range = FreqMtfPos[0][0] * (range / (RangeScaleMtfPos[0] - unused_queue_freq));
-    else
-      range = FreqMtfPos[1][0] * (range / (RangeScaleMtfPos[1] - unused_queue_freq_cap));
-    FreqMtfPos[Context][0] += UP_FREQ_MTF_POS;
+    range = FreqMtfPos[0][0] * (range / (RangeScaleMtfPos[0] - unused_queue_freq));
+    FreqMtfPos[0][0] += UP_FREQ_MTF_POS;
   }
   else {
-    uint16_t * FreqPtr = &FreqMtfPos[Context][0];
-    uint16_t * StopFreqPtr = &FreqMtfPos[Context][position];
+    uint16_t * FreqPtr = &FreqMtfPos[0][0];
+    uint16_t * StopFreqPtr = &FreqMtfPos[0][position];
     RangeLow = *FreqPtr++;
     while (FreqPtr != StopFreqPtr)
       RangeLow += *FreqPtr++;
-    if (Context == 0)
-      low += RangeLow * (range /= (RangeScaleMtfPos[0] - unused_queue_freq));
-    else
-      low += RangeLow * (range /= (RangeScaleMtfPos[1] - unused_queue_freq_cap));
+    low += RangeLow * (range /= (RangeScaleMtfPos[0] - unused_queue_freq));
     range *= *FreqPtr;
+
     if (position >= 4) {
       if (position == 4) {
-        *FreqPtr += UP_FREQ_MTF_POS - 2;
-        *(FreqPtr + 1) += 2;
-        if (position + 1 == QueueSize) {
-          if (Context == 0)
-            unused_queue_freq += 2;
-          else 
-            unused_queue_freq_cap += 2;
-        }
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+        *(FreqPtr + 1) += 1;
+        if (position + 1 == QueueSize)
+          unused_queue_freq += 1;
       }
       else if (position == 255) {
-        *(FreqPtr - 1) += 2;
-        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
       }
       else {
-        *(FreqPtr - 1) += 2;
-        *FreqPtr += UP_FREQ_MTF_POS - 4;
-        *(FreqPtr + 1) += 2;
-        if (position + 1 == QueueSize) {
-          if (Context == 0)
-            unused_queue_freq += 2;
-          else 
-            unused_queue_freq_cap += 2;
-        }
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr + 1) += 1;
+        if (position + 1 == QueueSize)
+          unused_queue_freq += 1;
       }
     }
     else
       *FreqPtr += UP_FREQ_MTF_POS;
   }
-  if ((RangeScaleMtfPos[Context] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
-    rescaleMtfQueuePos(Context);
+  if ((RangeScaleMtfPos[0] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(0);
   return;
+}
+
+
+void EncodeMtfPosAz(uint8_t position, uint16_t QueueSize) {
+  NormalizeEncoder(FREQ_MTF_POS_BOT);
+  if (last_queue_size_az > QueueSize) {
+    do {
+      unused_queue_freq_az += FreqMtfPos[1][--last_queue_size_az];
+    } while (last_queue_size_az != QueueSize);
+  }
+  else if (last_queue_size_az < QueueSize) {
+    do {
+      unused_queue_freq_az -= FreqMtfPos[1][last_queue_size_az++];
+      if (last_queue_size_az > rescale_queue_size_az) {
+        rescale_queue_size_az++;
+        FreqMtfPos[1][last_queue_size_az - 1] += 16;
+        RangeScaleMtfPos[1] += 16;
+      }
+      else {
+        FreqMtfPos[1][last_queue_size_az - 1] += 4;
+        RangeScaleMtfPos[1] += 4;
+      }
+    } while (last_queue_size_az != QueueSize);
+  }
+  if (RangeScaleMtfPos[1] > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(1);
+
+  if (position == 0) {
+    range = FreqMtfPos[1][0] * (range / (RangeScaleMtfPos[1] - unused_queue_freq_az));
+    FreqMtfPos[1][0] += UP_FREQ_MTF_POS;
+  }
+  else {
+    uint16_t * FreqPtr = &FreqMtfPos[1][0];
+    uint16_t * StopFreqPtr = &FreqMtfPos[1][position];
+    RangeLow = *FreqPtr++;
+    while (FreqPtr != StopFreqPtr)
+      RangeLow += *FreqPtr++;
+    low += RangeLow * (range /= (RangeScaleMtfPos[1] - unused_queue_freq_az));
+    range *= *FreqPtr;
+
+    if (position >= 4) {
+      if (position == 4) {
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+        *(FreqPtr + 1) += 1;
+        if (position + 1 == QueueSize)
+          unused_queue_freq_az += 1;
+      }
+      else if (position == 255) {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+      }
+      else {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr + 1) += 1;
+        if (position + 1 == QueueSize)
+          unused_queue_freq_az += 1;
+      }
+    }
+    else
+      *FreqPtr += UP_FREQ_MTF_POS;
+  }
+  if ((RangeScaleMtfPos[1] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(1);
+  return;
+}
+
+void EncodeMtfPosSpace(uint8_t position, uint16_t QueueSize) {
+  NormalizeEncoder(FREQ_MTF_POS_BOT);
+  if (last_queue_size_space > QueueSize) {
+    do {
+      unused_queue_freq_space += FreqMtfPos[2][--last_queue_size_space];
+    } while (last_queue_size_space != QueueSize);
+  }
+  else if (last_queue_size_space < QueueSize) {
+    do {
+      unused_queue_freq_space -= FreqMtfPos[2][last_queue_size_space++];
+      if (last_queue_size_space > rescale_queue_size_space) {
+        rescale_queue_size_space++;
+        FreqMtfPos[2][last_queue_size_space - 1] += 16;
+        RangeScaleMtfPos[2] += 16;
+      }
+      else {
+        FreqMtfPos[2][last_queue_size_space - 1] += 4;
+        RangeScaleMtfPos[2] += 4;
+      }
+    } while (last_queue_size_space != QueueSize);
+  }
+  if (RangeScaleMtfPos[2] > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(2);
+  if (position == 0) {
+    range = FreqMtfPos[2][0] * (range / (RangeScaleMtfPos[2] - unused_queue_freq_space));
+    FreqMtfPos[2][0] += UP_FREQ_MTF_POS;
+  }
+  else {
+    uint16_t * FreqPtr = &FreqMtfPos[2][0];
+    uint16_t * StopFreqPtr = &FreqMtfPos[2][position];
+    RangeLow = *FreqPtr++;
+    while (FreqPtr != StopFreqPtr)
+      RangeLow += *FreqPtr++;
+    low += RangeLow * (range /= (RangeScaleMtfPos[2] - unused_queue_freq_space));
+    range *= *FreqPtr;
+
+    if (position >= 4) {
+      if (position == 4) {
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+        *(FreqPtr + 1) += 1;
+        if (position + 1 == QueueSize)
+          unused_queue_freq_space += 1;
+      }
+      else if (position == 255) {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+      }
+      else {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr + 1) += 1;
+        if (position + 1 == QueueSize)
+          unused_queue_freq_space += 1;
+      }
+    }
+    else
+      *FreqPtr += UP_FREQ_MTF_POS;
+  }
+  if ((RangeScaleMtfPos[2] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(2);
+  return;
+}
+
+void EncodeMtfPosOther(uint8_t position, uint16_t QueueSize) {
+  NormalizeEncoder(FREQ_MTF_POS_BOT);
+  if (last_queue_size_other > QueueSize) {
+    do {
+      unused_queue_freq_other += FreqMtfPos[3][--last_queue_size_other];
+    } while (last_queue_size_other != QueueSize);
+  }
+  else if (last_queue_size_other < QueueSize) {
+    do {
+      unused_queue_freq_other -= FreqMtfPos[3][last_queue_size_other++];
+      if (last_queue_size_other > rescale_queue_size_other) {
+        rescale_queue_size_other++;
+        FreqMtfPos[3][last_queue_size_other - 1] += 16;
+        RangeScaleMtfPos[3] += 16;
+      }
+      else {
+        FreqMtfPos[3][last_queue_size_other - 1] += 4;
+        RangeScaleMtfPos[3] += 4;
+      }
+    } while (last_queue_size_other != QueueSize);
+  }
+  if (RangeScaleMtfPos[3] > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(3);
+  if (position == 0) {
+    range = FreqMtfPos[3][0] * (range / (RangeScaleMtfPos[3] - unused_queue_freq_other));
+    FreqMtfPos[3][0] += UP_FREQ_MTF_POS;
+  }
+  else {
+    uint16_t * FreqPtr = &FreqMtfPos[3][0];
+    uint16_t * StopFreqPtr = &FreqMtfPos[3][position];
+    RangeLow = *FreqPtr++;
+    while (FreqPtr != StopFreqPtr)
+      RangeLow += *FreqPtr++;
+    low += RangeLow * (range /= (RangeScaleMtfPos[3] - unused_queue_freq_other));
+    range *= *FreqPtr;
+
+    if (position >= 4) {
+      if (position == 4) {
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+        *(FreqPtr + 1) += 1;
+        if (position + 1 == QueueSize)
+          unused_queue_freq_other += 1;
+      }
+      else if (position == 255) {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+      }
+      else {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr + 1) += 1;
+        if (position + 1 == QueueSize)
+          unused_queue_freq_other += 1;
+      }
+    }
+    else
+      *FreqPtr += UP_FREQ_MTF_POS;
+  }
+  if ((RangeScaleMtfPos[3] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(3);
 }
 
 void EncodeSID(uint8_t Context, uint8_t SIDSymbol) {
@@ -567,6 +976,7 @@ void EncodeSID(uint8_t Context, uint8_t SIDSymbol) {
   return;
 }
 
+
 void EncodeExtraLength(uint8_t Symbol) {
   NormalizeEncoder(1 << 2);
   range >>= 2;
@@ -576,8 +986,10 @@ void EncodeExtraLength(uint8_t Symbol) {
 
 void EncodeINST(uint8_t Context, uint8_t SIDSymbol, uint8_t Symbol) {
   NormalizeEncoder(FREQ_INST_BOT);
+  uint32_t old_range = range;
+  range /= RangeScaleINST[Context][SIDSymbol];
   if (Symbol == 0) {
-    range = FreqINST[Context][SIDSymbol][0] * (range / RangeScaleINST[Context][SIDSymbol]);
+    range = old_range - range * (RangeScaleINST[Context][SIDSymbol] - FreqINST[Context][SIDSymbol][0]);
     if (RangeScaleINST[Context][SIDSymbol] >= (FREQ_INST_BOT >> 1)) {
       FreqINST[Context][SIDSymbol][0] += RangeScaleINST[Context][SIDSymbol] >> 11;
       if ((RangeScaleINST[Context][SIDSymbol] += (RangeScaleINST[Context][SIDSymbol]) >> 11) > FREQ_INST_BOT)
@@ -593,7 +1005,7 @@ void EncodeINST(uint8_t Context, uint8_t SIDSymbol, uint8_t Symbol) {
     uint8_t FoundIndex = 1;
     while (FoundIndex != Symbol)
       RangeLow += FreqINST[Context][SIDSymbol][FoundIndex++];
-    low += RangeLow * (range /= RangeScaleINST[Context][SIDSymbol]);
+    low += range * RangeLow + old_range - range * RangeScaleINST[Context][SIDSymbol];
     range *= FreqINST[Context][SIDSymbol][FoundIndex];
     if (RangeScaleINST[Context][SIDSymbol] >= (FREQ_INST_BOT >> 1)) {
       FreqINST[Context][SIDSymbol][FoundIndex] += RangeScaleINST[Context][SIDSymbol] >> 11;
@@ -608,59 +1020,63 @@ void EncodeINST(uint8_t Context, uint8_t SIDSymbol, uint8_t Symbol) {
   return;
 }
 
-void EncodeERG(uint8_t Context, uint8_t Symbol) {
+void EncodeERG(uint16_t Context1, uint16_t Context2, uint8_t Symbol) {
   NormalizeEncoder(FREQ_ERG_BOT);
+  uint32_t extra_range = range & (FREQ_ERG_BOT - 1);
   if (Symbol == 0) {
-    range = FreqERG[Context] * (range / RangeScaleERG[Context]);
-    FreqERG[Context] += UP_FREQ_ERG;
+    range = (FreqERG[0] + FreqERG[Context1] + FreqERG[Context2]) * (range >> 13) + extra_range;
+    FreqERG[0] += (0x400 - FreqERG[0]) >> 2;
+    FreqERG[Context1] += (0x1000 - FreqERG[Context1]) >> 4;
+    FreqERG[Context2] += (0xC00 - FreqERG[Context2]) >> 3;
   }
   else {
-    low += FreqERG[Context] * (range /= RangeScaleERG[Context]);
-    range *= RangeScaleERG[Context] - FreqERG[Context];
-  }
-  if ((RangeScaleERG[Context] += UP_FREQ_ERG) > FREQ_ERG_BOT) {
-    RangeScaleERG[Context] = (FREQ_ERG_BOT >> 1) + 1;
-    FreqERG[Context] = (FreqERG[Context] + 1) >> 1;
+    low += (FreqERG[0] + FreqERG[Context1] + FreqERG[Context2]) * (range >>= 13) + extra_range;
+    range *= 0x2000 - (FreqERG[0] + FreqERG[Context1] + FreqERG[Context2]);
+    FreqERG[0] -= FreqERG[0] >> 2;
+    FreqERG[Context1] -= FreqERG[Context1] >> 4;
+    FreqERG[Context2] -= FreqERG[Context2] >> 3;
   }
   return;
 }
 
-void EncodeGoMtf(uint8_t Context, uint8_t InQueue, uint8_t Symbol) {
+void EncodeGoMtf(uint16_t Context1, uint8_t Context2, uint8_t Symbol) {
   NormalizeEncoder(FREQ_GO_MTF_BOT);
+  uint32_t extra_range = range & (FREQ_GO_MTF_BOT - 1);
+  Context1 += 0xF0 * Context2;
+  uint16_t Context3 = Context1 + 0x2D0;
   if (Symbol == 0) {
-    range = FreqGoMtf[Context][InQueue] * (range / RangeScaleGoMtf[Context][InQueue]);
-    FreqGoMtf[Context][InQueue] += UP_FREQ_GO_MTF;
+    range = (FreqGoMtf[Context1] + FreqGoMtf[Context2] + 2 * FreqGoMtf[Context3]) * (range >> 13) + extra_range;
+    FreqGoMtf[Context1] += (0x800 - FreqGoMtf[Context1]) >> 2;
+    FreqGoMtf[Context2] += (0x800 - FreqGoMtf[Context2]) >> 2;
+    FreqGoMtf[Context3] += (0x800 - FreqGoMtf[Context3]) >> 6;
   }
   else {
-    low += FreqGoMtf[Context][InQueue] * (range /= RangeScaleGoMtf[Context][InQueue]);
-    range *= RangeScaleGoMtf[Context][InQueue] - FreqGoMtf[Context][InQueue];
-  }
-  if ((RangeScaleGoMtf[Context][InQueue] += UP_FREQ_GO_MTF) > FREQ_GO_MTF_BOT) {
-    RangeScaleGoMtf[Context][InQueue] = (FREQ_GO_MTF_BOT >> 1) + 1;
-    FreqGoMtf[Context][InQueue] = (FreqGoMtf[Context][InQueue] + 1) >> 1;
+    low += (FreqGoMtf[Context1] + FreqGoMtf[Context2] + 2 * FreqGoMtf[Context3]) * (range >>= 13) + extra_range;
+    range *= 0x2000 - (FreqGoMtf[Context1] + FreqGoMtf[Context2] + 2 * FreqGoMtf[Context3]);
+    FreqGoMtf[Context1] -= FreqGoMtf[Context1] >> 2;
+    FreqGoMtf[Context2] -= FreqGoMtf[Context2] >> 2;
+    FreqGoMtf[Context3] -= FreqGoMtf[Context3] >> 6;
   }
   return;
 }
 
-void EncodeWordTag(uint8_t Symbol) {
+void EncodeWordTag(uint8_t Symbol, uint8_t Context) {
   NormalizeEncoder(FREQ_WORD_TAG_BOT);
+  uint32_t extra_range = range & (FREQ_WORD_TAG_BOT - 1);
   if (Symbol == 0) {
-    range = FreqWordTag * (range / RangeScaleWordTag);
-    FreqWordTag += UP_FREQ_WORD_TAG;
+    range = FreqWordTag[Context] * (range >> 12) + extra_range;
+    FreqWordTag[Context] += (0x1000 - FreqWordTag[Context]) >> 4;
   }
   else {
-    low += FreqWordTag * (range /= RangeScaleWordTag);
-    range *= RangeScaleWordTag - FreqWordTag;
-  }
-  if ((RangeScaleWordTag += UP_FREQ_WORD_TAG) > FREQ_WORD_TAG_BOT) {
-    RangeScaleWordTag = (FREQ_WORD_TAG_BOT >> 1) + 1;
-    FreqWordTag = (FreqWordTag + 1) >> 1;
+    low += FreqWordTag[Context] * (range >>= 12) + extra_range;
+    range *= 0x1000 - FreqWordTag[Context];
+    FreqWordTag[Context] -= FreqWordTag[Context] >> 4;
   }
   return;
 }
 
 void EncodeShortDictionarySymbol(uint16_t BinNum, uint16_t DictionaryBins, uint16_t CodeBins) {
-  NormalizeEncoder((uint32_t)1 << 12);
+  NormalizeEncoder(1 << 12);
   low += BinNum * (range /= DictionaryBins);
   range *= (uint32_t)CodeBins;
   return;
@@ -703,6 +1119,45 @@ void EncodeFirstChar(uint8_t Symbol, uint8_t SymType, uint8_t LastChar) {
       RangeLow += FreqFirstChar[SymType][LastChar][FoundIndex++];
     low += RangeLow * (range /= RangeScaleFirstChar[SymType][LastChar]);
     range *= FreqFirstChar[SymType][LastChar][FoundIndex];
+    if (RangeScaleFirstChar[SymType][LastChar] >= (FREQ_FIRST_CHAR_BOT >> 1)) {
+      FreqFirstChar[SymType][LastChar][FoundIndex] += RangeScaleFirstChar[SymType][LastChar] >> 9;
+      if ((RangeScaleFirstChar[SymType][LastChar] += (RangeScaleFirstChar[SymType][LastChar] >> 9)) > FREQ_FIRST_CHAR_BOT)
+        rescaleFirstChar(SymType, LastChar);
+    }
+    else {
+      FreqFirstChar[SymType][LastChar][FoundIndex] += UP_FREQ_FIRST_CHAR;
+      RangeScaleFirstChar[SymType][LastChar] += UP_FREQ_FIRST_CHAR;
+    }
+    if (FreqFirstChar[SymType][LastChar][FoundIndex] > FreqFirstChar[SymType][LastChar][FoundIndex - 1]) {
+      uint16_t SavedFreq = FreqFirstChar[SymType][LastChar][FoundIndex];
+      do {
+        FreqFirstChar[SymType][LastChar][FoundIndex] = FreqFirstChar[SymType][LastChar][FoundIndex - 1];
+        SymbolFirstChar[SymType][LastChar][FoundIndex] = SymbolFirstChar[SymType][LastChar][FoundIndex - 1];
+      } while ((--FoundIndex) && (SavedFreq > FreqFirstChar[SymType][LastChar][FoundIndex - 1]));
+      FreqFirstChar[SymType][LastChar][FoundIndex] = SavedFreq;
+      SymbolFirstChar[SymType][LastChar][FoundIndex] = Symbol;
+    }
+  }
+  return;
+}
+
+void UpdateFirstChar(uint8_t Symbol, uint8_t SymType, uint8_t LastChar) {
+  NormalizeEncoder(FREQ_FIRST_CHAR_BOT);
+  if (Symbol == SymbolFirstChar[SymType][LastChar][0]) {
+    if (RangeScaleFirstChar[SymType][LastChar] >= (FREQ_FIRST_CHAR_BOT >> 1)) {
+      FreqFirstChar[SymType][LastChar][0] += RangeScaleFirstChar[SymType][LastChar] >> 9;
+      if ((RangeScaleFirstChar[SymType][LastChar] += (RangeScaleFirstChar[SymType][LastChar] >> 9)) > FREQ_FIRST_CHAR_BOT)
+        rescaleFirstChar(SymType, LastChar);
+    }
+    else {
+      FreqFirstChar[SymType][LastChar][0] += UP_FREQ_FIRST_CHAR;
+      RangeScaleFirstChar[SymType][LastChar] += UP_FREQ_FIRST_CHAR;
+    }
+  }
+  else {
+    uint8_t FoundIndex = 1;
+    while (SymbolFirstChar[SymType][LastChar][FoundIndex] != Symbol)
+      FoundIndex++;
     if (RangeScaleFirstChar[SymType][LastChar] >= (FREQ_FIRST_CHAR_BOT >> 1)) {
       FreqFirstChar[SymType][LastChar][FoundIndex] += RangeScaleFirstChar[SymType][LastChar] >> 9;
       if ((RangeScaleFirstChar[SymType][LastChar] += (RangeScaleFirstChar[SymType][LastChar] >> 9)) > FREQ_FIRST_CHAR_BOT)
@@ -843,7 +1298,8 @@ void InitEncoder(uint8_t max_code_length, uint8_t max_base_code, uint8_t num_ins
   MaxInstCode = num_inst_codes - 1;
   OutCharNum = 0;
   low = 0, range = -1;
-  StartModelSymType(use_mtf);
+  StartModelSymType(use_mtf, cap_encoded);
+  StartModelMtfFirst();
   StartModelMtfQueuePos(max_code_length);
   StartModelSID();
   StartModelINST(num_inst_codes);
@@ -871,107 +1327,428 @@ void NormalizeDecoder(uint32_t bot) {
   }
 }
 
-uint8_t DecodeSymType(uint8_t Context) {
+uint8_t DecodeSymType1(uint8_t Context1) {
   uint32_t dict_range;
-  NormalizeDecoder(FREQ_SYM_TYPE_BOT);
-  uint32_t extra_range = range & (FREQ_SYM_TYPE_BOT - 1);
-  if ((dict_range = (range >>= 14) * FreqSymType[Context][0] + extra_range) > code - low) {
+  NormalizeDecoder(FREQ_SYM_TYPE_BOT1);
+  uint32_t extra_range = range & (FREQ_SYM_TYPE_BOT1 - 1);
+  if ((dict_range = (range >>= 14) * FreqSymTypePriorType[Context1][0] + extra_range) > code - low) {
     range = dict_range;
-    uint8_t delta = FreqSymType[Context][1] >> 6;
-    FreqSymType[Context][0] += delta + ((FREQ_SYM_TYPE_BOT - FreqSymType[Context][0] - FreqSymType[Context][1]) >> 6);
-    FreqSymType[Context][1] -= delta;
+    uint16_t delta = FreqSymTypePriorType[Context1][1] >> 6;
+    FreqSymTypePriorType[Context1][0]
+        += delta + ((FREQ_SYM_TYPE_BOT1 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 6);
+    FreqSymTypePriorType[Context1][1] -= delta;
     return(0);
   }
-  else if (dict_range + range * FreqSymType[Context][1] > code - low) {
+  else if (dict_range + range * FreqSymTypePriorType[Context1][1] > code - low) {
     low += dict_range;
-    range *= FreqSymType[Context][1];
-    uint8_t delta = FreqSymType[Context][0] >> 6;
-    FreqSymType[Context][1] += delta + ((FREQ_SYM_TYPE_BOT - FreqSymType[Context][0] - FreqSymType[Context][1]) >> 6);
-    FreqSymType[Context][0] -= delta;
+    range *= FreqSymTypePriorType[Context1][1];
+    uint16_t delta = FreqSymTypePriorType[Context1][0] >> 6;
+    FreqSymTypePriorType[Context1][1]
+        += delta + ((FREQ_SYM_TYPE_BOT1 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 6);
+    FreqSymTypePriorType[Context1][0] -= delta;
     return(1);
   }
   else {
-    low += dict_range + range * FreqSymType[Context][1];
-    range *= (FREQ_SYM_TYPE_BOT - FreqSymType[Context][0] - FreqSymType[Context][1]);
-    FreqSymType[Context][0] -= FreqSymType[Context][0] >> 6;
-    FreqSymType[Context][1] -= FreqSymType[Context][1] >> 6;
+    low += dict_range + range * FreqSymTypePriorType[Context1][1];
+    range *= (FREQ_SYM_TYPE_BOT1 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]);
+    FreqSymTypePriorType[Context1][0] -= FreqSymTypePriorType[Context1][0] >> 6;
+    FreqSymTypePriorType[Context1][1] -= FreqSymTypePriorType[Context1][1] >> 6;
     return(2);
   }
 }
 
-uint8_t DecodeMtfPos(uint8_t Context, uint16_t QueueSize) {
-  NormalizeDecoder(FREQ_MTF_POS_BOT);
-  if (Context == 0) {
-    if (last_queue_size > QueueSize) {
-      do {
-        unused_queue_freq += FreqMtfPos[0][--last_queue_size];
-      } while (last_queue_size != QueueSize);
-    }
-    else if (last_queue_size < QueueSize) {
-      do {
-        unused_queue_freq -= FreqMtfPos[0][last_queue_size++];
-      } while (last_queue_size != QueueSize);
-    }
-    count = (code - low) / (range /= (RangeScaleMtfPos[0] - unused_queue_freq));
+uint8_t DecodeSymType2(uint8_t Context1, uint8_t Context2) {
+  uint32_t dict_range;
+  NormalizeDecoder(2 * FREQ_SYM_TYPE_BOT2);
+  uint32_t extra_range = range & (2 * FREQ_SYM_TYPE_BOT2 - 1);
+  if ((dict_range = (range >>= 14)
+      * (FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context2][0]) + extra_range) > code - low) {
+    range = dict_range;
+    uint16_t delta = FreqSymTypePriorType[Context1][1] >> 4;
+    FreqSymTypePriorType[Context1][0]
+        += delta + ((FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 4);
+    FreqSymTypePriorType[Context1][1] -= delta;
+    delta = FreqSymTypePriorType[Context2][1] >> 7;
+    FreqSymTypePriorType[Context2][0]
+        += delta + ((FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context2][0] - FreqSymTypePriorType[Context2][1]) >> 7);
+    FreqSymTypePriorType[Context2][1] -= delta;
+    return(0);
+  }
+  else if (dict_range + range * (FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1]) > code - low) {
+    low += dict_range;
+    range *= (FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1]);
+    uint16_t delta = FreqSymTypePriorType[Context1][0] >> 4;
+    FreqSymTypePriorType[Context1][1]
+        += delta + ((FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 4);
+    FreqSymTypePriorType[Context1][0] -= delta;
+    delta = FreqSymTypePriorType[Context2][0] >> 7;
+    FreqSymTypePriorType[Context2][1]
+        += delta + ((FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context2][0] - FreqSymTypePriorType[Context2][1]) >> 7);
+    FreqSymTypePriorType[Context2][0] -= delta;
+    return(1);
   }
   else {
-    if (last_queue_size_cap > QueueSize) {
-      do {
-        unused_queue_freq_cap += FreqMtfPos[1][--last_queue_size_cap];
-      } while (last_queue_size_cap != QueueSize);
-    }
-    else if (last_queue_size_cap < QueueSize) {
-      do {
-        unused_queue_freq_cap -= FreqMtfPos[1][last_queue_size_cap++];
-      } while (last_queue_size_cap != QueueSize);
-    }
-    count = (code - low) / (range /= (RangeScaleMtfPos[1] - unused_queue_freq_cap));
+    low += dict_range + range * (FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1]);
+    range *= (2 * FREQ_SYM_TYPE_BOT2 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context2][0]
+        - FreqSymTypePriorType[Context1][1] - FreqSymTypePriorType[Context2][1]);
+    FreqSymTypePriorType[Context1][0] -= FreqSymTypePriorType[Context1][0] >> 4;
+    FreqSymTypePriorType[Context1][1] -= FreqSymTypePriorType[Context1][1] >> 4;
+    FreqSymTypePriorType[Context2][0] -= FreqSymTypePriorType[Context2][0] >> 7;
+    FreqSymTypePriorType[Context2][1] -= FreqSymTypePriorType[Context2][1] >> 7;
+    return(2);
   }
-  if ((RangeHigh = FreqMtfPos[Context][0]) > count) {
+}
+
+uint8_t DecodeSymType3(uint8_t Context1, uint8_t Context2, uint8_t Context3) {
+  uint32_t dict_range;
+  NormalizeDecoder(8 * FREQ_SYM_TYPE_BOT3);
+  uint32_t extra_range = range & (8 * FREQ_SYM_TYPE_BOT3 - 1);
+  if ((dict_range = (FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context2][0]
+      + FreqSymTypePriorEnd[Context3][0]) * (range >>= 15) + extra_range) > code - low) {
+    range = dict_range;
+    uint16_t delta = FreqSymTypePriorType[Context1][1] >> 4;
+    FreqSymTypePriorType[Context1][0]
+        += delta + ((3 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 4);
+    FreqSymTypePriorType[Context1][1] -= delta;
+    delta = FreqSymTypePriorType[Context2][1] >> 7;
+    FreqSymTypePriorType[Context2][0]
+        += delta + ((3 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorType[Context2][0] - FreqSymTypePriorType[Context2][1]) >> 7);
+    FreqSymTypePriorType[Context2][1] -= delta;
+    delta = FreqSymTypePriorEnd[Context3][1] >> 3;
+    FreqSymTypePriorEnd[Context3][0]
+        += delta + ((2 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorEnd[Context3][0] - FreqSymTypePriorEnd[Context3][1]) >> 3);
+    FreqSymTypePriorEnd[Context3][1] -= delta;
+    return(0);
+  }
+  else if (dict_range + range * (FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1]
+      + FreqSymTypePriorEnd[Context3][1]) > code - low) {
+    low += dict_range;
+    range *= FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1] + FreqSymTypePriorEnd[Context3][1];
+    uint16_t delta = FreqSymTypePriorType[Context1][0] >> 4;
+    FreqSymTypePriorType[Context1][1]
+        += delta + ((3 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorType[Context1][0] - FreqSymTypePriorType[Context1][1]) >> 4);
+    FreqSymTypePriorType[Context1][0] -= delta;
+    delta = FreqSymTypePriorType[Context2][0] >> 7;
+    FreqSymTypePriorType[Context2][1]
+        += delta + ((3 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorType[Context2][0] - FreqSymTypePriorType[Context2][1]) >> 7);
+    FreqSymTypePriorType[Context2][0] -= delta;
+    delta = FreqSymTypePriorEnd[Context3][0] >> 3;
+    FreqSymTypePriorEnd[Context3][1]
+        += delta + ((2 * FREQ_SYM_TYPE_BOT3 - FreqSymTypePriorEnd[Context3][0] - FreqSymTypePriorEnd[Context3][1]) >> 3);
+    FreqSymTypePriorEnd[Context3][0] -= delta;
+    return(1);
+  }
+  else {
+    low += dict_range + range * (FreqSymTypePriorType[Context1][1] + FreqSymTypePriorType[Context2][1]
+        + FreqSymTypePriorEnd[Context3][1]);
+    range *= 8 * FREQ_SYM_TYPE_BOT3 - (FreqSymTypePriorType[Context1][0] + FreqSymTypePriorType[Context1][1])
+        - (FreqSymTypePriorType[Context2][0] + FreqSymTypePriorType[Context2][1])
+        - (FreqSymTypePriorEnd[Context3][0] + FreqSymTypePriorEnd[Context3][1]);
+    FreqSymTypePriorType[Context1][0] -= FreqSymTypePriorType[Context1][0] >> 4;
+    FreqSymTypePriorType[Context1][1] -= FreqSymTypePriorType[Context1][1] >> 4;
+    FreqSymTypePriorType[Context2][0] -= FreqSymTypePriorType[Context2][0] >> 7;
+    FreqSymTypePriorType[Context2][1] -= FreqSymTypePriorType[Context2][1] >> 7;
+    FreqSymTypePriorEnd[Context3][0] -= FreqSymTypePriorEnd[Context3][0] >> 3;
+    FreqSymTypePriorEnd[Context3][1] -= FreqSymTypePriorEnd[Context3][1] >> 3;
+    return(2);
+  }
+}
+
+uint8_t DecodeMtfFirst(uint8_t Context) {
+  uint32_t delta;
+  NormalizeDecoder(0x1000);
+  uint32_t extra_range = range & 0xFFF;
+
+  if (FreqMtfFirst[Context][0] * (range >>= 12) + extra_range > code - low) {
+    range = range * FreqMtfFirst[Context][0] + extra_range;
+    delta = FreqMtfFirst[Context][1] >> 7;
+    FreqMtfFirst[Context][1] -= delta;
+    FreqMtfFirst[Context][0] += delta;
+    delta = FreqMtfFirst[Context][2] >> 7;
+    FreqMtfFirst[Context][2] -= delta;
+    FreqMtfFirst[Context][0] += delta;
+    return(0);
+  }
+  else if ((FreqMtfFirst[Context][0] + FreqMtfFirst[Context][1]) * range + extra_range > code - low) {
+    low += range * FreqMtfFirst[Context][0] + extra_range;
+    range *= FreqMtfFirst[Context][1];
+    delta = FreqMtfFirst[Context][0] >> 7;
+    FreqMtfFirst[Context][0] -= delta;
+    FreqMtfFirst[Context][1] += delta;
+    delta = FreqMtfFirst[Context][2] >> 7;
+    FreqMtfFirst[Context][2] -= delta;
+    FreqMtfFirst[Context][1] += delta;
+    return(1);
+  }
+  else {
+    low += (FreqMtfFirst[Context][0] + FreqMtfFirst[Context][1]) * range + extra_range;
+    range *= FreqMtfFirst[Context][2];
+    delta = FreqMtfFirst[Context][0] >> 7;
+    FreqMtfFirst[Context][0] -= delta;
+    FreqMtfFirst[Context][2] += delta;
+    delta = FreqMtfFirst[Context][1] >> 7;
+    FreqMtfFirst[Context][1] -= delta;
+    FreqMtfFirst[Context][2] += delta;
+    return(2);
+  }
+}
+
+uint8_t DecodeMtfPos(uint16_t QueueSize) {
+  NormalizeDecoder(FREQ_MTF_POS_BOT);
+  if (last_queue_size > QueueSize) {
+    do {
+      unused_queue_freq += FreqMtfPos[0][--last_queue_size];
+    } while (last_queue_size != QueueSize);
+  }
+  else if (last_queue_size < QueueSize) {
+    do {
+      unused_queue_freq -= FreqMtfPos[0][last_queue_size++];
+      if (last_queue_size > rescale_queue_size) {
+        rescale_queue_size++;
+        FreqMtfPos[0][last_queue_size - 1] += 8;
+        RangeScaleMtfPos[0] += 8;
+      }
+      else {
+        FreqMtfPos[0][last_queue_size - 1] += 2;
+        RangeScaleMtfPos[0] += 2;
+      }
+    } while (last_queue_size != QueueSize);
+    if (RangeScaleMtfPos[0] > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(0);
+  }
+  count = (code - low) / (range /= (RangeScaleMtfPos[0] - unused_queue_freq));
+  if ((RangeHigh = FreqMtfPos[0][0]) > count) {
     range *= RangeHigh;
-    FreqMtfPos[Context][0] = RangeHigh + UP_FREQ_MTF_POS;
-    if ((RangeScaleMtfPos[Context] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
-      rescaleMtfQueuePos(Context);
+    FreqMtfPos[0][0] = RangeHigh + UP_FREQ_MTF_POS;
+    if ((RangeScaleMtfPos[0] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(0);
     return(0);
   }
   else {
-    uint16_t * FreqPtr = &FreqMtfPos[Context][1];
+    uint16_t * FreqPtr = &FreqMtfPos[0][1];
     while ((RangeHigh += *FreqPtr) <= count)
       FreqPtr++;
-    uint8_t position = FreqPtr - &FreqMtfPos[Context][0];
+    uint8_t position = FreqPtr - &FreqMtfPos[0][0];
     low += range * (RangeHigh - *FreqPtr);
     range *= *FreqPtr;
     if (position >= 4) {
       if (position == 4) {
-        *FreqPtr += UP_FREQ_MTF_POS - 2;
-        *(FreqPtr + 1) += 2;
-        if (position == QueueSize - 1) {
-          if (Context == 0)
-            unused_queue_freq += 2;
-          else 
-            unused_queue_freq_cap += 2;
-        }
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+        *(FreqPtr + 1) += 1;
+        if (position == QueueSize - 1)
+          unused_queue_freq += 1;
       }
       else if (position == 255) {
-        *(FreqPtr - 1) += 2;
-        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
       }
       else {
-        *(FreqPtr - 1) += 2;
-        *FreqPtr += UP_FREQ_MTF_POS - 4;
-        *(FreqPtr + 1) += 2;
-        if (position == QueueSize - 1) {
-          if (Context == 0)
-            unused_queue_freq += 2;
-          else 
-            unused_queue_freq_cap += 2;
-        }
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr + 1) += 1;
+        if (position == QueueSize - 1)
+          unused_queue_freq += 1;
       }
     }
     else
        *FreqPtr += UP_FREQ_MTF_POS;
-    if ((RangeScaleMtfPos[Context] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
-      rescaleMtfQueuePos(Context);
+    if ((RangeScaleMtfPos[0] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(0);
+    return(position);
+  }
+}
+
+uint8_t DecodeMtfPosAz(uint16_t QueueSize) {
+  NormalizeDecoder(FREQ_MTF_POS_BOT);
+  if (last_queue_size_az > QueueSize) {
+    do {
+      unused_queue_freq_az += FreqMtfPos[1][--last_queue_size_az];
+    } while (last_queue_size_az != QueueSize);
+  }
+  else if (last_queue_size_az < QueueSize) {
+    do {
+      unused_queue_freq_az -= FreqMtfPos[1][last_queue_size_az++];
+      if (last_queue_size_az > rescale_queue_size_az) {
+        rescale_queue_size_az++;
+        FreqMtfPos[1][last_queue_size_az - 1] += 16;
+        RangeScaleMtfPos[1] += 16;
+      }
+      else {
+        FreqMtfPos[1][last_queue_size_az - 1] += 4;
+        RangeScaleMtfPos[1] += 4;
+      }
+    } while (last_queue_size_az != QueueSize);
+    if (RangeScaleMtfPos[1] > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(1);
+  }
+  count = (code - low) / (range /= (RangeScaleMtfPos[1] - unused_queue_freq_az));
+  if ((RangeHigh = FreqMtfPos[1][0]) > count) {
+    range *= RangeHigh;
+    FreqMtfPos[1][0] = RangeHigh + UP_FREQ_MTF_POS;
+    if ((RangeScaleMtfPos[1] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(1);
+    return(0);
+  }
+  else {
+    uint16_t * FreqPtr = &FreqMtfPos[1][1];
+    while ((RangeHigh += *FreqPtr) <= count)
+      FreqPtr++;
+    uint8_t position = FreqPtr - &FreqMtfPos[1][0];
+    low += range * (RangeHigh - *FreqPtr);
+    range *= *FreqPtr;
+    if (position >= 4) {
+      if (position == 4) {
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+        *(FreqPtr + 1) += 1;
+        if (position == QueueSize - 1)
+          unused_queue_freq_az += 1;
+      }
+      else if (position == 255) {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+      }
+      else {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr + 1) += 1;
+        if (position == QueueSize - 1)
+          unused_queue_freq_az += 1;
+      }
+    }
+    else
+       *FreqPtr += UP_FREQ_MTF_POS;
+    if ((RangeScaleMtfPos[1] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(1);
+    return(position);
+  }
+}
+
+uint8_t DecodeMtfPosSpace(uint16_t QueueSize) {
+  NormalizeDecoder(FREQ_MTF_POS_BOT);
+  if (last_queue_size_space > QueueSize) {
+    do {
+      unused_queue_freq_space += FreqMtfPos[2][--last_queue_size_space];
+    } while (last_queue_size_space != QueueSize);
+  }
+  else if (last_queue_size_space < QueueSize) {
+    do {
+      unused_queue_freq_space -= FreqMtfPos[2][last_queue_size_space++];
+      if (last_queue_size_space > rescale_queue_size_space) {
+        rescale_queue_size_space++;
+        FreqMtfPos[2][last_queue_size_space - 1] += 16;
+        RangeScaleMtfPos[2] += 16;
+      }
+      else {
+        FreqMtfPos[2][last_queue_size_space - 1] += 4;
+        RangeScaleMtfPos[2] += 4;
+      }
+    } while (last_queue_size_space != QueueSize);
+    if (RangeScaleMtfPos[2] > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(2);
+  }
+  count = (code - low) / (range /= (RangeScaleMtfPos[2] - unused_queue_freq_space));
+  if ((RangeHigh = FreqMtfPos[2][0]) > count) {
+    range *= RangeHigh;
+    FreqMtfPos[2][0] = RangeHigh + UP_FREQ_MTF_POS;
+    if ((RangeScaleMtfPos[2] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(2);
+    return(0);
+  }
+  else {
+    uint16_t * FreqPtr = &FreqMtfPos[2][1];
+    while ((RangeHigh += *FreqPtr) <= count)
+      FreqPtr++;
+    uint8_t position = FreqPtr - &FreqMtfPos[2][0];
+    low += range * (RangeHigh - *FreqPtr);
+    range *= *FreqPtr;
+    if (position >= 4) {
+      if (position == 4) {
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+        *(FreqPtr + 1) += 1;
+        if (position == QueueSize - 1)
+          unused_queue_freq_space += 1;
+      }
+      else if (position == 255) {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+      }
+      else {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr + 1) += 1;
+        if (position == QueueSize - 1)
+          unused_queue_freq_space += 1;
+      }
+    }
+    else
+       *FreqPtr += UP_FREQ_MTF_POS;
+    if ((RangeScaleMtfPos[2] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(2);
+    return(position);
+  }
+}
+
+uint8_t DecodeMtfPosOther(uint16_t QueueSize) {
+  NormalizeDecoder(FREQ_MTF_POS_BOT);
+  if (last_queue_size_other > QueueSize) {
+    do {
+      unused_queue_freq_other += FreqMtfPos[3][--last_queue_size_other];
+    } while (last_queue_size_other != QueueSize);
+  }
+  else if (last_queue_size_other < QueueSize) {
+    do {
+      unused_queue_freq_other -= FreqMtfPos[3][last_queue_size_other++];
+      if (last_queue_size_other > rescale_queue_size_other) {
+        rescale_queue_size_other++;
+        FreqMtfPos[3][last_queue_size_other - 1] += 16;
+        RangeScaleMtfPos[3] += 16;
+      }
+      else {
+        FreqMtfPos[3][last_queue_size_other - 1] += 4;
+        RangeScaleMtfPos[3] += 4;
+      }
+    } while (last_queue_size_other != QueueSize);
+    if (RangeScaleMtfPos[3] > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(3);
+  }
+  count = (code - low) / (range /= (RangeScaleMtfPos[3] - unused_queue_freq_other));
+  if ((RangeHigh = FreqMtfPos[3][0]) > count) {
+    range *= RangeHigh;
+    FreqMtfPos[3][0] = RangeHigh + UP_FREQ_MTF_POS;
+    if ((RangeScaleMtfPos[3] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+    rescaleMtfQueuePos(3);
+    return(0);
+  }
+  else {
+    uint16_t * FreqPtr = &FreqMtfPos[3][1];
+    while ((RangeHigh += *FreqPtr) <= count)
+      FreqPtr++;
+    uint8_t position = FreqPtr - &FreqMtfPos[3][0];
+    low += range * (RangeHigh - *FreqPtr);
+    range *= *FreqPtr;
+    if (position >= 4) {
+      if (position == 4) {
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+        *(FreqPtr + 1) += 1;
+        if (position == QueueSize - 1)
+          unused_queue_freq_other += 1;
+      }
+      else if (position == 255) {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 1;
+      }
+      else {
+        *(FreqPtr - 1) += 1;
+        *FreqPtr += UP_FREQ_MTF_POS - 2;
+        *(FreqPtr + 1) += 1;
+        if (position == QueueSize - 1)
+          unused_queue_freq_other += 1;
+      }
+    }
+    else
+       *FreqPtr += UP_FREQ_MTF_POS;
+    if ((RangeScaleMtfPos[3] += UP_FREQ_MTF_POS) > FREQ_MTF_POS_BOT)
+      rescaleMtfQueuePos(3);
     return(position);
   }
 }
@@ -1008,10 +1785,12 @@ uint8_t DecodeExtraLength() {
 
 uint8_t DecodeINST(uint8_t Context, uint8_t SIDSymbol) {
   NormalizeDecoder(FREQ_INST_BOT);
+uint32_t extra_range = range;
   range /= RangeScaleINST[Context][SIDSymbol];
+extra_range -= range * RangeScaleINST[Context][SIDSymbol];
   RangeHigh = FreqINST[Context][SIDSymbol][0];
-  if (RangeHigh * range > code - low) {
-    range *= RangeHigh;
+  if (RangeHigh * range + extra_range > code - low) {
+    range = range * RangeHigh + extra_range;
     if (RangeScaleINST[Context][SIDSymbol] >= (FREQ_INST_BOT >> 1)) {
       FreqINST[Context][SIDSymbol][0] += RangeScaleINST[Context][SIDSymbol] >> 11;
       if ((RangeScaleINST[Context][SIDSymbol] += RangeScaleINST[Context][SIDSymbol] >> 11) > FREQ_INST_BOT)
@@ -1024,6 +1803,7 @@ uint8_t DecodeINST(uint8_t Context, uint8_t SIDSymbol) {
     return(0);
   }
   else {
+    low += extra_range;
     count = (code - low) / range;
     uint8_t Instances = 1;
     while ((RangeHigh += FreqINST[Context][SIDSymbol][Instances]) <= count)
@@ -1041,97 +1821,66 @@ uint8_t DecodeINST(uint8_t Context, uint8_t SIDSymbol) {
     }
     return(Instances);
   }
-/*
-  count = (code - low) / (range /= RangeScaleINST[Context][SIDSymbol]);
-  if ((RangeHigh = FreqINST[Context][SIDSymbol][0]) > count) {
-    range *= RangeHigh;
-    if (RangeScaleINST[Context][SIDSymbol] >= (FREQ_INST_BOT >> 1)) {
-      FreqINST[Context][SIDSymbol][0] += RangeScaleINST[Context][SIDSymbol] >> 11;
-      if ((RangeScaleINST[Context][SIDSymbol] += RangeScaleINST[Context][SIDSymbol] >> 11) > FREQ_INST_BOT)
-        rescaleINST(Context, SIDSymbol);
-    }
-    else {
-      FreqINST[Context][SIDSymbol][0] += UP_FREQ_INST;
-      RangeScaleINST[Context][SIDSymbol] += UP_FREQ_INST;
-    }
+}
+
+uint8_t DecodeERG(uint16_t Context1, uint16_t Context2) {
+  NormalizeDecoder(FREQ_ERG_BOT);
+  uint32_t extra_range = range & (FREQ_ERG_BOT - 1);
+  if ((FreqERG[0] + FreqERG[Context1] + FreqERG[Context2]) * (range >>= 13) + extra_range > code - low) {
+    range = range * (FreqERG[0] + FreqERG[Context1] + FreqERG[Context2]) + extra_range;
+    FreqERG[0] += (0x400 - FreqERG[0]) >> 2;
+    FreqERG[Context1] += (0x1000 - FreqERG[Context1]) >> 4;
+    FreqERG[Context2] += (0xC00 - FreqERG[Context2]) >> 3;
     return(0);
   }
   else {
-    uint8_t Instances = 1;
-    while ((RangeHigh += FreqINST[Context][SIDSymbol][Instances]) <= count)
-      Instances++;
-    low += range * (RangeHigh - FreqINST[Context][SIDSymbol][Instances]);
-    range *= FreqINST[Context][SIDSymbol][Instances];
-    if (RangeScaleINST[Context][SIDSymbol] >= (FREQ_INST_BOT >> 1)) {
-      FreqINST[Context][SIDSymbol][Instances] += RangeScaleINST[Context][SIDSymbol] >> 11;
-      if ((RangeScaleINST[Context][SIDSymbol] += (RangeScaleINST[Context][SIDSymbol] >> 11)) > FREQ_INST_BOT)
-        rescaleINST(Context, SIDSymbol);
-    }
-    else {
-      FreqINST[Context][SIDSymbol][Instances] += UP_FREQ_INST;
-      RangeScaleINST[Context][SIDSymbol] += UP_FREQ_INST;
-    }
-    return(Instances);
+    low += range * (FreqERG[0] + FreqERG[Context1] + FreqERG[Context2]) + extra_range;
+    range *= 0x2000 - (FreqERG[0] + FreqERG[Context1] + FreqERG[Context2]);
+    FreqERG[0] -= FreqERG[0] >> 2;
+    FreqERG[Context1] -= FreqERG[Context1] >> 4;
+    FreqERG[Context2] -= FreqERG[Context2] >> 3;
+    return(1);
   }
-*/
 }
 
-uint8_t DecodeERG(uint8_t Context) {
-  uint8_t nonergodic;
-  NormalizeDecoder(FREQ_ERG_BOT);
-  if (FreqERG[Context] * (range /= RangeScaleERG[Context]) > code - low) {
-    range *= FreqERG[Context];
-    FreqERG[Context] += UP_FREQ_ERG;
-    nonergodic = 0;
-  }
-  else {
-    low += range * FreqERG[Context];
-    range *= RangeScaleERG[Context] - FreqERG[Context];
-    nonergodic = 1;
-  }
-  if ((RangeScaleERG[Context] += UP_FREQ_ERG) > FREQ_ERG_BOT) {
-    RangeScaleERG[Context] = (FREQ_ERG_BOT >> 1) + 1;
-    FreqERG[Context] = (FreqERG[Context] + 1) >> 1;
-  }
-  return(nonergodic);
-}
-
-uint8_t DecodeGoMtf(uint8_t Context, uint8_t InQueue) {
+uint8_t DecodeGoMtf(uint16_t Context1, uint8_t Context2) {
   uint8_t go_mtf;
   NormalizeDecoder(FREQ_GO_MTF_BOT);
-  if (FreqGoMtf[Context][InQueue] * (range /= RangeScaleGoMtf[Context][InQueue]) > code - low) {
-    range *= FreqGoMtf[Context][InQueue];
-    FreqGoMtf[Context][InQueue] += UP_FREQ_GO_MTF;
+  uint32_t extra_range = range & (FREQ_GO_MTF_BOT - 1);
+  Context1 += 0xF0 * Context2;
+  uint16_t Context3 = Context1 + 0x2D0;
+  if ((FreqGoMtf[Context1] + FreqGoMtf[Context2] + 2 * FreqGoMtf[Context3]) * (range >>= 13) + extra_range > code - low) {
+    range = range * (FreqGoMtf[Context1] + FreqGoMtf[Context2] + 2 * FreqGoMtf[Context3]) + extra_range;
+    FreqGoMtf[Context1] += (0x800 - FreqGoMtf[Context1]) >> 2;
+    FreqGoMtf[Context2] += (0x800 - FreqGoMtf[Context2]) >> 2;
+    FreqGoMtf[Context3] += (0x800 - FreqGoMtf[Context3]) >> 6;
     go_mtf = 0;
   }
   else {
-    low += range * FreqGoMtf[Context][InQueue];
-    range *= RangeScaleGoMtf[Context][InQueue] - FreqGoMtf[Context][InQueue];
+    low += range * (FreqGoMtf[Context1] + FreqGoMtf[Context2] + 2 * FreqGoMtf[Context3]) + extra_range;
+    range *= 0x2000 - (FreqGoMtf[Context1] + FreqGoMtf[Context2] + 2 * FreqGoMtf[Context3]);
+    FreqGoMtf[Context1] -= FreqGoMtf[Context1] >> 2;
+    FreqGoMtf[Context2] -= FreqGoMtf[Context2] >> 2;
+    FreqGoMtf[Context3] -= FreqGoMtf[Context3] >> 6;
     go_mtf = 1;
-  }
-  if ((RangeScaleGoMtf[Context][InQueue] += UP_FREQ_GO_MTF) > FREQ_GO_MTF_BOT) {
-    RangeScaleGoMtf[Context][InQueue] = (FREQ_GO_MTF_BOT >> 1) + 1;
-    FreqGoMtf[Context][InQueue] = (FreqGoMtf[Context][InQueue] + 1) >> 1;
   }
   return(go_mtf);
 }
 
-uint8_t DecodeWordTag() {
+uint8_t DecodeWordTag(uint8_t Context) {
   uint8_t Tag;
   NormalizeDecoder(FREQ_WORD_TAG_BOT);
-  if (FreqWordTag * (range /= RangeScaleWordTag) > code - low) {
-    range *= FreqWordTag;
-    FreqWordTag += UP_FREQ_WORD_TAG;
+  uint32_t extra_range = range & (FREQ_WORD_TAG_BOT - 1);
+  if (FreqWordTag[Context] * (range >>= 12) + extra_range > code - low) {
+    range = range * FreqWordTag[Context] + extra_range;
+    FreqWordTag[Context] += (0x1000 - FreqWordTag[Context]) >> 4;
     Tag = 0;
   }
   else {
-    low += range * FreqWordTag;
-    range *= RangeScaleWordTag - FreqWordTag;
+    low += FreqWordTag[Context] * range + extra_range;
+    range *= 0x1000 - FreqWordTag[Context];
+    FreqWordTag[Context] -= FreqWordTag[Context] >> 4;
     Tag = 1;
-  }
-  if ((RangeScaleWordTag += UP_FREQ_WORD_TAG) > FREQ_WORD_TAG_BOT) {
-    RangeScaleWordTag = (FREQ_WORD_TAG_BOT >> 1) + 1;
-    FreqWordTag = (FreqWordTag + 1) >> 1;
   }
   return(Tag);
 }
@@ -1292,7 +2041,8 @@ void InitDecoder(uint8_t max_code_length, uint8_t max_base_code, uint8_t num_ins
   code = 0, range = -1;
   for (low = 4; low != 0; low--)
     code = (code << 8) | InBuffer[InCharNum++];
-  StartModelSymType(use_mtf);
+  StartModelSymType(use_mtf, cap_encoded);
+  StartModelMtfFirst();
   StartModelMtfQueuePos(max_code_length);
   StartModelSID();
   StartModelINST(num_inst_codes);

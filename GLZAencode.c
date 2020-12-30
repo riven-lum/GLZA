@@ -36,53 +36,52 @@ uint8_t UTF8_compliant, cap_encoded, prior_is_cap, end_char, prior_end, use_mtf,
 uint8_t max_code_length, max_regular_code_length, found_first_symbol, cap_symbol_defined, cap_lock_symbol_defined;
 uint8_t symbol_lengths[0x100], bin_code_length[0x100], sym_list_bits[0x100][26], queue_miss_code_length[16];
 uint16_t nbob[0x100][26], sum_nbob[0x100], fbob[0x100][26];
-uint32_t prior_symbol, num_grammar_rules, num_codes, num_base_symbols, num_transmits, queue_size, queue_size_cap;
-uint32_t queue[0x1A0], nsob[0x100][26], *sym_list_ptrs[0x100][26], *symbol_array;
+uint16_t queue_size, queue_size_az, queue_size_space, queue_size_other;
+uint32_t prior_symbol, num_grammar_rules, num_codes, num_base_symbols, num_transmits;
+uint32_t queue[0x100], nsob[0x100][26], *sym_list_ptrs[0x100][26], *symbol_array;
+
+struct symbol_data {
+  uint8_t starts, ends, code_length, type;
+  uint32_t count, hits, array_index, define_symbol_start_index, previous, previous2;
+  int32_t space_score;
+  float score;
+} *sd;
 
 struct transmit_symbols {
   uint32_t symbol;
   uint32_t distance;
-  uint32_t previous_index;
-  uint32_t hurts;
-  float score;
 } *transmits;
 
 
-// type:  bit 0: string ends 'C' or 'B' (cap symbol/cap lock symbol), bit 1: string starts a-z, bit 2: non-ergodic,
-//        bit 3: in queue, bit 4: "word" ending determined, bit 7: sent MTF
-// bits 6-5: 0: not a word, 1: word, 2: word & >= 15 repeats (ending sub)symbol,
-//           3: word & >= 15 repeats (ending sub)symbol & likely followed by ' '
-
-struct symbol_data {
-  uint8_t starts, ends, code_length, type;
-  uint32_t count, hits, array_index, define_symbol_start_index, previous;
-  int32_t space_score;
-} *sd;
+// type:  bit 0: string starts a-z, bit 1: non-ergodic, bit 2: "word" ending determined,
+//        bits 4-3: 0: not a word, 1: word, 2: word & >= 15 repeats (ending sub)symbol & likely followed by ' ',
+//                  3: word & >= 15 repeats (ending sub)symbol
+//        bit 5: string ends 'C' or 'B' (cap symbol/cap lock symbol), bit 6: in queue, bit 7: sent MTF
 
 
 void print_string(uint32_t symbol_number) {
   if (symbol_number < num_base_symbols) {
     if (UTF8_compliant != 0) {
       if (symbol_number < START_UTF8_2BYTE_SYMBOLS)
-        printf("%c",(unsigned char)symbol_number);
+        printf("%c", (unsigned char)symbol_number);
       else if (symbol_number < START_UTF8_3BYTE_SYMBOLS) {
-        printf("%c",(unsigned char)(symbol_number >> 6) + 0xC0);
-        printf("%c",(unsigned char)(symbol_number & 0x3F) + 0x80);
+        printf("%c", (unsigned char)(symbol_number >> 6) + 0xC0);
+        printf("%c", (unsigned char)(symbol_number & 0x3F) + 0x80);
       }
       else if (symbol_number < START_UTF8_4BYTE_SYMBOLS) {
-        printf("%c",(unsigned char)(symbol_number >> 12) + 0xE0);
-        printf("%c",(unsigned char)((symbol_number >> 6) & 0x3F) + 0x80);
-        printf("%c",(unsigned char)(symbol_number & 0x3F) + 0x80);
+        printf("%c", (unsigned char)(symbol_number >> 12) + 0xE0);
+        printf("%c", (unsigned char)((symbol_number >> 6) & 0x3F) + 0x80);
+        printf("%c", (unsigned char)(symbol_number & 0x3F) + 0x80);
       }
       else {
-        printf("%c",(unsigned char)(symbol_number >> 18) + 0xF0);
-        printf("%c",(unsigned char)((symbol_number >> 12) & 0x3F) + 0x80);
-        printf("%c",(unsigned char)((symbol_number >> 6) & 0x3F) + 0x80);
-        printf("%c",(unsigned char)(symbol_number & 0x3F) + 0x80);
+        printf("%c", (unsigned char)(symbol_number >> 18) + 0xF0);
+        printf("%c", (unsigned char)((symbol_number >> 12) & 0x3F) + 0x80);
+        printf("%c", (unsigned char)((symbol_number >> 6) & 0x3F) + 0x80);
+        printf("%c", (unsigned char)(symbol_number & 0x3F) + 0x80);
       }
     }
     else
-      printf("%c",(unsigned char)symbol_number);
+      printf("%c", (unsigned char)symbol_number);
   }
   else {
     uint32_t *symbol_ptr, *next_symbol_ptr;
@@ -124,31 +123,36 @@ uint32_t get_dictionary_size(uint32_t symbol_number) {
 
 void get_symbol_category(uint32_t symbol_number, uint8_t *sym_type_ptr) {
   if (symbol_number >= num_base_symbols) {
-    if ((sd[symbol_number].type & 0x20) != 0) {
-      *sym_type_ptr |= 0x30;
+    if ((sd[symbol_number].type & 8) != 0) {
+      *sym_type_ptr |= 0xC;
       return;
     }
     uint32_t * string_ptr = symbol_array + sd[symbol_number + 1].define_symbol_start_index - 2;
     get_symbol_category(*string_ptr, sym_type_ptr);
-    while (((*sym_type_ptr & 0x10) == 0) && (string_ptr != symbol_array + sd[symbol_number].define_symbol_start_index))
+    while (((*sym_type_ptr & 4) == 0) && (string_ptr != symbol_array + sd[symbol_number].define_symbol_start_index))
       get_symbol_category(*--string_ptr, sym_type_ptr);
-    if ((sd[symbol_number].type & 0x10) == 0)
-      sd[symbol_number].type |= *sym_type_ptr & 0x30;
+    if ((sd[symbol_number].type & 4) == 0)
+      sd[symbol_number].type |= *sym_type_ptr & 0xC;
   }
   else if (symbol_number == (uint32_t)' ')
-    *sym_type_ptr |= 0x30;
+    *sym_type_ptr |= 0xC;
   return;
 }
 
 
 uint8_t find_first(uint32_t symbol_number) {
   uint8_t first_char;
+//fprintf(stderr,"FF SN %x ", symbol_number);
   uint32_t first_symbol = symbol_array[sd[symbol_number].define_symbol_start_index];
+//fprintf(stderr, "FIRST SYM %x\n", first_symbol);
   if (first_symbol >= num_base_symbols) {
     if ((first_char = sd[first_symbol].starts) == 0) {
+// fprintf(stderr," FIRST CHAR %x\n", first_char);
       first_char = find_first(first_symbol);
       sd[first_symbol].starts = first_char;
     }
+//else
+// fprintf(stderr,"  FIRST CHAR %x\n", first_char);
     return(first_char);
   }
   return((uint8_t)first_symbol);
@@ -357,10 +361,14 @@ void remove_dictionary_symbol(uint32_t symbol, uint8_t bits) {
 
 
 void add_symbol_to_queue(uint32_t symbol_number) {
-  sd[symbol_number].type |= 0x88;
-  *(queue + --queue_offset) = symbol_number;
-  if ((sd[symbol_number].type & 2) != 0)
-    queue_size_cap++;
+  sd[symbol_number].type |= 0xC0;
+  queue[(uint8_t)(--queue_offset)] = symbol_number;
+  if ((sd[symbol_number].type & 1) != 0)
+    queue_size_az++;
+  else if (sd[symbol_number].starts == 0x20)
+    queue_size_space++;
+  else
+    queue_size_other++;
   queue_size++;
   return;
 }
@@ -368,28 +376,75 @@ void add_symbol_to_queue(uint32_t symbol_number) {
 
 void update_queue(uint32_t symbol_number, uint8_t in_definition) {
   uint8_t queue_position = 0;
-  while (symbol_number != *(queue + (uint8_t)(queue_position + queue_offset)))
+  uint32_t az_queue_position = 0;
+  uint32_t space_queue_position = 0;
+  uint32_t other_queue_position = 0;
+  while (symbol_number != queue[(uint8_t)(queue_position + queue_offset)]) {
+    if ((sd[queue[(uint8_t)(queue_position + queue_offset)]].type & 1) != 0)
+      az_queue_position++;
+    else if (sd[queue[(uint8_t)(queue_position + queue_offset)]].starts == 0x20)
+      space_queue_position++;
+    else
+      other_queue_position++;
     queue_position++;
-  EncodeMtfType(2 * in_definition);
-  EncodeMtfPos(NOT_CAP, queue_position, queue_size);
+  }
+
+  if (cap_encoded != 0) {
+    EncodeMtfType3(in_definition, 4 + in_definition + (sd[prior_symbol].type & 0x18) + 2 * (sd[prior_symbol].type & 7),
+        prior_end);
+    if (sd[symbol_number].starts == 0x20) {
+      if (prior_end != 0xA)
+        EncodeMtfFirst(((sd[prior_symbol].type & 0x18) == 0x10), 1);
+      EncodeMtfPosSpace(space_queue_position, queue_size_space);
+    }
+    else if ((sd[symbol_number].type & 1) != 0) {
+      EncodeMtfFirst(((sd[prior_symbol].type & 0x18) == 0x10), 2);
+      EncodeMtfPosAz(az_queue_position, queue_size_az);
+    }
+    else {
+      EncodeMtfFirst(((sd[prior_symbol].type & 0x18) == 0x10), 0);
+      EncodeMtfPosOther(other_queue_position, queue_size_other);
+    }
+  }
+  else {
+    EncodeMtfType1(in_definition);
+    EncodeMtfPos(queue_position, queue_size);
+  }
+
   while (queue_position != 0) {
-    *(queue + (uint8_t)(queue_offset + queue_position))
-        = *(queue + (uint8_t)(queue_offset + queue_position - 1));
+    queue[(uint8_t)(queue_offset + queue_position)] = queue[(uint8_t)(queue_offset + queue_position - 1)];
     queue_position--;
   }
   if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-    EncodeGoMtf(sd[symbol_number].count, 1, 1);
-    *(queue + queue_offset) = symbol_number;
+    uint16_t context;
+    if (cap_encoded != 0)
+      context = 6 * (sd[symbol_number].count - 1) + (sd[symbol_number].type & 1)
+          + 3 * (((sd[symbol_number].type >> 3) & 3) == 2);
+    else
+      context = 6 * (sd[symbol_number].count - 1);
+    EncodeGoMtf(context, 1, 1);
+    queue[queue_offset] = symbol_number;
   }
   else {
     queue_size--;
-    if ((sd[symbol_number].type & 2) != 0)
-      queue_size_cap--;
+    if ((sd[symbol_number].type & 1) != 0)
+      queue_size_az--;
+    else if (sd[symbol_number].starts == 0x20)
+      queue_size_space--;
+    else
+      queue_size_other--;
+
     queue_offset++;
     if ((sd[symbol_number].count > MAX_INSTANCES_FOR_REMOVE)
         || (sd[symbol_number].hits != sd[symbol_number].count)) {
-      EncodeGoMtf(sd[symbol_number].count, 1, 0);
-      sd[symbol_number].type &= 0xF7;
+      uint16_t context;
+      if (cap_encoded != 0)
+        context = 6 * (sd[symbol_number].count - 1) + (sd[symbol_number].type & 1)
+            + 3 * (((sd[symbol_number].type >> 3) & 3) == 2);
+      else
+        context = 6 * (sd[symbol_number].count - 1);
+      EncodeGoMtf(context, 1, 0);
+      sd[symbol_number].type &= 0xBF;
       add_dictionary_symbol(symbol_number, sd[symbol_number].code_length);
     }
   }
@@ -399,29 +454,30 @@ void update_queue(uint32_t symbol_number, uint8_t in_definition) {
 
 void update_queue_prior_cap(uint32_t symbol_number, uint8_t in_definition) {
   uint8_t queue_position = 0;
-  uint8_t cap_queue_position = 0;
-  while (symbol_number != *(queue + (uint8_t)(queue_position + queue_offset)))
-    if ((sd[*(queue + (uint8_t)(queue_position++ + queue_offset))].type & 2) != 0)
-      cap_queue_position++;
+  uint8_t az_queue_position = 0;
+
+  while (symbol_number != queue[(uint8_t)(queue_position + queue_offset)])
+    if ((sd[queue[(uint8_t)(queue_position++ + queue_offset)]].type & 1) != 0)
+      az_queue_position++;
   while (queue_position != 0) {
-    *(queue + (uint8_t)(queue_offset + queue_position))
-        = *(queue + (uint8_t)(queue_offset + queue_position - 1));
+    queue[(uint8_t)(queue_offset + queue_position)] = queue[(uint8_t)(queue_offset + queue_position - 1)];
     queue_position--;
   }
-  EncodeMtfType(2 * in_definition + 1);
-  EncodeMtfPos(CAP, cap_queue_position, queue_size_cap);
+  EncodeMtfType2(2 + in_definition, 0x2C + 4 * in_definition + (sd[prior_symbol].type & 3));
+  EncodeMtfPosAz(az_queue_position, queue_size_az);
   if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-    EncodeGoMtf(sd[symbol_number].count, 1, 1);
-    *(queue + queue_offset) = symbol_number;
+    uint16_t context = 6 * (sd[symbol_number].count - 1) + 2 + 3 * (((sd[symbol_number].type >> 3) & 3) == 2);
+    EncodeGoMtf(context, 1, 1);
+    queue[queue_offset] = symbol_number;
   }
   else {
     queue_size--;
-    queue_size_cap--;
+    queue_size_az--;
     queue_offset++;
-    if ((sd[symbol_number].count > MAX_INSTANCES_FOR_REMOVE)
-        || (sd[symbol_number].hits != sd[symbol_number].count)) {
-      EncodeGoMtf(sd[symbol_number].count, 1, 0);
-      sd[symbol_number].type &= 0xF7;
+    if ((sd[symbol_number].count > MAX_INSTANCES_FOR_REMOVE) || (sd[symbol_number].hits != sd[symbol_number].count)) {
+      uint16_t context = 6 * (sd[symbol_number].count - 1) + 2 + 3 * (((sd[symbol_number].type >> 3) & 3) == 2);
+      EncodeGoMtf(context, 1, 0);
+      sd[symbol_number].type &= 0xBF;
       add_dictionary_symbol(symbol_number, sd[symbol_number].code_length);
     }
   }
@@ -469,62 +525,30 @@ uint16_t get_mtf_overflow_position(struct symbol_data * sd, uint32_t * queue, ui
 }
 
 
-float get_mtf_score_limit(uint32_t count, uint32_t num_transmits_over_sqrt2) {
-  float score_limit;
-  if (count > (num_transmits_over_sqrt2 >> 11))
-    score_limit = 16.0;
-  else if (count > (num_transmits_over_sqrt2 >> 12))
-    score_limit = 9.5;
-  else if (count > (num_transmits_over_sqrt2 >> 13))
-    score_limit = 8.0;
-  else if (count > (num_transmits_over_sqrt2 >> 14))
-    score_limit = 6.4;
-  else if (count > (num_transmits_over_sqrt2 >> 15))
-    score_limit = 4.8;
-  else if (count > (num_transmits_over_sqrt2 >> 16))
-    score_limit = 3.7;
-  else if (count > (num_transmits_over_sqrt2 >> 17))
-    score_limit = 2.9;
-  else if (count > (num_transmits_over_sqrt2 >> 18))
-    score_limit = 2.5;
-  else if (count > (num_transmits_over_sqrt2 >> 19))
-    score_limit = 2.3;
-  else if (count > (num_transmits_over_sqrt2 >> 20))
-    score_limit = 2.2;
-  else if (count > (num_transmits_over_sqrt2 >> 21))
-    score_limit = 2.1;
-  else if (count > (num_transmits_over_sqrt2 >> 22))
-    score_limit = 2.0;
-  else if (count > (num_transmits_over_sqrt2 >> 23))
-    score_limit = 1.9;
-  else
-    score_limit = 1.8;
-  return(score_limit);
-}
-
-
 void add_mtf_hit_scores(struct symbol_data * sd, uint16_t queue_position, uint32_t num_transmits_over_sqrt2) {
-  if (queue_position <= 4)
-    sd->hits += 61 - 3 * queue_position;
-  else if (queue_position <= 7)
-    sd->hits += 56 - 2 * queue_position;
+  if (queue_position <= 1)
+    sd->hits += 65;
+  else if (queue_position <= 4)
+    sd->hits += 67 - 3 * queue_position;
+  else if (queue_position <= 8)
+    sd->hits += 62 - 2 * queue_position;
   else if (queue_position <= 0xF)
-    sd->hits += 48 - queue_position;
+    sd->hits += 53 - queue_position;
   else if (queue_position <= 0x1F) {
     if (sd->count <= (num_transmits_over_sqrt2 >> 12))
-      sd->hits += 40 - (queue_position >> 1);
+      sd->hits += 45 - (queue_position >> 1);
   }
   else if (queue_position <= 0x3F) {
     if (sd->count <= (num_transmits_over_sqrt2 >> 13))
-      sd->hits += 28 - (queue_position >> 3);
+      sd->hits += 37 - (queue_position >> 2);
   }
   else if (queue_position <= 0x7F) {
     if (sd->count <= (num_transmits_over_sqrt2 >> 14))
-      sd->hits += 22 - (queue_position >> 5);
+      sd->hits += 29 - (queue_position >> 3);
   }
-  else if (queue_position <= 0xFF) {
+  else {
     if (sd->count <= (num_transmits_over_sqrt2 >> 15))
-      sd->hits += 20 - (queue_position >> 6);
+      sd->hits += 21 - (queue_position >> 4);
   }
 }
 
@@ -539,7 +563,7 @@ void encode_dictionary_symbol(uint32_t symbol) {
   code_length = sd[symbol].code_length;
   if (cap_encoded != 0) {
     if (prior_end != 0xA)
-      EncodeFirstChar(first_char, (sd[prior_symbol].type & 0x60) >> 5, prior_end);
+      EncodeFirstChar(first_char, (sd[prior_symbol].type & 0x18) >> 3, prior_end);
   }
   else if (UTF8_compliant != 0)
     EncodeFirstChar(first_char, 0, prior_end);
@@ -611,8 +635,7 @@ uint32_t count_symbols(uint32_t symbol) {
 
 
 void get_embedded_symbols(uint32_t define_symbol) {
-  uint32_t symbol;
-  uint32_t *define_string_ptr, *define_string_end_ptr;
+  uint32_t symbol, *define_string_ptr, *define_string_end_ptr;
 
   if (define_symbol >= num_base_symbols) {
     define_string_ptr = symbol_array + sd[define_symbol].define_symbol_start_index;
@@ -624,23 +647,20 @@ void get_embedded_symbols(uint32_t define_symbol) {
         get_embedded_symbols(symbol);
       else {
         transmits[sd[symbol].previous].distance = num_transmits - sd[symbol].previous;
-        transmits[num_transmits].previous_index = sd[symbol].previous;
         transmits[num_transmits].distance = 0xFFFFFFFF;
+        sd[symbol].previous2 = sd[symbol].previous;
         sd[symbol].previous = num_transmits++;
       }
     } while (define_string_ptr != define_string_end_ptr);
   }
-  if (sd[define_symbol].count != 1) {
-    sd[define_symbol].previous = num_transmits;
-    transmits[num_transmits++].previous_index = 0xFFFFFFFF;
-  }
+  if (sd[define_symbol].count != 1)
+    sd[define_symbol].previous = num_transmits++;
   return;
 }
 
 
 void get_embedded_symbols2(uint32_t define_symbol) {
-  uint32_t symbol;
-  uint32_t *define_string_ptr, *define_string_end_ptr;
+  uint32_t symbol, *define_string_ptr, *define_string_end_ptr;
 
   if (define_symbol >= num_base_symbols) {
     define_string_ptr = symbol_array + sd[define_symbol].define_symbol_start_index;
@@ -651,30 +671,28 @@ void get_embedded_symbols2(uint32_t define_symbol) {
         get_embedded_symbols2(symbol);
       else {
         transmits[sd[symbol].previous].distance = num_transmits - sd[symbol].previous;
-        transmits[num_transmits].previous_index = sd[symbol].previous;
         transmits[num_transmits].symbol = symbol;
         transmits[num_transmits].distance = 0xFFFFFFFF;
         sd[symbol].previous = num_transmits++;
-        if ((sd[prior_symbol].type & 0x20) != 0) {
+        if ((sd[prior_symbol].type & 8) != 0) {
           if (sd[symbol].starts == 0x20)
             sd[prior_symbol].space_score++;
           else
-            sd[prior_symbol].space_score -= 4;
+            sd[prior_symbol].space_score -= 5;
         }
         prior_symbol = symbol;
       }
     } while (define_string_ptr != define_string_end_ptr);
     define_string_ptr--;
-    sd[define_symbol].type |= sd[symbol].type & 0x30;
-    while (((sd[define_symbol].type & 0x10) == 0)
+    sd[define_symbol].type |= sd[symbol].type & 0xC;
+    while (((sd[define_symbol].type & 4) == 0)
         && (define_string_ptr-- != symbol_array + sd[define_symbol].define_symbol_start_index))
       get_symbol_category(*define_string_ptr, &sd[define_symbol].type);
   }
   prior_symbol = define_symbol;
   if (sd[define_symbol].count != 1) {
     sd[define_symbol].previous = num_transmits;
-    transmits[num_transmits].symbol = define_symbol;
-    transmits[num_transmits++].previous_index = 0xFFFFFFFF;
+    transmits[num_transmits++].symbol = define_symbol;
   }
   return;
 }
@@ -685,7 +703,6 @@ uint8_t embed_define_binary(uint32_t define_symbol, uint8_t in_definition) {
   uint32_t define_symbol_instances, symbols_in_definition, symbol, symbol_inst;
   uint8_t new_symbol_code_length, SID_symbol;
 
-  EncodeNewType(2 * in_definition);
   define_symbol_instances = sd[define_symbol].count;
   if (define_symbol_instances != 1)
     new_symbol_code_length = sd[define_symbol].code_length;
@@ -775,43 +792,46 @@ uint8_t embed_define_binary(uint32_t define_symbol, uint8_t in_definition) {
       symbol = *define_string_ptr++;
       symbol_inst = sd[symbol].hits++;
       if (symbol_inst == 0) {
+        EncodeNewType1(1);
         if (embed_define_binary(symbol, 1) == 0)
           return(0);
       }
       else {
-        if ((sd[symbol].type & 8) != 0) {
+        if ((sd[symbol].type & 0x40) != 0) {
           if (prior_is_cap == 0)
             update_queue(symbol, 1);
           else
             update_queue_prior_cap(symbol, 1);
         }
         else {
-          EncodeDictType(2);
+          EncodeDictType1(1);
           encode_dictionary_symbol(symbol);
           if (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE) {
             if (sd[symbol].count == sd[symbol].hits)
               remove_dictionary_symbol(symbol, sd[symbol].code_length);
             else if (use_mtf != 0) {
-              if ((sd[symbol].type & 4) != 0) {
+              if ((sd[symbol].type & 2) != 0) {
                 if (transmits[num_transmits].distance != 0xFFFFFFFF) {
                   if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0))
-                    EncodeGoMtf(sd[symbol].count, 0, 1);
+                    EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 1);
                   remove_dictionary_symbol(symbol, sd[symbol].code_length);
                   add_symbol_to_queue(symbol);
                 }
-                else
-                  EncodeGoMtf(sd[symbol].count, 0, 0);
+                else {
+                  EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 0);
+                }
               }
             }
           }
-          else if ((sd[symbol].type & 4) != 0) {
+          else if ((sd[symbol].type & 2) != 0) {
             if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 1);
+              EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 1);
               remove_dictionary_symbol(symbol, sd[symbol].code_length);
               add_symbol_to_queue(symbol);
             }
-            else
-              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 0);
+            else {
+              EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 0);
+            }
           }
         }
         num_transmits++;
@@ -828,48 +848,56 @@ uint8_t embed_define_binary(uint32_t define_symbol, uint8_t in_definition) {
 
   if ((use_mtf != 0) && ((new_symbol_code_length >= 11) || (define_symbol_instances <= MAX_INSTANCES_FOR_REMOVE))) {
     if (define_symbol_instances > MAX_INSTANCES_FOR_REMOVE) {
-      if ((sd[define_symbol].type & 4) != 0) {
-        EncodeERG(0, 1);
+      uint16_t context = new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE - 1;
+      uint16_t context2 = 240;
+      if ((sd[define_symbol].type & 2) != 0) {
+        EncodeERG(context, context2, 1);
         if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-          EncodeGoMtf(new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE, 2, 1);
+          EncodeGoMtf(context, 2, 1);
           add_symbol_to_queue(define_symbol);
         }
         else {
-          EncodeGoMtf(new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE, 2, 0);
+          EncodeGoMtf(context, 2, 0);
           if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
             return(0);
         }
       }
       else {
-        EncodeERG(0, 0);
-        if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
-          return(0);
-      }
-    }
-    else if ((sd[define_symbol].type & 4) != 0) {
-      EncodeERG(define_symbol_instances + 1, 1);
-      if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-        if (define_symbol_instances > 2)
-          EncodeGoMtf(define_symbol_instances, 2, 1);
-        add_symbol_to_queue(define_symbol);
-      }
-      else {
-        if (define_symbol_instances > 2)
-          EncodeGoMtf(define_symbol_instances, 2, 0);
+        EncodeERG(context, context2, 0);
         if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
           return(0);
       }
     }
     else {
-      EncodeERG(define_symbol_instances + 1, 0);
-      if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
-        return(0);
+      uint16_t context = define_symbol_instances - 1;
+      uint16_t context2 = 240 + new_symbol_code_length;
+      if ((sd[define_symbol].type & 2) != 0) {
+        EncodeERG(context, context2, 1);
+        if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+          if (define_symbol_instances > 2) {
+            EncodeGoMtf(context, 2, 1);
+          }
+          add_symbol_to_queue(define_symbol);
+        }
+        else {
+          if (define_symbol_instances > 2) {
+            EncodeGoMtf(context, 2, 0);
+          }
+          if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+            return(0);
+        }
+      }
+      else {
+        EncodeERG(context, context2, 0);
+        if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+          return(0);
+      }
     }
   }
   else if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
     return(0);
   num_transmits++;
-  return (1);
+  return(1);
 }
 
 
@@ -878,8 +906,8 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
   uint32_t define_symbol_instances, symbols_in_definition, symbol, symbol_inst;
   uint8_t new_symbol_code_length, SID_symbol;
   uint8_t tag_type = 0;
+  uint8_t saved_prior_is_cap = prior_is_cap;
 
-  EncodeNewType(2 * in_definition + prior_is_cap);
   define_symbol_instances = sd[define_symbol].count;
   if (define_symbol_instances != 1)
     new_symbol_code_length = sd[define_symbol].code_length;
@@ -1072,7 +1100,7 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
       }
     }
     prior_symbol = define_symbol;
-    prior_is_cap = sd[define_symbol].type & 1;
+    prior_is_cap = (sd[define_symbol].type & 0x20) >> 5;
     if (found_first_symbol == 0) {
       found_first_symbol = 1;
       end_char = prior_end;
@@ -1125,7 +1153,6 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
         EncodeExtraLength((extra_symbols >> data_bits) & 3);
       }
     }
-    uint8_t saved_prior_is_cap = prior_is_cap;
 
     // write the symbol string
     define_string_ptr = define_symbol_start_ptr;
@@ -1133,46 +1160,78 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
       symbol = *define_string_ptr++;
       symbol_inst = sd[symbol].hits++;
       if (symbol_inst == 0) {
+        if (cap_encoded != 0) {
+          if (prior_is_cap == 0)
+            EncodeNewType3(1, 5 + (sd[prior_symbol].type & 0x18) + 2 * (sd[prior_symbol].type & 7), prior_end);
+          else
+            EncodeNewType2(3, 0x30 + (sd[prior_symbol].type & 3));
+        }
+        else {
+          EncodeNewType1(1);
+        }
         if (embed_define(symbol, 1) == 0)
           return(0);
       }
       else {
-        if ((sd[symbol].type & 8) != 0) {
+        if ((sd[symbol].type & 0x40) != 0) {
           if (prior_is_cap == 0)
             update_queue(symbol, 1);
           else
             update_queue_prior_cap(symbol, 1);
         }
         else {
-          EncodeDictType(2 + prior_is_cap);
+          if (cap_encoded != 0) {
+            if (prior_is_cap == 0)
+              EncodeDictType3(1, 5 + (sd[prior_symbol].type & 0x18) + 2 * (sd[prior_symbol].type & 7), prior_end);
+            else
+              EncodeDictType2(3, 0x30 + (sd[prior_symbol].type & 3));
+          }
+          else
+            EncodeDictType1(1);
           encode_dictionary_symbol(symbol);
           if (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE) {
             if (sd[symbol].count == sd[symbol].hits)
               remove_dictionary_symbol(symbol, sd[symbol].code_length);
             else if (use_mtf != 0) {
-              if ((sd[symbol].type & 4) != 0) {
+              if ((sd[symbol].type & 2) != 0) {
                 if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0))
-                    EncodeGoMtf(sd[symbol].count, 0, 1);
+                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0)) {
+                    if (cap_encoded != 0)
+                      EncodeGoMtf(6 * (sd[symbol].count - 1) + prior_is_cap + (sd[symbol].type & 1)
+                          + 3 * (((sd[symbol].type >> 3) & 3) == 2), 0, 1);
+                    else
+                      EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 1);
+                  }
                   remove_dictionary_symbol(symbol, sd[symbol].code_length);
                   add_symbol_to_queue(symbol);
                 }
-                else
-                  EncodeGoMtf(sd[symbol].count, 0, 0);
+                else {
+                  if (cap_encoded != 0)
+                    EncodeGoMtf(6 * (sd[symbol].count - 1) + prior_is_cap
+                        + (sd[symbol].type & 1) + 3 * (((sd[symbol].type >> 3) & 3) == 2), 0, 0);
+                  else
+                    EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 0);
+                }
               }
             }
           }
-          else if ((sd[symbol].type & 4) != 0) {
+          else if ((sd[symbol].type & 2) != 0) {
+            uint16_t context;
+            if (cap_encoded != 0)
+              context = 6 * (sd[symbol].count - 1) + prior_is_cap + (sd[symbol].type & 1) + 3 * (((sd[symbol].type >> 3) & 3) == 2);
+            else
+              context = 6 * (sd[symbol].count - 1);
             if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 1);
+              EncodeGoMtf(context, 0, 1);
               remove_dictionary_symbol(symbol, sd[symbol].code_length);
               add_symbol_to_queue(symbol);
             }
-            else
-              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 0);
+            else {
+              EncodeGoMtf(context, 0, 0);
+            }
           }
         }
-        prior_is_cap = sd[symbol].type & 1;
+        prior_is_cap = (sd[symbol].type & 0x20) >> 5;
         prior_symbol = symbol;
         num_transmits++;
       }
@@ -1187,56 +1246,81 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
           MAX_INSTANCES_FOR_REMOVE - 1 + max_regular_code_length - new_symbol_code_length);
 
     if (cap_encoded != 0) {
-      if ((sd[define_symbol].type & 0x40) != 0) {
-        if ((sd[define_symbol].type & 0x20) != 0)
+      if ((sd[define_symbol].type & 0x10) != 0) {
+        if ((sd[define_symbol].type & 8) == 0)
           tag_type++;
-        EncodeWordTag(tag_type++);
+        EncodeWordTag(tag_type++, prior_end);
       }
-      else if ((sd[symbol_array[sd[define_symbol + 1].define_symbol_start_index - 2]].type & 0x60)
-            > (sd[define_symbol].type & 0x60))
+      else if ((sd[symbol_array[sd[define_symbol + 1].define_symbol_start_index - 2]].type & 0x18)
+            > (sd[define_symbol].type & 0x18))
         sd[define_symbol].type
-            += (sd[symbol_array[sd[define_symbol + 1].define_symbol_start_index - 2]].type & 0x60) - 0x20;
+            += (sd[symbol_array[sd[define_symbol + 1].define_symbol_start_index - 2]].type & 0x18) - 8;
     }
   }
 
   if ((use_mtf != 0) && ((new_symbol_code_length >= 11) || (define_symbol_instances <= MAX_INSTANCES_FOR_REMOVE))) {
     if (define_symbol_instances > MAX_INSTANCES_FOR_REMOVE) {
-      if ((sd[define_symbol].type & 4) != 0) {
-        EncodeERG(tag_type, 1);
+      uint16_t context, context2;
+      if (cap_encoded != 0) {
+        context = 6 * (new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE - 1) + saved_prior_is_cap
+            + (sd[define_symbol].type & 1) + 3 * (((sd[define_symbol].type >> 3) & 3) == 2);
+        context2 = 240 + ((((sd[define_symbol].type >> 3) & 3) == 2) << 1) + (sd[define_symbol].type & 1);
+      }
+      else {
+        context = new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE - 1;
+        context2 = 240;
+      }
+      if ((sd[define_symbol].type & 2) != 0) {
+        EncodeERG(context, context2, 1);
         if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-          EncodeGoMtf(new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE, 2, 1);
+          EncodeGoMtf(context, 2, 1);
           add_symbol_to_queue(define_symbol);
         }
         else {
-          EncodeGoMtf(new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE, 2, 0);
+          EncodeGoMtf(context, 2, 0);
           if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
             return(0);
         }
       }
       else {
-        EncodeERG(tag_type, 0);
-        if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
-          return(0);
-      }
-    }
-    else if ((sd[define_symbol].type & 4) != 0) {
-      EncodeERG(define_symbol_instances + 1, 1);
-      if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-        if (define_symbol_instances > 2)
-          EncodeGoMtf(define_symbol_instances, 2, 1);
-        add_symbol_to_queue(define_symbol);
-      }
-      else {
-        if (define_symbol_instances > 2)
-          EncodeGoMtf(define_symbol_instances, 2, 0);
+        EncodeERG(context, context2, 0);
         if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
           return(0);
       }
     }
     else {
-      EncodeERG(define_symbol_instances + 1, 0);
-      if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
-        return(0);
+      uint16_t context, context2;
+      if (cap_encoded != 0) {
+        context = 6 * (define_symbol_instances - 1) + saved_prior_is_cap + (sd[define_symbol].type & 1)
+            + 3 * (((sd[define_symbol].type >> 3) & 3) == 2);
+        context2 = 240 + (4 * new_symbol_code_length) + ((((sd[define_symbol].type >> 3) & 3) == 2) << 1)
+            + (sd[define_symbol].type & 1);
+      }
+      else {
+        context = define_symbol_instances - 1;
+        context2 = 240 + new_symbol_code_length;
+      }
+      if ((sd[define_symbol].type & 2) != 0) {
+        EncodeERG(context, context2, 1);
+        if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+          if (define_symbol_instances > 2) {
+            EncodeGoMtf(context, 2, 1);
+          }
+          add_symbol_to_queue(define_symbol);
+        }
+        else {
+          if (define_symbol_instances > 2) {
+            EncodeGoMtf(context, 2, 0);
+          }
+          if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+            return(0);
+        }
+      }
+      else {
+        EncodeERG(context, context2, 0);
+        if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+          return(0);
+      }
     }
   }
   else if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
@@ -1272,7 +1356,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   uint8_t temp_char, base_bits, format, verbose, code_length, increase_length, decrease_length;
   uint8_t *in_char_ptr, *end_char_ptr;
   uint16_t queue_position;
-  uint32_t i, j, num_symbols_defined, num_definitions_to_code, grammar_size, dictionary_size;
+  uint32_t i, j, k, num_symbols_defined, num_definitions_to_code, grammar_size, dictionary_size;
   uint32_t num_more_than_15_inst_definitions, num_greater_500, num_transmits_over_sqrt2, num_mtfs;
   uint32_t UTF8_value, max_UTF8_value, symbol, symbol_inst, prior_repeats, next_symbol;
   uint32_t min_ranked_symbols, ranked_symbols_save, num_new_symbols, num_symbols_to_code, num_rules_reversed;
@@ -1308,6 +1392,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       max_UTF8_value = 0x7F;
     }
   }
+
   if ((symbol_array = (uint32_t *)malloc(sizeof(uint32_t) * in_size)) == 0) {
     fprintf(stderr, "Symbol memory allocation failed\n");
     return(0);
@@ -1413,23 +1498,23 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       sd[i++].type = 0;
     } while (i != 0x61);
     do {
-      sd[i++].type = 2;
+      sd[i++].type = 1;
     } while (i != 0x7B);
     do {
       sd[i++].type = 0;
     } while (i != num_base_symbols);
-    sd[' '].type = 0x10;
-    sd['B'].type = 0x11;
-    sd['C'].type = 0x11;
+    sd[' '].type = 4;
+    sd['B'].type = 0x24;
+    sd['C'].type = 0x24;
     while (i < num_codes) {
       next_symbol = symbol_array[sd[i].define_symbol_start_index];
       while (next_symbol > i)
         next_symbol = symbol_array[sd[next_symbol].define_symbol_start_index];
-      sd[i].type = sd[next_symbol].type & 2;
+      sd[i].type = sd[next_symbol].type & 1;
       next_symbol = symbol_array[sd[i + 1].define_symbol_start_index - 2];
       while (next_symbol > i)
         next_symbol = symbol_array[sd[next_symbol + 1].define_symbol_start_index - 2];
-      sd[i++].type |= sd[next_symbol].type & 1;
+      sd[i++].type |= sd[next_symbol].type & 0x20;
     }
   }
   else {
@@ -1446,10 +1531,13 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   min_ranked_symbols_ptr = ranked_symbols_ptr;
 
   // move single instance symbols to the end of the sorted symbols array
+  rules_reduced = 0;
   ranked_symbols_ptr = ranked_symbols;
   while (ranked_symbols_ptr < min_ranked_symbols_ptr) {
     if (sd[*ranked_symbols_ptr].count == 1) { // move this symbol to the top of the moved to end 1 instance symbols
       ranked_symbols_save = *ranked_symbols_ptr;
+      if (ranked_symbols_save >= num_base_symbols)
+        rules_reduced++;
       *ranked_symbols_ptr = *--min_ranked_symbols_ptr;
       *min_ranked_symbols_ptr = ranked_symbols_save;
     }
@@ -1457,13 +1545,6 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       ranked_symbols_ptr++;
   }
   min_one_instance_ranked_symbols_ptr = min_ranked_symbols_ptr;
-
-  rules_reduced = 0;
-  if (num_symbols_defined != 0) {
-    for (i = num_base_symbols ; i < num_codes; i++)
-      if (sd[i].count == 1)
-        rules_reduced++;
-  }
 
 #ifdef PRINTON
   double order_0_entropy = 0.0;
@@ -1540,6 +1621,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
 #endif
 
   grammar_size -= num_symbols_defined - rules_reduced;
+  num_new_symbols = end_ranked_symbols_ptr - ranked_symbols - rules_reduced;
 
 #ifdef PRINTON
   order_0_entropy = 0.0;
@@ -1562,7 +1644,6 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     double d_symbol_count = (double)(num_symbols_defined - rules_reduced);
     order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
   }
-  num_new_symbols = end_ranked_symbols_ptr - ranked_symbols - rules_reduced;
   double code_entropy = 0.0;
   if (num_symbols_defined != 0) {
     uint32_t len_codes = num_symbols_defined - rules_reduced;
@@ -1836,8 +1917,8 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     }
     else {
       transmits[sd[symbol].previous].distance = num_transmits - sd[symbol].previous;
-      transmits[num_transmits].previous_index = sd[symbol].previous;
       transmits[num_transmits].distance = 0xFFFFFFFF;
+      sd[symbol].previous2 = sd[symbol].previous;
       sd[symbol].previous = num_transmits++;
     }
   }
@@ -1868,20 +1949,14 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   uint32_t num_2_inst_definitions = num_definitions_to_code - i;
   num_rules_reversed = 0;
   while (i < num_definitions_to_code) {
-    uint32_t * define_string_ptr = symbol_array + sd[ranked_symbols[i]].define_symbol_start_index;
-    uint32_t * define_string_end_ptr = symbol_array + sd[ranked_symbols[i] + 1].define_symbol_start_index - 1;
-    if (define_string_end_ptr - define_string_ptr == 2) {
+    if (sd[ranked_symbols[i] + 1].define_symbol_start_index - sd[ranked_symbols[i]].define_symbol_start_index == 3) {
       uint32_t last_transmit = sd[ranked_symbols[i]].previous;
-      uint32_t distance = last_transmit - transmits[last_transmit].previous_index;
-      float score = 0.0;
-      if ((distance <= num_transmits / 20))
-        score = (float)log2((double)num_transmits / (2.0 * (double)distance)) - 1.5 * log2((double)distance) + 10.5;
+      uint32_t distance = last_transmit - sd[ranked_symbols[i]].previous2;
+      float score = (float)log2((double)num_transmits / (2.0 * (double)distance)) - 1.5 * log2((double)distance) + 10.5;
       if (score <= 0.0) {
-        float cost = 1.0 + (float)log2(((double)(sd[*define_string_ptr].count - 1)
-            * (double)(sd[*(define_string_ptr + 1)].count - 1)) / (double)num_2_inst_definitions);
-        if (sd[ranked_symbols[i]].hits != 0)
-          cost -= (float)sd[ranked_symbols[i]].hits;
-        if (cost >= 0.0) {
+        uint32_t * define_string_ptr = symbol_array + sd[ranked_symbols[i]].define_symbol_start_index;
+        if ((uint64_t)((4 >> sd[ranked_symbols[i]].hits) * (sd[*define_string_ptr].count - 1))
+            * (uint64_t)(sd[*(define_string_ptr + 1)].count - 1) >= (uint64_t)num_2_inst_definitions) {
           sd[ranked_symbols[i]].code_length = 1;
           num_rules_reversed++;
         }
@@ -1890,9 +1965,8 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     i++;
   }
 
-  // unmark rules that contain reversed rules
-  i = num_definitions_to_code - num_2_inst_definitions;
-  while (i < num_definitions_to_code) {
+  // unmark rules that contain reversed rules then update symbol array
+  for (i = num_definitions_to_code - num_2_inst_definitions ; i < num_definitions_to_code ; i++) {
     if (sd[ranked_symbols[i]].code_length != 0) {
       uint32_t * define_string_ptr = symbol_array + sd[ranked_symbols[i]].define_symbol_start_index;
       if ((sd[*define_string_ptr].code_length != 0) || (sd[*(define_string_ptr + 1)].code_length != 0)) {
@@ -1900,9 +1974,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
         num_rules_reversed--;
       }
     }
-    i++;
   }
-
   symbol2_ptr = symbol_array2;
   symbol_ptr = symbol_array;
   while (symbol_ptr < end_symbol_ptr) {
@@ -1945,9 +2017,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       }
     }
   }
-  if (++prior_symbol != num_codes)
-    sd[prior_symbol].define_symbol_start_index = symbol2_ptr - symbol_array2 + 1;
-  sd[num_codes].define_symbol_start_index = symbol2_ptr - symbol_array2 + 1;
+  sd[++prior_symbol].define_symbol_start_index = symbol2_ptr - symbol_array2 + 1;
 
   i = 0;
   while (i < num_definitions_to_code) {
@@ -1962,12 +2032,23 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       if ((i != 0) && (sd[ranked_symbols[i]].count > sd[ranked_symbols[i - 1]].count)) {
         uint32_t temp_symbol = ranked_symbols[i];
         uint32_t temp_count = sd[temp_symbol].count;
-        uint32_t new_rank = i - 1;
+        uint32_t new_rank = i;
         while ((new_rank != 0) && (temp_count > sd[ranked_symbols[new_rank - 1]].count)) {
-          ranked_symbols[new_rank + 1] = ranked_symbols[new_rank];
+          while ((new_rank >= 1001) && (sd[ranked_symbols[new_rank - 1]].count == sd[ranked_symbols[new_rank - 1001]].count)) {
+            ranked_symbols[new_rank] = ranked_symbols[new_rank - 1000];
+            new_rank -= 1000;
+          }
+          while ((new_rank >= 33) && (sd[ranked_symbols[new_rank - 1]].count == sd[ranked_symbols[new_rank - 33]].count)) {
+            ranked_symbols[new_rank] = ranked_symbols[new_rank - 32];
+            new_rank -= 32;
+          }
+          while ((new_rank >= 2) && (sd[ranked_symbols[new_rank - 1]].count == sd[ranked_symbols[new_rank - 2]].count)) {
+            ranked_symbols[new_rank] = ranked_symbols[new_rank - 1];
+            new_rank -= 1;
+          }
+          ranked_symbols[new_rank] = ranked_symbols[new_rank - 1];
           new_rank--;
         }
-        ranked_symbols[new_rank + 1] = ranked_symbols[new_rank];
         ranked_symbols[new_rank] = temp_symbol;
       }
       i++;
@@ -1988,15 +2069,14 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       get_embedded_symbols2(symbol);
     else {
       transmits[sd[symbol].previous].distance = num_transmits - sd[symbol].previous;
-      transmits[num_transmits].previous_index = sd[symbol].previous;
       transmits[num_transmits].symbol = symbol;
       transmits[num_transmits].distance = 0xFFFFFFFF;
       sd[symbol].previous = num_transmits++;
-      if (sd[prior_symbol].type >= 0x20) {
+      if ((sd[prior_symbol].type & 0x18) != 0) {
         if (sd[symbol].starts == 0x20)
           sd[prior_symbol].space_score++;
         else
-          sd[prior_symbol].space_score -= 4;
+          sd[prior_symbol].space_score -= 5;
       }
       prior_symbol = symbol;
     }
@@ -2009,231 +2089,146 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   if (use_mtf != 0) {
     for (i = 0 ; i < num_codes ; i++) {
       if ((sd[i].count <= (num_transmits_over_sqrt2 >> 10)) || (sd[i].count <= MAX_INSTANCES_FOR_REMOVE))
-        sd[i].type |= 4;
-    }
-    for (i = 0 ; i < num_codes ; i++)
+        sd[i].type |= 2;
       sd[i].hits = 0;
+      sd[i].array_index = 0; // temporary use as instance counter
+    }
+    queue_size = 0;
 
     for (i = 0 ; i < num_transmits ; i++) {
-      uint32_t distance = transmits[i].distance;
-      if (distance != 0xFFFFFFFF) {
-        uint32_t symbol = transmits[i].symbol;
-        if (((sd[symbol].type & 4) != 0) && (distance <= num_transmits / (10 * sd[symbol].count))) {
-          transmits[i].score = (float)log2((double)num_transmits / ((double)sd[symbol].count * (double)distance))
-              - 1.5 * log2((double)distance) + 10.5;
-          if (transmits[i].score < 0.0) {
-            transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
-            transmits[i].distance = 0xFFFFFFFF;
+      uint32_t symbol = transmits[i].symbol;
+      sd[symbol].array_index++;
+      if ((sd[symbol].type & 0x40) != 0) {
+        queue_position = 0;
+        while (queue[queue_position] != symbol)
+          queue_position++;
+        add_mtf_hit_scores(&sd[symbol], queue_position, num_transmits_over_sqrt2);
+        sd[symbol].previous = i;
+        if (transmits[i].distance != 0xFFFFFFFF) {
+          if (((sd[symbol].type & 2) != 0)
+              && ((uint64_t)transmits[i].distance * 4 * (uint64_t)sd[symbol].count <= num_transmits)) {
+            if ((sd[symbol].array_index + 1 == sd[symbol].count) && (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE))
+              // next to last instance
+              sd[symbol].score = (float)((log2((double)num_transmits / ((double)sd[symbol].count
+                  * (double)transmits[i].distance)) - 1.5) / (double)transmits[i].distance) - 0.001;
+            else if (transmits[i].distance > transmits[i + transmits[i].distance].distance)
+              sd[symbol].score = (float)((log2((double)num_transmits / ((double)sd[symbol].count
+                  * (double)transmits[i].distance)) - 0.0) / (double)transmits[i].distance) - 0.001;
+            else
+              sd[symbol].score = (float)((log2((double)num_transmits / ((double)sd[symbol].count
+                  * (double)transmits[i].distance)) - 3.0) / (double)transmits[i].distance) - 0.001;
+            if (sd[symbol].score >= 0.0) {
+              num_mtfs++;
+              while (queue_position-- != 0)
+                queue[queue_position + 1] = queue[queue_position];
+              queue[0] = symbol;
+            }
+            else
+              transmits[i].distance = 0xFFFFFFFF;
           }
           else
+            transmits[i].distance = 0xFFFFFFFF;
+        }
+        if (transmits[i].distance == 0xFFFFFFFF) {
+          sd[symbol].type &= 0xBF;
+          queue_size--;
+          while (queue_position != queue_size) {
+            queue[queue_position] = queue[queue_position + 1];
+            queue_position++;
+          }
+        }
+      }
+      else if (transmits[i].distance != 0xFFFFFFFF) {
+        if (((sd[symbol].type & 2) != 0) && (transmits[i].distance <= num_transmits / (4 * sd[symbol].count))) {
+          if ((sd[symbol].array_index + 1 == sd[symbol].count) && (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE))
+            sd[symbol].score = (float)((log2((double)num_transmits / ((double)sd[symbol].count
+                * (double)transmits[i].distance)) - 4.0) / (double)transmits[i].distance) - 0.001;
+          else if (transmits[i].distance > transmits[i + transmits[i].distance].distance)
+            sd[symbol].score = (float)((log2((double)num_transmits / ((double)sd[symbol].count
+                * (double)transmits[i].distance)) - 3.0) / (double)transmits[i].distance) - 0.001;
+          else
+            sd[symbol].score = (float)((log2((double)num_transmits / ((double)sd[symbol].count
+                * (double)transmits[i].distance)) - 5.0) / (double)transmits[i].distance) - 0.001;
+          if (sd[symbol].score >= 0.0) {
             num_mtfs++;
+            sd[symbol].previous = i;
+            if (queue_size < 0x100) {
+              sd[symbol].type |= 0x40;
+              queue_position = queue_size++;
+              while (queue_position-- != 0)
+                queue[queue_position + 1] = queue[queue_position];
+              queue[0] = symbol;
+            }
+            else {
+              float low_score = sd[symbol].score;
+              uint16_t low_score_pos = 0x100;
+              for (k = 0 ; k <= 0xFF ; k++) {
+                j = sd[queue[k]].previous;
+                if (sd[queue[k]].score * (float)transmits[j].distance / (float)(transmits[j].distance - (i - j))
+                    < low_score) {
+                  low_score
+                      = sd[queue[k]].score * (float)transmits[j].distance / (float)(transmits[j].distance - (i - j));
+                  low_score_pos = k;
+                }
+              }
+              if (low_score_pos != 0x100) {
+                sd[symbol].type |= 0x40;
+                sd[queue[low_score_pos]].type &= 0xBF;
+                j = sd[queue[low_score_pos]].previous;
+                queue_position = low_score_pos;
+                while (queue_position-- != 0)
+                 queue[queue_position + 1] = queue[queue_position];
+                queue[0] = symbol;
+                transmits[j].distance = 0xFFFFFFFF;
+              }
+              else
+                transmits[i].distance = 0xFFFFFFFF;
+            }
+          }
+          else
+            transmits[i].distance = 0xFFFFFFFF;
         }
-        else {
-          transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
+        else
           transmits[i].distance = 0xFFFFFFFF;
-        }
       }
     }
 #ifdef PRINTON
   fprintf(stderr, "Found %u MTF candidates, ", (unsigned int)num_mtfs);
 #endif
 
-    queue_size = 0;
-    for (i = 0 ; i < num_transmits ; i++) {
-      uint16_t limit_position;
-      uint32_t symbol = transmits[i].symbol;
-      sd[symbol].previous = i;
-
-      if ((sd[symbol].type & 8) != 0) {
-        queue_position = 0;
-        while (queue[queue_position] != symbol)
-          queue_position++;
-        add_mtf_hit_scores(&sd[symbol], queue_position, num_transmits_over_sqrt2);
-        if (transmits[i].distance != 0xFFFFFFFF) {
-          limit_position = get_mtf_overflow_position(sd, queue, queue_position, num_transmits_over_sqrt2);
-          if (limit_position != 0) {
-            sd[queue[limit_position]].type &= 0xF7;
-            queue_size--;
-            while (queue_position != queue_size) {
-              queue[queue_position] = queue[queue_position + 1];
-              queue_position++;
-            }
-            queue_position = limit_position;
-          }
-          while (queue_position-- != 0)
-            queue[queue_position + 1] = queue[queue_position];
-          queue[0] = symbol;
-        }
-        else {
-          sd[symbol].type &= 0xF7;
-          queue_size--;
-          while (queue_position != queue_size) {
-            queue[queue_position] = queue[queue_position + 1];
-            queue_position++;
-          }
-        }
-      }
-      else if (transmits[i].distance != 0xFFFFFFFF) {
-        sd[symbol].type |= 8;
-        limit_position = get_mtf_overflow_position(sd, queue, queue_size, num_transmits_over_sqrt2);
-        if (limit_position != 0) {
-          sd[queue[limit_position]].type &= 0xF7;
-          queue_position = limit_position;
-        }
-        else {
-          if (queue_size == 0x1A0) {
-            float low_score = transmits[sd[queue[0x19F]].previous].score;
-            uint16_t low_score_pos = 0x19F;
-            for (j = 0 ; j < 0x19F ; j++) {
-              if (transmits[sd[queue[j]].previous].score < low_score) {
-                low_score = transmits[sd[queue[j]].previous].score;
-                low_score_pos = j;
-              }
-            }
-            sd[queue[low_score_pos]].type &= 0xF7;
-            queue_position = low_score_pos;
-          }
-          else {
-            queue_position = queue_size++;
-          }
-        }
-        while (queue_position-- != 0)
-          queue[queue_position + 1] = queue[queue_position];
-        queue[0] = symbol;
-      }
-    }
     for (i = 0 ; i < num_codes ; i++) {
-      if (((sd[i].type & 4) != 0) && (sd[i].count > MAX_INSTANCES_FOR_REMOVE)
-          && ((float)sd[i].hits < get_mtf_score_limit(sd[i].count, num_transmits_over_sqrt2) * (float)(sd[i].count - 1)))
-        sd[i].type &= 0xFB;
-      sd[i].hits = 0;
-    }
-
-    queue_size = 0;
-    for (i = 0 ; i < num_transmits ; i++) {
-      uint32_t symbol = transmits[i].symbol;
-      sd[symbol].previous = i;
-      if ((sd[symbol].type & 8) != 0) {
-        queue_position = 0;
-        while (queue[queue_position] != symbol)
-          queue_position++;
-        add_mtf_hit_scores(&sd[symbol], queue_position, num_transmits_over_sqrt2);
-        if (transmits[i].distance != 0xFFFFFFFF) {
-          while (queue_position-- != 0)
-            queue[queue_position + 1] = queue[queue_position];
-          queue[0] = symbol;
+      if ((sd[i].type & 2) != 0) {
+        if (sd[i].count > MAX_INSTANCES_FOR_REMOVE) {
+          if ((float)sd[i].hits < (float)(sd[i].count - 1)
+              * (1.0 + 0.03 * pow(22.0 - log2((float)num_transmits_over_sqrt2 / (float)sd[i].count), 2.5)))
+            sd[i].type &= 0xFD;
         }
-        else {
-          sd[symbol].type &= 0xF7;
-          queue_size--;
-          while (queue_position != queue_size) {
-            queue[queue_position] = queue[queue_position + 1];
-            queue_position++;
-          }
-        }
+        else if (sd[i].hits == 0)
+          sd[i].type &= 0xFD;
       }
-      else if (transmits[i].distance != 0xFFFFFFFF) {
-        if ((sd[symbol].type & 4) != 0) {
-          sd[symbol].type |= 8;
-          if (queue_size == 0x100) {
-            float low_score = transmits[sd[queue[0xFF]].previous].score;
-            uint16_t low_score_pos = 0xFF;
-            for (j = 0 ; j < 0xFF ; j++) {
-              if (transmits[sd[queue[j]].previous].score < low_score) {
-                low_score = transmits[sd[queue[j]].previous].score;
-                low_score_pos = j;
-              }
-            }
-            sd[queue[low_score_pos]].type &= 0xF7;
-            j = sd[queue[low_score_pos]].previous;
-            transmits[j + transmits[j].distance].previous_index = 0xFFFFFFFF;
-            transmits[j].distance = 0xFFFFFFFF;
-            queue_position = low_score_pos;
-          }
-          else
-            queue_position = queue_size++;
-          while (queue_position-- != 0)
-            queue[queue_position + 1] = queue[queue_position];
-          queue[0] = symbol;
-        }
-        else {
-          transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
-          transmits[i].distance = 0xFFFFFFFF;
-        }
-      }
-    }
-    for (i = 0 ; i < num_codes ; i++) {
-      if ((sd[i].count > MAX_INSTANCES_FOR_REMOVE) && (sd[i].count <= (num_transmits_over_sqrt2 >> 10))
-          && ((sd[i].type & 4) != 0)
-          && ((float)sd[i].hits < get_mtf_score_limit(sd[i].count, num_transmits_over_sqrt2) * (float)(sd[i].count - 1)))
-        sd[i].type &= 0xFB;
       sd[i].hits = 0;
     }
 
     num_mtfs = 0;
-    queue_size = 0;
     for (i = 0 ; i < num_transmits ; i++) {
-      transmits[i].hurts = 0;
       uint32_t symbol = transmits[i].symbol;
-      sd[symbol].previous = i;
-      if ((sd[symbol].type & 8) != 0) {
-        queue_position = 0;
-        while (queue[queue_position] != symbol)
-          queue_position++;
-        if (queue_position + transmits[transmits[i].previous_index].hurts
-            >= 10 + (uint32_t)(30.0 * (log2((double)num_transmits / (double)sd[transmits[i].symbol].count) - 9.0))) {
-          transmits[transmits[i].previous_index].distance = 0xFFFFFFFF;
-          transmits[i].previous_index = 0xFFFFFFFF;
-        }
-        else {
-          if (queue_position > 0x10)
-            for (j = 0 ; j < queue_position ; j++)
-              transmits[sd[queue[j]].previous].hurts += 1;
-          else if (queue_position > 5)
-            for (j = 0 ; j < queue_position ; j++)
-              transmits[sd[queue[j]].previous].hurts += 2;
-          else if (queue_position > 1)
-            for (j = 0 ; j < queue_position ; j++)
-              transmits[sd[queue[j]].previous].hurts += 3;
-          sd[symbol].hits++;
-          num_mtfs++;
-        }
-        if (transmits[i].distance != 0xFFFFFFFF) {
-          while (queue_position-- != 0)
-            queue[queue_position + 1] = queue[queue_position];
-          queue[0] = symbol;
-        }
-        else {
-          sd[symbol].type &= 0xF7;
-          queue_size--;
-          while (queue_position != queue_size) {
-            queue[queue_position] = queue[queue_position + 1];
-            queue_position++;
-          }
-        }
+      if ((sd[symbol].type & 0x40) != 0) {
+        sd[symbol].hits++;
+        num_mtfs++;
+        if (transmits[i].distance == 0xFFFFFFFF)
+          sd[symbol].type &= 0xBF;
       }
       else if (transmits[i].distance != 0xFFFFFFFF) {
-        if ((sd[symbol].type & 4) != 0) {
-          sd[symbol].type |= 8;
-          queue_position = queue_size++;
-          while (queue_position-- != 0)
-            queue[queue_position + 1] = queue[queue_position];
-          queue[0] = symbol;
-        }
-        else {
-          transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
+        if ((sd[symbol].type & 2) != 0)
+          sd[symbol].type |= 0x40;
+        else
           transmits[i].distance = 0xFFFFFFFF;
-        }
       }
     }
-    for (i = 0 ; i < num_codes ; i++)
-      if (sd[i].hits == 0)
-        sd[i].type &= 0xFB;
-  }
-
 #ifdef PRINTON
   fprintf(stderr, "%u MTF symbols\n", (unsigned int)num_mtfs);
 #endif
+  }
 
   for (i = 2 ; i <= MAX_INSTANCES_FOR_REMOVE ; i++) {
     mtf_started[i] = 0;
@@ -2245,52 +2240,50 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   }
 
   for (i = 0 ; i < num_codes ; i++)
-    sd[i].previous = 0;
+    sd[i].array_index = 0;  // temporary use as instance counter
 
   for (i = 0 ; i < num_transmits ; i++) {
     uint32_t symbol = transmits[i].symbol;
-    sd[symbol].previous++;
+    sd[symbol].array_index++;
     uint32_t count = sd[symbol].count;
     if (count <= MAX_INSTANCES_FOR_REMOVE) {
       if (mtf_in_dictionary[count] > mtf_peak_mtf[count])
         mtf_peak_mtf[count] = mtf_in_dictionary[count];
       if (mtf_active[count] > mtf_peak[count])
         mtf_peak[count] = mtf_active[count];
-      if (sd[symbol].previous == 1) {
+      if (sd[symbol].array_index == 1) {
         mtf_started[count]++;
         mtf_active[count]++;
         if (transmits[i].distance != 0xFFFFFFFF)
-          sd[symbol].type |= 8;
+          sd[symbol].type |= 0x40;
         else
           mtf_in_dictionary[count]++;
       }
-      else if (sd[symbol].previous == count) {
+      else if (sd[symbol].array_index == count) {
         mtf_active[count]--;
-        if ((sd[symbol].type & 8) != 0) {
-          sd[symbol].type &= 0xF7;
+        if ((sd[symbol].type & 0x40) != 0) {
+          sd[symbol].type &= 0xBF;
           mtf_hits[count]++;
         }
         else
           mtf_in_dictionary[count]--;
       }
       else {
-        if ((sd[symbol].type & 8) != 0) {
+        if ((sd[symbol].type & 0x40) != 0) {
           mtf_hits[count]++;
           if (transmits[i].distance == 0xFFFFFFFF) {
-            sd[symbol].type &= 0xF7;
+            sd[symbol].type &= 0xBF;
             mtf_in_dictionary[count]++;
           }
         }
         else if (transmits[i].distance != 0xFFFFFFFF) {
-          sd[symbol].type |= 8;
+          sd[symbol].type |= 0x40;
           mtf_in_dictionary[count]--;
         }
       }
     }
-    else if ((transmits[i].distance != 0xFFFFFFFF) && ((sd[symbol].type & 4) == 0)) {
-      transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
+    else if ((transmits[i].distance != 0xFFFFFFFF) && ((sd[symbol].type & 2) == 0))
       transmits[i].distance = 0xFFFFFFFF;
-    }
   }
 
   if (use_mtf == 2) {
@@ -2311,7 +2304,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   if (use_mtf != 0) {
     for (i = 0 ; i < num_codes ; i++) {
       if (sd[i].count > MAX_INSTANCES_FOR_REMOVE) {
-        if ((sd[i].type & 4) != 0) {
+        if ((sd[i].type & 2) != 0) {
           if (sd[i].count - sd[i].hits <= MAX_INSTANCES_FOR_REMOVE) {
             num_symbols_to_code -= sd[i].count - (MAX_INSTANCES_FOR_REMOVE + 1);
             sd[i].count = MAX_INSTANCES_FOR_REMOVE + 1;
@@ -2367,7 +2360,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   }
   else {
     for (i = 0 ; i < num_codes ; i++)
-      sd[i].type &= 0xFB;
+      sd[i].type &= 0xFD;
     for (i = 2 ; i <= MAX_INSTANCES_FOR_REMOVE ; i++)
       mtf_hits[i] = 0;
     peak_array = mtf_peak;
@@ -2407,15 +2400,17 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     mtf_miss_code_space += (1 << (30 - queue_miss_code_length[i])) * peak_array[i];
   }
   max_code_length = queue_miss_code_length[2];
+
   remaining_code_space = (1 << 30) - (1 << (30 - max_code_length)) - mtf_miss_code_space;
   min_code_space = 1 << (30 - (queue_miss_code_length[MAX_INSTANCES_FOR_REMOVE] - 1));
+
   codes_per_code_space = (double)remaining_symbols_to_code / (double)remaining_code_space;
   max_regular_code_length = 1;
   prior_repeats = 0;
   for (i = 0 ; i <= 25 ; i++)
     index_last_length[i] = -1;
 
-  // optimize code lengths
+  // recalculate code lengths
   for (i = 0 ; i < num_more_than_15_inst_definitions ; i++) {
     symbol_inst = sd[ranked_symbols[i]].count;
     if (--symbol_inst != prior_repeats) {
@@ -2430,13 +2425,15 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
         / (double)(remaining_code_space - min_code_space * (num_more_than_15_inst_definitions - i - 1)));
     if (code_length < code_length_limit)
       code_length = code_length_limit;
-    if (code_length > max_code_length)
-      code_length = max_code_length;
-    if (code_length > max_regular_code_length) {
-      if (code_length >= queue_miss_code_length[MAX_INSTANCES_FOR_REMOVE])
-        code_length = queue_miss_code_length[MAX_INSTANCES_FOR_REMOVE] - 1;
+    if (code_length >= queue_miss_code_length[MAX_INSTANCES_FOR_REMOVE])
+      code_length = queue_miss_code_length[MAX_INSTANCES_FOR_REMOVE] - 1;
+    else
+      while ((num_more_than_15_inst_definitions - i - 1) * min_code_space > remaining_code_space - (1 << (30 - code_length)))
+        code_length++;
+
+    if (code_length > max_regular_code_length)
       max_regular_code_length = code_length;
-    }
+      
     sd[ranked_symbols[i]].code_length = code_length;
     remaining_code_space -= 1 << (30 - code_length);
     remaining_symbols_to_code -= symbol_inst;
@@ -2527,10 +2524,10 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
 
   for (i = 0 ; i < num_more_than_15_inst_definitions ; i++)
     if (sd[ranked_symbols[i]].code_length < 11)
-      sd[ranked_symbols[i]].type &= 0xFB;
+      sd[ranked_symbols[i]].type &= 0xFD;
 
   for (i = num_more_than_15_inst_definitions ; i < num_definitions_to_code ; i++) {
-    sd[ranked_symbols[i]].type &= 0xF7;
+    sd[ranked_symbols[i]].type &= 0xBF;
     sd[ranked_symbols[i]].code_length = queue_miss_code_length[sd[ranked_symbols[i]].count];
   }
 
@@ -2545,20 +2542,20 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   if (max_code_length >= 14) {
     i = 0;
     while (i < num_more_than_15_inst_definitions) {
-     if ((sd[ranked_symbols[i]].type & 0x20) != 0) {
+     if ((sd[ranked_symbols[i]].type & 8) != 0) {
         if (sd[ranked_symbols[i]].space_score > 0)
-          sd[ranked_symbols[i]].type += 0x40;
+          sd[ranked_symbols[i]].type += 8;
         else
-          sd[ranked_symbols[i]].type += 0x20;
+          sd[ranked_symbols[i]].type += 0x10;
       }
       i++;
     }
     for (i = num_base_symbols ; i < num_codes; i++) {
-      if ((sd[i].type & 0x40) != 0) {
+      if ((sd[i].type & 0x10) != 0) {
         uint32_t last_symbol = symbol_array[sd[i + 1].define_symbol_start_index - 2];
         while (last_symbol >= num_base_symbols) {
-          if ((sd[last_symbol].type & 0x60) == 0x60) {
-            sd[i].type = (sd[i].type & 0x3F) | 0x20;
+          if ((sd[last_symbol].type & 0x18) == 0x10) {
+            sd[i].type = (sd[i].type & 0x6F) | 8;
             break;
           }
           last_symbol = symbol_array[sd[last_symbol + 1].define_symbol_start_index - 2];
@@ -2568,7 +2565,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   }
   else {
     for (i = 0 ; i < num_definitions_to_code ; i++)
-      sd[ranked_symbols[i]].type &= 0xF;
+      sd[ranked_symbols[i]].type &= 0x63;
   }
 
 #ifdef PRINTON
@@ -2577,12 +2574,12 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       for (i = 0 ; i < num_definitions_to_code ; i++) {
         if (sd[ranked_symbols[i]].code_length >= 11) {
           if (use_mtf != 0)
-            printf("%u: #%u %u L%u D%02x: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].previous,
+            printf("%u: #%u %u L%u D%02x: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].array_index,
                 (unsigned int)sd[ranked_symbols[i]].count, (unsigned int)sd[ranked_symbols[i]].code_length,
-                (unsigned int)sd[ranked_symbols[i]].type & 0xF4);
+                (unsigned int)sd[ranked_symbols[i]].type & 0xCE);
           else
             printf("%u: #%u L%u D%02x: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].count,
-                (unsigned int)sd[ranked_symbols[i]].code_length, (unsigned int)sd[ranked_symbols[i]].type & 0xF4);
+                (unsigned int)sd[ranked_symbols[i]].code_length, (unsigned int)sd[ranked_symbols[i]].type & 0xCE);
         }
         else
           printf("%u: #%u L%u: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].count,
@@ -2601,14 +2598,14 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     }
     else {
       for (i = 0 ; i < num_codes ; i++) {
-        if (sd[i].hits != 0) {
+        if ((sd[i].array_index != 0) && ((sd[i].array_index > 1) || (i < num_base_symbols))) {
           if (sd[i].code_length >= 11) {
             if (use_mtf != 0)
-              printf("%u: #%u %u L%u D%02x: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].previous,
-                  (unsigned int)sd[i].count, (unsigned int)sd[i].code_length, (unsigned int)sd[i].type & 0xF4);
+              printf("%u: #%u %u L%u D%02x: \"", (unsigned int)i + 1, (unsigned int)sd[i].array_index,
+                  (unsigned int)sd[i].count, (unsigned int)sd[i].code_length, (unsigned int)sd[i].type & 0xCE);
             else
               printf("%u: #%u L%u D%02x: \"",(unsigned int)i + 1, (unsigned int)sd[i].count,
-                  (unsigned int)sd[i].code_length, (unsigned int)sd[i].type & 0xF4);
+                  (unsigned int)sd[i].code_length, (unsigned int)sd[i].type & 0xCE);
           }
           else
             printf("%u: #%u L%u: \"", (unsigned int)i + 1, (unsigned int)sd[i].count, (unsigned int)sd[i].code_length);
@@ -2681,7 +2678,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       WriteOutBuffer(format);
   }
   do {
-    for (j = 2 ; j <= max_code_length ; j++) {
+    for (j = 1 ; j <= max_code_length ; j++) {
       sym_list_bits[i][j] = 2;
       if (0 == (sym_list_ptrs[i][j] = (uint32_t *)malloc(sizeof(uint32_t) * 4))) {
         fprintf(stderr, "Error - symbol list memory allocation failed\n");
@@ -2705,56 +2702,96 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     sd[ranked_symbols[i]].count = sd[ranked_symbols[i]].code_length + MAX_INSTANCES_FOR_REMOVE;
   for (i = 0 ; i < num_codes ; i++)
     sd[i].hits = 0;
-  num_transmits = queue_size = queue_size_cap = queue_offset = found_first_symbol = prior_end = 0;
+  num_transmits = queue_size = queue_size_az = queue_size_space = queue_size_other = queue_offset = 0;
+  found_first_symbol = prior_end = 0;
   num_grammar_rules = 1;
+  prior_symbol = num_codes;
 
   if ((UTF8_compliant != 0) || (cap_encoded != 0)) {
     cap_symbol_defined = 0;
     cap_lock_symbol_defined = 0;
+    symbol = *symbol_ptr++;
+    sd[symbol].hits++;
+    if (embed_define(symbol, 0) == 0)
+      return(0);
+
     while (symbol_ptr < first_define_ptr) {
       symbol = *symbol_ptr++;
       symbol_inst = sd[symbol].hits++;
       if (symbol_inst == 0) {
+        if (cap_encoded != 0) {
+          if (prior_is_cap == 0)
+            EncodeNewType3(0, 4 + (sd[prior_symbol].type & 0x18) + 2 * (sd[prior_symbol].type & 7), prior_end);
+          else
+            EncodeNewType2(2, 0x2C + (sd[prior_symbol].type & 3));
+        }
+        else
+          EncodeNewType1(0);
         if (embed_define(symbol, 0) == 0)
           return(0);
       }
       else {
-        if ((sd[symbol].type & 8) != 0) {
+        if ((sd[symbol].type & 0x40) != 0) {
           if (prior_is_cap == 0)
             update_queue(symbol, 0);
           else
             update_queue_prior_cap(symbol, 0);
         }
         else {
-          EncodeDictType(prior_is_cap);
+          if (cap_encoded != 0) {
+            if (prior_is_cap == 0)
+              EncodeDictType3(0, 4 + (sd[prior_symbol].type & 0x18) + 2 * (sd[prior_symbol].type & 7), prior_end);
+            else
+              EncodeDictType2(2, 0x2C + (sd[prior_symbol].type & 3));
+          }
+          else
+            EncodeDictType1(0);
+
           encode_dictionary_symbol(symbol);
           if (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE) {
             if (sd[symbol].count == sd[symbol].hits)
               remove_dictionary_symbol(symbol, sd[symbol].code_length);
             else if (use_mtf != 0) {
-              if ((sd[symbol].type & 4) != 0) {
+              if ((sd[symbol].type & 2) != 0) {
                 if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0))
-                    EncodeGoMtf(sd[symbol].count, 0, 1);
+                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0)) {
+                    if (cap_encoded != 0)
+                      EncodeGoMtf(6 * (sd[symbol].count - 1) + prior_is_cap + (sd[symbol].type & 1)
+                          + 3 * (((sd[symbol].type >> 3) & 3) == 2), 0, 1);
+                    else
+                      EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 1);
+                  }
                   remove_dictionary_symbol(symbol, sd[symbol].code_length);
                   add_symbol_to_queue(symbol);
                 }
-                else
-                  EncodeGoMtf(sd[symbol].count, 0, 0);
+                else {
+                  if (cap_encoded != 0)
+                    EncodeGoMtf(6 * (sd[symbol].count - 1) + prior_is_cap + (sd[symbol].type & 1)
+                        + 3 * (((sd[symbol].type >> 3) & 3) == 2), 0, 0);
+                  else
+                    EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 0);
+                }
               }
             }
           }
-          else if ((sd[symbol].type & 4) != 0) {
+          else if ((sd[symbol].type & 2) != 0) {
+            uint16_t context;
+            if (cap_encoded != 0)
+              context = 6 * (sd[symbol].count - 1) + prior_is_cap + (sd[symbol].type & 1)
+                  + 3 * (((sd[symbol].type >> 3) & 3) == 2);
+            else
+              context = 6 * (sd[symbol].count - 1);
             if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 1);
+              EncodeGoMtf(context, 0, 1);
               remove_dictionary_symbol(symbol, sd[symbol].code_length);
               add_symbol_to_queue(symbol);
             }
-            else
-              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 0);
+            else {
+              EncodeGoMtf(context, 0, 0);
+            }
           }
         }
-        prior_is_cap = sd[symbol].type & 1;
+        prior_is_cap = (sd[symbol].type & 0x20) >> 5;
         prior_symbol = symbol;
         num_transmits++;
       }
@@ -2767,43 +2804,52 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     }
   }
   else {
+    symbol = *symbol_ptr++;
+    sd[symbol].hits++;
+    if (embed_define_binary(symbol, 0) == 0)
+      return(0);
+
     while (symbol_ptr < first_define_ptr) {
       symbol = *symbol_ptr++;
       symbol_inst = sd[symbol].hits++;
       if (symbol_inst == 0) {
+        EncodeNewType1(0);
         if (embed_define_binary(symbol, 0) == 0)
           return(0);
       }
       else {
-        if ((sd[symbol].type & 8) != 0)
+        if ((sd[symbol].type & 0x40) != 0)
           update_queue(symbol, 0);
         else {
-          EncodeDictType(0);
+          EncodeDictType1(0);
           encode_dictionary_symbol(symbol);
           if (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE) {
             if (sd[symbol].count == sd[symbol].hits)
               remove_dictionary_symbol(symbol, sd[symbol].code_length);
             else if (use_mtf != 0) {
-              if ((sd[symbol].type & 4) != 0) {
+              if ((sd[symbol].type & 2) != 0) {
                 if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0))
-                    EncodeGoMtf(sd[symbol].count, 0, 1);
+                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0)) {
+                    EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 1);
+                  }
                   remove_dictionary_symbol(symbol, sd[symbol].code_length);
                   add_symbol_to_queue(symbol);
                 }
-                else
-                  EncodeGoMtf(sd[symbol].count, 0, 0);
+                else {
+                  EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 0);
+                }
               }
             }
           }
-          else if ((sd[symbol].type & 4) != 0) {
+          else if ((sd[symbol].type & 2) != 0) {
             if (transmits[num_transmits].distance != 0xFFFFFFFF) {
-              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 1);
+              EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 1);
               remove_dictionary_symbol(symbol, sd[symbol].code_length);
               add_symbol_to_queue(symbol);
             }
-            else
-              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 0);
+            else {
+              EncodeGoMtf(6 * (sd[symbol].count - 1), 0, 0);
+            }
           }
         }
         num_transmits++;
@@ -2818,13 +2864,17 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   }
 
   // send EOF and flush output
-  EncodeDictType(0);
-  if (cap_encoded != 0)
-    EncodeFirstChar(end_char, (sd[prior_symbol].type & 0x60) >> 5, prior_end);
-  else if (UTF8_compliant != 0)
-    EncodeFirstChar(end_char, 0, prior_end);
-  else
-    EncodeFirstCharBinary(end_char, prior_end);
+  if (cap_encoded != 0) {
+    EncodeDictType3(0, 4 + (sd[prior_symbol].type & 0x18) + 2 * (sd[prior_symbol].type & 7), prior_end);
+    EncodeFirstChar(end_char, (sd[prior_symbol].type & 0x18) >> 3, prior_end);
+  }
+  else {
+    EncodeDictType1(0);
+    if (UTF8_compliant != 0)
+      EncodeFirstChar(end_char, 0, prior_end);
+    else
+      EncodeFirstCharBinary(end_char, prior_end);
+  }
   code_length = bin_code_length[end_char];
   EncodeShortDictionarySymbol(fbob[end_char][max_code_length], sum_nbob[end_char], nbob[end_char][code_length]);
   FinishEncoder();

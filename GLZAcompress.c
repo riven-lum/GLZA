@@ -120,6 +120,9 @@ struct substitute_thread_data {
 struct score_data {
   struct string_node *node_ptr;
   double string_entropy;
+  double string_entropy2;
+  double string_profit;
+  uint32_t prior_symbol;
   uint16_t num_symbols;
   uint8_t next_sibling;
   uint8_t score_type;
@@ -160,6 +163,59 @@ struct match_node ** base_child_ptr_array;
 atomic_uint_least16_t rank_scores_write_index, rank_scores_read_index;
 atomic_uint_least16_t substitute_data_write_index, substitute_data_read_index;
 atomic_uintptr_t max_symbol_ptr, scan_symbol_ptr;
+
+uint32_t *symbol_counts;
+uint32_t o1c[0x100][0x100];
+uint32_t num_ends[0x100];
+uint32_t num_starts[0x100];
+double log_file_symbols;
+struct symbol_ends_data {
+  uint8_t start;
+  uint8_t end;
+} *symbol_ends;
+//uint8_t first_cycle = 0;
+
+
+uint8_t get_UTF8_context(uint32_t symbol) {
+  if (symbol < 0x80)
+    return((uint8_t)symbol);
+  else if (symbol < 0x250)
+    return(0x80);
+  else if (symbol < 0x370)
+    return(0x81);
+  else if (symbol < 0x400)
+    return(0x82);
+  else if (symbol < 0x530)
+    return(0x83);
+  else if (symbol < 0x590)
+    return(0x84);
+  else if (symbol < 0x600)
+    return(0x85);
+  else if (symbol < 0x700)
+    return(0x86);
+  else if (symbol < 0x800)
+    return(0x87);
+  else if (symbol < 0x1000)
+    return(0x88);
+  else if (symbol < 0x2000)
+    return(0x89);
+  else if (symbol < 0x3000)
+    return(0x8A);
+  else if (symbol < 0x3040)
+    return(0x8B);
+  else if (symbol < 0x30A0)
+    return(0x8C);
+  else if (symbol < 0x3100)
+    return(0x8D);
+  else if (symbol < 0x3200)
+    return(0x8E);
+  else if (symbol < 0xA000)
+    return(0x8F);
+  else if (symbol < 0x10000)
+    return(0x8E);
+  else
+    return(0x90);
+}
 
 
 void init_match_node(struct match_node *match_node_ptr, uint32_t symbol, uint32_t match_num_symbols,
@@ -1202,63 +1258,98 @@ void *rank_word_scores_thread_fast(void *arg) {
 
 void score_base_node_tree(struct string_node *node_ptr, struct score_data *node_data, double string_entropy,
     double production_cost, double profit_ratio_power, double log2_num_symbols_plus_substitution_cost,
+    double *log2_instances,
     double *new_symbol_cost, double *symbol_entropy, struct node_score_data *rank_scores_buffer,
-    uint16_t *node_ptrs_num_ptr, uint8_t UTF8_compliant) {
+    float order_ratio, uint16_t *node_ptrs_num_ptr, uint8_t UTF8_compliant, uint32_t prior_symbol) {
   uint16_t num_symbols = 2;
   uint16_t level = 0;
   uint16_t node_ptrs_num = *node_ptrs_num_ptr;
+  double string_entropy2 = string_entropy;
 
   while (1) {
     uint32_t node_instances = node_ptr->instances;
     if (node_instances >= 2)  {
       node_data[level].string_entropy = string_entropy;
+      node_data[level].string_entropy2 = string_entropy2;
+      node_data[level].prior_symbol = prior_symbol;
       uint32_t symbol = node_ptr->symbol;
-      string_entropy += symbol_entropy[symbol];
       uint32_t num_extra_symbols = 0;
       double repeats = (double)(node_instances - 1);
+
+      string_entropy += symbol_entropy[symbol];
+      string_entropy2 += log2(((double)num_ends[symbol_ends[prior_symbol].end] - 0.5 * repeats)
+            * (double)num_starts[symbol_ends[symbol].start]
+          / (((double)o1c[symbol_ends[prior_symbol].end][symbol_ends[symbol].start] - 0.5 * repeats)
+            * (double)symbol_counts[symbol]));
+
       while (num_extra_symbols != node_ptr->num_extra_symbols) {
+        prior_symbol = symbol;
         symbol = *(start_symbol_ptr + node_ptr->last_match_index + ++num_extra_symbols);
         string_entropy += symbol_entropy[symbol];
+        string_entropy2 += log2(((double)num_ends[symbol_ends[prior_symbol].end] - 0.5 * repeats)
+              * (double)num_starts[symbol_ends[symbol].start]
+            / (((double)o1c[symbol_ends[prior_symbol].end][symbol_ends[symbol].start] - 0.5 * repeats)
+              * (double)symbol_counts[symbol]));
       }
+      prior_symbol = symbol;
+
       // calculate score
-      double profit_per_substitution;
-      if (node_instances < NUM_PRECALCULATED_SYMBOL_COSTS)
+      double profit_per_substitution, profit_per_substitution2;
+      if (node_instances < NUM_PRECALCULATED_SYMBOL_COSTS) {
         profit_per_substitution = string_entropy - new_symbol_cost[node_instances];
-      else
-        profit_per_substitution = string_entropy - (log2_num_symbols_plus_substitution_cost - log2(repeats));
-      if (profit_per_substitution >= 0.0) {
-        double total_bit_savings_minus_production_cost = repeats * profit_per_substitution - production_cost;
-        if (total_bit_savings_minus_production_cost > 0.0) {
-          double profit_ratio = profit_per_substitution / string_entropy;
-          float score = (float)(total_bit_savings_minus_production_cost * pow(profit_ratio, profit_ratio_power));
-          if ((UTF8_compliant != 0) && (symbol == 0x20))
-            score *= 0.2;
-          if (score > min_score) {
-            struct string_node * child_ptr = &string_nodes[node_ptr->child_node_num];
-            uint32_t new_score_lmi1 = child_ptr->last_match_index - 1;
-            uint32_t new_score_lmi2 = node_ptr->last_match_index + num_extra_symbols;
-            if (new_score_lmi1 == new_score_lmi2) {
-              int32_t * sibling_node_num_ptr = &child_ptr->sibling_node_num[0];
-              if (*sibling_node_num_ptr > 0)
-                new_score_lmi1 = string_nodes[*sibling_node_num_ptr].last_match_index - 1;
-              else if (*sibling_node_num_ptr != 0)
-                new_score_lmi1 = *sibling_node_num_ptr + 0x7FFFFFFF;
-              else if (*(sibling_node_num_ptr + 1) > 0)
-                new_score_lmi1 = string_nodes[*(sibling_node_num_ptr + 1)].last_match_index - 1;
-              else if (*(sibling_node_num_ptr + 1) != 0)
-                new_score_lmi1 = *(sibling_node_num_ptr + 1) + 0x7FFFFFFF;
-            }
-            if ((node_ptrs_num & 0xFFF) == 0)
-              while ((uint16_t)(node_ptrs_num - atomic_load_explicit(&rank_scores_read_index, memory_order_acquire))
-                  >= 0xF000) /* wait */ ;
-            rank_scores_buffer[node_ptrs_num].score = score;
-            rank_scores_buffer[node_ptrs_num].last_match_index1 = new_score_lmi1;
-            rank_scores_buffer[node_ptrs_num].last_match_index2 = new_score_lmi2;
-            rank_scores_buffer[node_ptrs_num].num_symbols = num_symbols + num_extra_symbols;
-            atomic_store_explicit(&rank_scores_write_index, ++node_ptrs_num, memory_order_release);
-          }
-        }
+        profit_per_substitution2 = string_entropy2 + log2_instances[node_instances - 1] - log_file_symbols;
       }
+      else {
+        double log2_repeats = log2(repeats);
+        profit_per_substitution = string_entropy - (log2_num_symbols_plus_substitution_cost - log2_repeats);
+        profit_per_substitution2 = string_entropy2 + log2_repeats - log_file_symbols;
+      }
+      double total_bit_savings_minus_production_cost = repeats * profit_per_substitution - production_cost;
+      double total_bit_savings_minus_production_cost2 = repeats * profit_per_substitution2 - production_cost;
+
+      float o0_score;
+      if (total_bit_savings_minus_production_cost > 0.0) {
+        double profit_ratio = profit_per_substitution / string_entropy;
+        o0_score = (float)(total_bit_savings_minus_production_cost * pow(profit_ratio, profit_ratio_power));
+      }
+      else
+        o0_score = total_bit_savings_minus_production_cost;
+      double profit_ratio2 = profit_per_substitution2 / string_entropy2;
+      float o1_score = (float)(total_bit_savings_minus_production_cost2 * pow(profit_ratio2, profit_ratio_power));
+      if ((UTF8_compliant != 0) && (symbol == 0x20)) {
+        o0_score *= 0.2;
+        o1_score *= 0.1;
+      }
+      if ((o0_score > 0.0) && (o1_score > 0.0))
+        o0_score = pow(o0_score, 1.0 - order_ratio) * pow(o1_score, order_ratio);
+      else
+        o0_score = 0.0;
+
+      if (o0_score > min_score) {
+        struct string_node * child_ptr = &string_nodes[node_ptr->child_node_num];
+        uint32_t new_score_lmi1 = child_ptr->last_match_index - 1;
+        uint32_t new_score_lmi2 = node_ptr->last_match_index + num_extra_symbols;
+        if (new_score_lmi1 == new_score_lmi2) {
+          int32_t * sibling_node_num_ptr = &child_ptr->sibling_node_num[0];
+          if (*sibling_node_num_ptr > 0)
+            new_score_lmi1 = string_nodes[*sibling_node_num_ptr].last_match_index - 1;
+          else if (*sibling_node_num_ptr != 0)
+            new_score_lmi1 = *sibling_node_num_ptr + 0x7FFFFFFF;
+          else if (*(sibling_node_num_ptr + 1) > 0)
+            new_score_lmi1 = string_nodes[*(sibling_node_num_ptr + 1)].last_match_index - 1;
+          else if (*(sibling_node_num_ptr + 1) != 0)
+            new_score_lmi1 = *(sibling_node_num_ptr + 1) + 0x7FFFFFFF;
+        }
+        if ((node_ptrs_num & 0xFFF) == 0)
+          while ((uint16_t)(node_ptrs_num - atomic_load_explicit(&rank_scores_read_index, memory_order_acquire))
+              >= 0xF000) /* wait */ ;
+        rank_scores_buffer[node_ptrs_num].score = o0_score;
+        rank_scores_buffer[node_ptrs_num].last_match_index1 = new_score_lmi1;
+        rank_scores_buffer[node_ptrs_num].last_match_index2 = new_score_lmi2;
+        rank_scores_buffer[node_ptrs_num].num_symbols = num_symbols + num_extra_symbols;
+        atomic_store_explicit(&rank_scores_write_index, ++node_ptrs_num, memory_order_release);
+      }
+
       if (node_ptr->sibling_node_num[0] > 0) {
         node_data[level].node_ptr = node_ptr;
         node_data[level].num_symbols = num_symbols;
@@ -1283,6 +1374,8 @@ void score_base_node_tree(struct string_node *node_ptr, struct score_data *node_
           node_data[level].node_ptr = node_ptr;
           node_data[level].num_symbols = num_symbols;
           node_data[level].string_entropy = string_entropy;
+          node_data[level].string_entropy2 = string_entropy2;
+          node_data[level].prior_symbol = prior_symbol;
           node_data[level++].next_sibling = 1;
         }
         node_ptr = &string_nodes[sib_node_num];
@@ -1299,6 +1392,8 @@ void score_base_node_tree(struct string_node *node_ptr, struct score_data *node_
             return;
           }
           string_entropy = node_data[--level].string_entropy;
+          string_entropy2 = node_data[level].string_entropy2;
+          prior_symbol = node_data[level].prior_symbol;
           num_symbols = node_data[level].num_symbols;
           node_ptr = node_data[level].node_ptr;
           if (node_data[level].next_sibling == 0) {
@@ -1318,7 +1413,7 @@ void score_base_node_tree(struct string_node *node_ptr, struct score_data *node_
 void score_base_node_tree_fast(struct string_node *node_ptr, struct score_data *node_data, double string_entropy,
     double production_cost, double profit_ratio_power, double log2_num_symbols_plus_substitution_cost,
     double *new_symbol_cost, double *symbol_entropy, struct node_score_data_fast *rank_scores_buffer,
-    uint16_t *node_ptrs_num_ptr, uint8_t UTF8_compliant) {
+    uint16_t *node_ptrs_num_ptr, uint8_t UTF8_compliant, uint32_t prior_symbol) {
   uint16_t num_symbols = 2;
   uint16_t level = 0;
   uint16_t node_ptrs_num = *node_ptrs_num_ptr;
@@ -1423,111 +1518,187 @@ void score_base_node_tree_fast(struct string_node *node_ptr, struct score_data *
 
 void score_base_node_tree_cap(struct string_node *node_ptr, struct score_data *node_data, double string_entropy,
     double production_cost, double profit_ratio_power, double log2_num_symbols_plus_substitution_cost,
-    double *new_symbol_cost, double *symbol_entropy, struct node_score_data *rank_scores_buffer,
-    uint16_t *node_ptrs_num_ptr) {
+    double *log2_instances, double *new_symbol_cost, double *symbol_entropy, struct node_score_data *rank_scores_buffer,
+    float order_ratio, uint16_t *node_ptrs_num_ptr, uint32_t prior_symbol) {
   uint16_t num_symbols = 2;
   uint16_t level = 0;
   uint16_t node_ptrs_num = *node_ptrs_num_ptr;
-  double profit_per_substitution, total_bit_savings_minus_production_cost;
+  double profit_per_substitution, profit_per_substitution2;
+  double total_bit_savings_minus_production_cost, total_bit_savings_minus_production_cost2;
+  float o0_score, o1_score;
+  double string_entropy2 = string_entropy;
 
   while (1) {
     uint32_t node_instances = node_ptr->instances;
     if (node_instances >= 2)  {
       double repeats = (double)(node_instances - 1);
       node_data[level].string_entropy = string_entropy;
+      node_data[level].string_entropy2 = string_entropy2;
+      node_data[level].prior_symbol = prior_symbol;
       uint32_t symbol = node_ptr->symbol;
       uint32_t num_extra_symbols = node_ptr->num_extra_symbols;
       if (num_extra_symbols == 0) {
         string_entropy += symbol_entropy[symbol];
+        string_entropy2 += log2(((double)num_ends[symbol_ends[prior_symbol].end] - 0.5 * repeats)
+              * (double)num_starts[symbol_ends[symbol].start]
+            / (((double)o1c[symbol_ends[prior_symbol].end][symbol_ends[symbol].start] - 0.5 * repeats)
+              * (double)symbol_counts[symbol]));
+
         // calculate score
-        if (node_instances < NUM_PRECALCULATED_SYMBOL_COSTS)
+        if (node_instances < NUM_PRECALCULATED_SYMBOL_COSTS) {
           profit_per_substitution = string_entropy - new_symbol_cost[node_instances];
-        else
-          profit_per_substitution = string_entropy - (log2_num_symbols_plus_substitution_cost - log2(repeats));
-        total_bit_savings_minus_production_cost = repeats * profit_per_substitution - production_cost;
-        if (total_bit_savings_minus_production_cost > min_score) {
-          double profit_ratio = profit_per_substitution / string_entropy;
-          float score = (float)(total_bit_savings_minus_production_cost * pow(profit_ratio, profit_ratio_power));
-          if (symbol == 0x20)
-            score *= 0.2;
-          else if ((symbol & 0xF2) != 0x42)
-            score *= 0.5;
-          if (score > min_score) {
-            struct string_node * child_ptr = &string_nodes[node_ptr->child_node_num];
-            uint32_t new_score_lmi1 = child_ptr->last_match_index - 1;
-            uint32_t new_score_lmi2 = node_ptr->last_match_index;
-            if (new_score_lmi1 == new_score_lmi2) {
-              int32_t * sibling_node_num_ptr = &child_ptr->sibling_node_num[0];
-              if (*sibling_node_num_ptr > 0)
-                new_score_lmi1 = string_nodes[*sibling_node_num_ptr].last_match_index - 1;
-              else if (*sibling_node_num_ptr != 0)
-                new_score_lmi1 = *sibling_node_num_ptr + 0x7FFFFFFF;
-              else if (*(sibling_node_num_ptr + 1) > 0)
-                new_score_lmi1 = string_nodes[*(sibling_node_num_ptr + 1)].last_match_index - 1;
-              else if (*(sibling_node_num_ptr + 1) != 0)
-                new_score_lmi1 = *(sibling_node_num_ptr + 1) + 0x7FFFFFFF;
-            }
-            if ((node_ptrs_num & 0xFFF) == 0)
-              while ((uint16_t)(node_ptrs_num - atomic_load_explicit(&rank_scores_read_index, memory_order_acquire))
-                  >= 0xF000) /* wait */ ;
-            rank_scores_buffer[node_ptrs_num].score = score;
-            rank_scores_buffer[node_ptrs_num].num_symbols = num_symbols;
-            if (new_score_lmi1 < new_score_lmi2) {
-              rank_scores_buffer[node_ptrs_num].last_match_index1 = new_score_lmi1;
-              rank_scores_buffer[node_ptrs_num].last_match_index2 = new_score_lmi2;
-            }
-            else {
-              rank_scores_buffer[node_ptrs_num].last_match_index1 = new_score_lmi2;
-              rank_scores_buffer[node_ptrs_num].last_match_index2 = new_score_lmi1;
-            }
-            atomic_store_explicit(&rank_scores_write_index, ++node_ptrs_num, memory_order_release);
-          }
+          profit_per_substitution2 = string_entropy2 + log2_instances[node_instances - 1] - log_file_symbols;
         }
+        else {
+          double log2_repeats = log2(repeats);
+          profit_per_substitution = string_entropy - (log2_num_symbols_plus_substitution_cost - log2_repeats);
+          profit_per_substitution2 = string_entropy2 + log2_repeats - log_file_symbols;
+        }
+
+        total_bit_savings_minus_production_cost = repeats * profit_per_substitution - production_cost;
+        total_bit_savings_minus_production_cost2 = repeats * profit_per_substitution2 - production_cost;
+        if (total_bit_savings_minus_production_cost > 0.0) {
+          double profit_ratio = profit_per_substitution / string_entropy;
+          o0_score = (float)(total_bit_savings_minus_production_cost * pow(profit_ratio, profit_ratio_power));
+        }
+        else
+          o0_score = total_bit_savings_minus_production_cost;
+        double profit_ratio2 = profit_per_substitution2 / string_entropy2;
+        o1_score = (float)(total_bit_savings_minus_production_cost2 * pow(profit_ratio2, profit_ratio_power));
+        if (symbol == 0x20) {
+          o0_score *= 0.2;
+          o1_score *= 0.1;
+        }
+        else if ((symbol & 0xF2) != 0x42) {
+          o0_score *= 0.5;
+          o1_score *= 0.5;
+        }
+        if ((o0_score > 0.0) && (o1_score > 0.0))
+          o0_score = pow(o0_score, 1.0 - order_ratio) * pow(o1_score, order_ratio);
+        else
+          o0_score = 0.0;
+
+        if (o0_score > min_score) {
+          struct string_node * child_ptr = &string_nodes[node_ptr->child_node_num];
+          uint32_t new_score_lmi1 = child_ptr->last_match_index - 1;
+          uint32_t new_score_lmi2 = node_ptr->last_match_index;
+          if (new_score_lmi1 == new_score_lmi2) {
+            int32_t * sibling_node_num_ptr = &child_ptr->sibling_node_num[0];
+            if (*sibling_node_num_ptr > 0)
+              new_score_lmi1 = string_nodes[*sibling_node_num_ptr].last_match_index - 1;
+            else if (*sibling_node_num_ptr != 0)
+              new_score_lmi1 = *sibling_node_num_ptr + 0x7FFFFFFF;
+            else if (*(sibling_node_num_ptr + 1) > 0)
+              new_score_lmi1 = string_nodes[*(sibling_node_num_ptr + 1)].last_match_index - 1;
+            else if (*(sibling_node_num_ptr + 1) != 0)
+              new_score_lmi1 = *(sibling_node_num_ptr + 1) + 0x7FFFFFFF;
+          }
+          if ((node_ptrs_num & 0xFFF) == 0)
+            while ((uint16_t)(node_ptrs_num - atomic_load_explicit(&rank_scores_read_index, memory_order_acquire))
+                >= 0xF000) /* wait */ ;
+          rank_scores_buffer[node_ptrs_num].score = o0_score;
+          rank_scores_buffer[node_ptrs_num].num_symbols = num_symbols;
+          if (new_score_lmi1 < new_score_lmi2) {
+            rank_scores_buffer[node_ptrs_num].last_match_index1 = new_score_lmi1;
+            rank_scores_buffer[node_ptrs_num].last_match_index2 = new_score_lmi2;
+          }
+          else {
+            rank_scores_buffer[node_ptrs_num].last_match_index1 = new_score_lmi2;
+            rank_scores_buffer[node_ptrs_num].last_match_index2 = new_score_lmi1;
+          }
+          atomic_store_explicit(&rank_scores_write_index, ++node_ptrs_num, memory_order_release);
+        }
+        prior_symbol = symbol;
       }
       else {
         uint32_t * symbol_ptr = start_symbol_ptr + node_ptr->last_match_index;
         uint32_t * end_symbol_ptr = symbol_ptr + num_extra_symbols;
         uint8_t send_score = 0;
-        float score;
         float short_score = min_score;
 
-        while (symbol_ptr < end_symbol_ptr)
-          string_entropy += symbol_entropy[*symbol_ptr++];
+        while (symbol_ptr < end_symbol_ptr) {
+          string_entropy += symbol_entropy[*symbol_ptr];
+          string_entropy2 += log2(((double)num_ends[symbol_ends[prior_symbol].end] - 0.5 * repeats)
+                * (double)num_starts[symbol_ends[*symbol_ptr].start]
+              / (((double)o1c[symbol_ends[prior_symbol].end][symbol_ends[*symbol_ptr].start] - 0.5 * repeats)
+                * (double)symbol_counts[*symbol_ptr]));
+          prior_symbol = *symbol_ptr++;
+        }
 
-        if ((*symbol_ptr == 0x20) && (*(symbol_ptr - 1) != 0x20)) {
+        if ((*symbol_ptr == 0x20) && (prior_symbol != 0x20)) {
           // calculate score
-          if (node_instances < NUM_PRECALCULATED_SYMBOL_COSTS)
+          if (node_instances < NUM_PRECALCULATED_SYMBOL_COSTS) {
             profit_per_substitution = string_entropy - new_symbol_cost[node_instances];
-          else
-            profit_per_substitution = string_entropy - (log2_num_symbols_plus_substitution_cost - log2(repeats));
+            profit_per_substitution2 = string_entropy2 + log2_instances[node_instances - 1] - log_file_symbols;
+          }
+          else {
+            double log2_repeats = log2(repeats);
+            profit_per_substitution = string_entropy - (log2_num_symbols_plus_substitution_cost - log2_repeats);
+            profit_per_substitution2 = string_entropy2 + log2_repeats - log_file_symbols;
+          }
+
           total_bit_savings_minus_production_cost = repeats * profit_per_substitution - production_cost;
-          if (total_bit_savings_minus_production_cost > short_score) {
+          total_bit_savings_minus_production_cost2 = repeats * profit_per_substitution2 - production_cost;
+          if (total_bit_savings_minus_production_cost > 0.0) {
             double profit_ratio = profit_per_substitution / (string_entropy + symbol_entropy[0x20]);
-            score = 0.5 * (float)(total_bit_savings_minus_production_cost * pow(profit_ratio, profit_ratio_power));
-            if (score > short_score) {
-              short_score = score;
-              send_score = 1;
-            }
+            o0_score = 0.5 * (float)(total_bit_savings_minus_production_cost * pow(profit_ratio, profit_ratio_power));
+          }
+          else
+            o0_score = 0.5 * total_bit_savings_minus_production_cost;
+          double profit_ratio2 = profit_per_substitution2 / (string_entropy2 + symbol_entropy[0x20]);
+          o1_score = 0.5 * (float)(total_bit_savings_minus_production_cost2 * pow(profit_ratio2, profit_ratio_power));
+          if ((o0_score > 0.0) && (o1_score > 0.0))
+            o0_score = pow(o0_score, 1.0 - order_ratio) * pow(o1_score, order_ratio);
+          else
+            o0_score = 0.0;
+          if (o0_score > short_score) {
+            short_score = o0_score;
+            send_score = 1;
           }
         }
 
         string_entropy += symbol_entropy[*symbol_ptr];
+        string_entropy2 += log2(((double)num_ends[symbol_ends[prior_symbol].end] - 0.5 * repeats)
+              * (double)num_starts[symbol_ends[*symbol_ptr].start]
+            / (((double)o1c[symbol_ends[prior_symbol].end][symbol_ends[*symbol_ptr].start] - 0.5 * repeats)
+              * (double)symbol_counts[*symbol_ptr]));
         // calculate score
-        if (node_instances < NUM_PRECALCULATED_SYMBOL_COSTS)
+        if (node_instances < NUM_PRECALCULATED_SYMBOL_COSTS) {
           profit_per_substitution = string_entropy - new_symbol_cost[node_instances];
-        else
-          profit_per_substitution = string_entropy - (log2_num_symbols_plus_substitution_cost - log2(repeats));
-        total_bit_savings_minus_production_cost = repeats * profit_per_substitution - production_cost;
-        if (total_bit_savings_minus_production_cost > short_score) {
-          double profit_ratio = profit_per_substitution / string_entropy;
-          score = (float)(total_bit_savings_minus_production_cost * pow(profit_ratio, profit_ratio_power));
-          if (*symbol_ptr == 0x20)
-            score *= 0.2;
-          else if (((*symbol_ptr) & 0xF2) != 0x42)
-            score *= 0.5;
-          if (score > short_score)
-            send_score = 2;
+          profit_per_substitution2 = string_entropy2 + log2_instances[node_instances - 1] - log_file_symbols;
         }
+        else {
+          double log2_repeats = log2(repeats);
+          profit_per_substitution = string_entropy - (log2_num_symbols_plus_substitution_cost - log2_repeats);
+          profit_per_substitution2 = string_entropy2 + log2_repeats - log_file_symbols;
+        }
+
+        total_bit_savings_minus_production_cost = repeats * profit_per_substitution - production_cost;
+        total_bit_savings_minus_production_cost2 = repeats * profit_per_substitution2 - production_cost;
+        if (total_bit_savings_minus_production_cost > 0.0) {
+          double profit_ratio = profit_per_substitution / string_entropy;
+          o0_score = (float)(total_bit_savings_minus_production_cost * pow(profit_ratio, profit_ratio_power));
+        }
+        else
+          o0_score = total_bit_savings_minus_production_cost;
+        double profit_ratio2 = profit_per_substitution2 / string_entropy2;
+        o1_score = (float)(total_bit_savings_minus_production_cost2 * pow(profit_ratio2, profit_ratio_power));
+        if (*symbol_ptr == 0x20) {
+          o0_score *= 0.2;
+          o1_score *= 0.1;
+        }
+        else if (((*symbol_ptr) & 0xF2) != 0x42) {
+          o0_score *= 0.5;
+          o1_score *= 0.5;
+        }
+        if ((o0_score > 0.0) && (o1_score > 0.0))
+          o0_score = pow(o0_score, 1.0 - order_ratio) * pow(o1_score, order_ratio);
+        else
+          o0_score = 0.0;
+        if (o0_score > short_score)
+          send_score = 2;
+
+        prior_symbol = *symbol_ptr;
         if (send_score != 0) {
           struct string_node * child_ptr = &string_nodes[node_ptr->child_node_num];
           uint32_t new_score_lmi1 = child_ptr->last_match_index - 1;
@@ -1547,7 +1718,7 @@ void score_base_node_tree_cap(struct string_node *node_ptr, struct score_data *n
             while ((uint16_t)(node_ptrs_num - atomic_load_explicit(&rank_scores_read_index, memory_order_acquire))
                 >= 0xF000); // wait
           if (send_score == 2) {
-            rank_scores_buffer[node_ptrs_num].score = score;
+            rank_scores_buffer[node_ptrs_num].score = o0_score;
             rank_scores_buffer[node_ptrs_num].num_symbols = num_symbols + num_extra_symbols;
             if (new_score_lmi1 < new_score_lmi2) {
               rank_scores_buffer[node_ptrs_num].last_match_index1 = new_score_lmi1;
@@ -1597,6 +1768,8 @@ void score_base_node_tree_cap(struct string_node *node_ptr, struct score_data *n
           node_data[level].node_ptr = node_ptr;
           node_data[level].num_symbols = num_symbols;
           node_data[level].string_entropy = string_entropy;
+          node_data[level].string_entropy2 = string_entropy2;
+          node_data[level].prior_symbol = prior_symbol;
           node_data[level++].next_sibling = 1;
         }
         node_ptr = &string_nodes[sib_node_num];
@@ -1613,6 +1786,8 @@ void score_base_node_tree_cap(struct string_node *node_ptr, struct score_data *n
             return;
           }
           string_entropy = node_data[--level].string_entropy;
+          string_entropy2 = node_data[level].string_entropy2;
+          prior_symbol = node_data[level].prior_symbol;
           num_symbols = node_data[level].num_symbols;
           node_ptr = node_data[level].node_ptr;
           if (node_data[level].next_sibling == 0) {
@@ -3361,13 +3536,13 @@ score_siblings:
 
 void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_score_data *rank_scores_buffer,
     struct score_data *node_data, uint16_t *node_ptrs_num_ptr, double production_cost, double profit_ratio_power,
-    double log2_num_symbols_plus_substitution_cost, double *new_symbol_cost, double *symbol_entropy,
-    uint8_t cap_encoded, uint8_t UTF8_compliant, uint32_t * symbol_counts) {
+    double log2_num_symbols_plus_substitution_cost, double *log2_instances, double *new_symbol_cost, double *symbol_entropy,
+    float order_ratio, uint8_t cap_encoded, uint8_t UTF8_compliant, uint32_t * symbol_counts) {
   int32_t * next_base_node_child_num_ptr;
   int32_t * base_node_child_num_ptr = &base_string_nodes_child_node_num[min_symbol * BASE_NODES_CHILD_ARRAY_SIZE];
   uint32_t symbol = min_symbol;
   if (cap_encoded != 0) {
-    if (profit_ratio_power == 3.0) {
+    if ((profit_ratio_power == 3.0) && (order_ratio == 0.0)) {
       while (symbol <= max_symbol) {
         if (symbol_counts[symbol] > 1) {
           next_base_node_child_num_ptr = base_node_child_num_ptr + BASE_NODES_CHILD_ARRAY_SIZE;
@@ -3384,7 +3559,7 @@ void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_sco
         symbol++;
       }
     }
-    else if (profit_ratio_power == 2.0) {
+    else if ((profit_ratio_power == 2.0) && (order_ratio == 0.0)) {
       while (symbol <= max_symbol) {
         if (symbol_counts[symbol] > 1) {
           next_base_node_child_num_ptr = base_node_child_num_ptr + BASE_NODES_CHILD_ARRAY_SIZE;
@@ -3401,7 +3576,7 @@ void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_sco
         symbol++;
       }
     }
-    else if (profit_ratio_power == 1.0) {
+    else if ((profit_ratio_power == 1.0) && (order_ratio == 0.0)) {
       while (symbol <= max_symbol) {
         if (symbol_counts[symbol] > 1) {
           next_base_node_child_num_ptr = base_node_child_num_ptr + BASE_NODES_CHILD_ARRAY_SIZE;
@@ -3425,8 +3600,8 @@ void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_sco
           do {
             if (*base_node_child_num_ptr > 0)
               score_base_node_tree_cap(&string_nodes[*base_node_child_num_ptr], node_data, symbol_entropy[symbol],
-                  production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, new_symbol_cost,
-                  symbol_entropy, rank_scores_buffer, node_ptrs_num_ptr);
+                  production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, log2_instances,
+                  new_symbol_cost, symbol_entropy, rank_scores_buffer, order_ratio, node_ptrs_num_ptr, symbol);
             base_node_child_num_ptr++;
           } while (base_node_child_num_ptr != next_base_node_child_num_ptr);
         }
@@ -3437,7 +3612,7 @@ void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_sco
     }
   }
   else {
-    if (profit_ratio_power == 2.0) {
+    if ((profit_ratio_power == 2.0) && (order_ratio == 0.0)) {
       while (symbol <= max_symbol) {
         if (symbol_counts[symbol] > 1) {
           next_base_node_child_num_ptr = base_node_child_num_ptr + BASE_NODES_CHILD_ARRAY_SIZE;
@@ -3454,7 +3629,7 @@ void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_sco
         symbol++;
       }
     }
-    else if (profit_ratio_power == 1.0) {
+    else if ((profit_ratio_power == 1.0) && (order_ratio == 0.0)) {
       while (symbol <= max_symbol) {
         if (symbol_counts[symbol] > 1) {
           next_base_node_child_num_ptr = base_node_child_num_ptr + BASE_NODES_CHILD_ARRAY_SIZE;
@@ -3471,7 +3646,7 @@ void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_sco
         symbol++;
       }
     }
-    else if (profit_ratio_power == 0.0) {
+    else if ((profit_ratio_power == 0.0) && (order_ratio == 0.0)) {
       while (symbol <= max_symbol) {
         if (symbol_counts[symbol] > 1) {
           next_base_node_child_num_ptr = base_node_child_num_ptr + BASE_NODES_CHILD_ARRAY_SIZE;
@@ -3495,8 +3670,9 @@ void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_sco
           do {
             if (*base_node_child_num_ptr > 0)
               score_base_node_tree(&string_nodes[*base_node_child_num_ptr], node_data, symbol_entropy[symbol],
-                  production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, new_symbol_cost,
-                  symbol_entropy, rank_scores_buffer, node_ptrs_num_ptr, UTF8_compliant);
+                  production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, log2_instances,
+                  new_symbol_cost, symbol_entropy, rank_scores_buffer, order_ratio, node_ptrs_num_ptr, UTF8_compliant,
+                  symbol);
             base_node_child_num_ptr++;
           } while (base_node_child_num_ptr != next_base_node_child_num_ptr);
         }
@@ -3512,7 +3688,7 @@ void score_symbol_tree(uint32_t min_symbol, uint32_t max_symbol, struct node_sco
 
 void score_symbol_tree_fast(uint32_t min_symbol, uint32_t max_symbol, struct node_score_data_fast *rank_scores_buffer,
     struct score_data *node_data, uint16_t *node_ptrs_num_ptr, double production_cost, double profit_ratio_power,
-    double log2_num_symbols_plus_substitution_cost, double *new_symbol_cost, double *symbol_entropy,
+    double log2_num_symbols_plus_substitution_cost, double *log2_instances, double *new_symbol_cost, double *symbol_entropy,
     uint8_t cap_encoded, uint8_t UTF8_compliant, uint32_t * symbol_counts) {
   int32_t * next_base_node_child_num_ptr;
   int32_t * base_node_child_num_ptr = &base_string_nodes_child_node_num[min_symbol * BASE_NODES_CHILD_ARRAY_SIZE];
@@ -3596,7 +3772,7 @@ void score_symbol_tree_fast(uint32_t min_symbol, uint32_t max_symbol, struct nod
             if (*base_node_child_num_ptr > 0)
               score_base_node_tree_fast(&string_nodes[*base_node_child_num_ptr], node_data, symbol_entropy[symbol],
                   production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, new_symbol_cost,
-                  symbol_entropy, rank_scores_buffer, node_ptrs_num_ptr, UTF8_compliant);
+                  symbol_entropy, rank_scores_buffer, node_ptrs_num_ptr, UTF8_compliant, symbol);
             base_node_child_num_ptr++;
           } while (base_node_child_num_ptr != next_base_node_child_num_ptr);
         }
@@ -4210,7 +4386,7 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
   uint32_t best_score_num_symbols, max_match_length, num_overlaps, prior_match_score_number[MAX_PRIOR_MATCHES];
   uint32_t *in_symbol_ptr, *previous_in_symbol_ptr, *out_symbol_ptr, *stop_symbol_ptr, *end_symbol_ptr;
   uint32_t *search_match_ptr, *start_cycle_symbol_ptr, *end_cycle_symbol_ptr, *node_string_start_ptr, *block_ptr;
-  uint32_t *match_string_start_ptr, *match_strings, *symbol_counts, *new_symbol_number, *substitute_data;
+  uint32_t *match_string_start_ptr, *match_strings, *new_symbol_number, *substitute_data;
   uint32_t *prior_match_end_ptr[MAX_PRIOR_MATCHES];
   int32_t *base_node_child_num_ptr;
   uint16_t scan_cycle, num_candidates, candidate_num, node_ptrs_num, *candidates_index, *candidates_position;
@@ -4218,10 +4394,11 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
   uint8_t fast_sections, fast_section, section_repeats, max_terminal;
   uint8_t *in_char_ptr, *end_char_ptr, *candidate_bad, *free_RAM_ptr, *end_RAM_ptr;
   size_t block_size;
-  double d_file_symbols, order_0_entropy, log_file_symbols, production_cost, profit_ratio_power;
+  double d_file_symbols, order_0_entropy, production_cost, profit_ratio_power;
   double log2_num_symbols_plus_substitution_cost, *symbol_entropy;
   double log2_instances[NUM_PRECALCULATED_INSTANCE_LOGS], new_symbol_cost[NUM_PRECALCULATED_SYMBOL_COSTS];
-  float prior_min_score, new_min_score, cycle_start_ratio, cycle_end_ratio, fast_min_score, section_scores[23];
+  float prior_min_score, new_min_score, cycle_start_ratio, cycle_end_ratio, order_ratio, fast_min_score;
+  float section_scores[23];
   struct lcp_thread_data lcp_thread_data[13];
   struct word_lcp_thread_data word_lcp_thread_data[4];
   struct rank_scores_thread_data *rank_scores_data_ptr;
@@ -4234,11 +4411,18 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
   pthread_t build_lcp_threads[7], word_build_lcp_threads[4], rank_scores_thread1, substitute_thread1;
   pthread_t overlap_check_threads[7], find_substitutions_threads[7];
 
+
   if ((0 == (symbol_counts = (uint32_t *)malloc(0x900000 * sizeof(uint32_t))))
       || (0 == (overlap_check_data = (struct overlap_check *)malloc(8 * sizeof(struct overlap_check))))) {
     fprintf(stderr, "ERROR - memory allocation failed\n");
     return(0);
   }
+
+  if (0 == (symbol_ends = (struct symbol_ends_data *)malloc(0x900000 * sizeof(struct symbol_ends_data)))) {
+    fprintf(stderr, "ERROR - memory allocation failed\n");
+    return(0);
+  }
+
   // Determine whether the RAM can be allocated, if not reduce size until malloc successful or RAM too small
   uint64_t max_memory_usage;
   if (sizeof(uint32_t *) >= 8)
@@ -4255,6 +4439,7 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
     create_words = params->create_words;
     max_rules = params->max_rules;
     fast_mode = params->fast_mode;
+    order_ratio = params->order;
   }
   else {
     user_set_production_cost = 0;
@@ -4316,6 +4501,14 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
     }
   }
   end_RAM_ptr = (uint8_t *)start_symbol_ptr + available_RAM;
+
+  for (i = 0 ; i < 0x100 ; i++)
+    for (j = 0 ; j < 0x100 ; j++)
+      o1c[i][j] = 0;
+  for (i = 0 ; i < 0x100 ; i++) {
+    num_ends[i] = 0;
+    num_starts[i] = 0;
+  }
 
   // parse the file to determine UTF8_compliant
   in_symbol_ptr = start_symbol_ptr;
@@ -4392,6 +4585,8 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
       else
         profit_ratio_power = 1.0;
     }
+    for (i = 0 ; i < num_simple_symbols ; i++)
+      symbol_ends[i].start = symbol_ends[i].end = get_UTF8_context(i);
   }
   else {
     num_simple_symbols = 0x100;
@@ -4415,6 +4610,8 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
       else
         profit_ratio_power = 0.0;
     }
+    for (i = 0 ; i < num_simple_symbols ; i++)
+      symbol_ends[i].start = symbol_ends[i].end = i;
   }
   free(*iobuf);
   if (available_RAM
@@ -4422,6 +4619,17 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
     fprintf(stderr, "ERROR - Insufficient RAM to compress - unable to allocate %Iu bytes\n",
         (size_t)(4 * (uint64_t)in_size + 4 * BASE_NODES_CHILD_ARRAY_SIZE * num_simple_symbols + 0x10 * MAX_SCORES_FAST));
     return(0);
+  }
+
+  in_symbol_ptr = start_symbol_ptr;
+  uint8_t sym1, sym2;
+  sym2 = *in_symbol_ptr++;
+  while (in_symbol_ptr != end_symbol_ptr) {
+    sym1 = sym2;
+    sym2 = symbol_ends[*in_symbol_ptr++].end;
+    o1c[sym1][sym2]++;
+    num_ends[sym1]++;
+    num_starts[sym2]++;
   }
 
   first_define_index = in_symbol_ptr - start_symbol_ptr;
@@ -4612,8 +4820,8 @@ top_main_loop:
       if (fast_mode == 0) {
         rank_scores_data_ptr->max_scores = max_scores;
         pthread_create(&rank_scores_thread1, NULL, rank_word_scores_thread, (void *)rank_scores_data_ptr);
-        score_symbol_tree_words(rank_scores_data_ptr->rank_scores_buffer, node_data,
-            &node_ptrs_num, production_cost, log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy);
+        score_symbol_tree_words(rank_scores_data_ptr->rank_scores_buffer, node_data, &node_ptrs_num,
+            production_cost, log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy);
         while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
         rank_scores_data_ptr->rank_scores_buffer[node_ptrs_num].last_match_index1 = 0;
       }
@@ -4629,8 +4837,8 @@ top_main_loop:
         } while (++i < next_new_symbol_number);
         rank_scores_data_fast_ptr->max_scores = max_scores;
         pthread_create(&rank_scores_thread1, NULL, rank_word_scores_thread_fast, (void *)rank_scores_data_fast_ptr);
-        score_symbol_tree_words_fast(rank_scores_data_fast_ptr->rank_scores_buffer, node_data,
-            &node_ptrs_num, production_cost, log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy);
+        score_symbol_tree_words_fast(rank_scores_data_fast_ptr->rank_scores_buffer, node_data, &node_ptrs_num,
+            production_cost, log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy);
         while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
         rank_scores_data_fast_ptr->rank_scores_buffer[node_ptrs_num].last_match_index = 0;
       }
@@ -4921,6 +5129,7 @@ wmain_symbol_substitution_loop_end:
             while ((uint16_t)(substitute_index - atomic_load_explicit(&substitute_data_read_index,
                 memory_order_acquire)) >= 0x8000) /* wait */ ;
           substitute_data[substitute_index++] = stop_symbol_ptr - previous_in_symbol_ptr;
+          atomic_store_explicit(&substitute_data_write_index, substitute_index, memory_order_release);
 wmain_symbol_substitution_loop_end2:
           if ((substitute_index & 0x7FFF) == 0)
             while (substitute_index != (uint16_t)atomic_load_explicit(&substitute_data_read_index,
@@ -5003,10 +5212,22 @@ wmain_symbol_substitution_loop_end2:
               else
                 match_string_end_ptr = match_string_ptr + candidates_fast[candidates_index[candidate_num]].num_symbols;
               uint32_t num_repeats = symbol_counts[num_simple_symbols + num_compound_symbols - 1] - 1;
+
+              uint32_t sym1, sym2;
+              sym1 = *match_string_ptr;
+              symbol_ends[num_simple_symbols + num_compound_symbols - 1].start = symbol_ends[sym1].start;
+              symbol_counts[sym1] -= num_repeats;
+              *out_symbol_ptr++ = *match_string_ptr++;
               while (match_string_ptr != match_string_end_ptr) {
-                symbol_counts[*match_string_ptr] -= num_repeats;
+                sym2 = *match_string_ptr;
+                symbol_counts[sym2] -= num_repeats;
+                o1c[symbol_ends[sym1].end][symbol_ends[sym2].start] -= num_repeats;
+                num_ends[symbol_ends[sym1].end] -= num_repeats;
+                num_starts[symbol_ends[sym2].start] -= num_repeats;
+                sym1 = sym2;
                 *out_symbol_ptr++ = *match_string_ptr++;
               }
+              symbol_ends[num_simple_symbols + num_compound_symbols - 1].end = symbol_ends[sym1].end;
             }
             else if (candidate_bad[candidate_num] == 1)
               candidate_bad[candidate_num] = 0;
@@ -5017,7 +5238,7 @@ wmain_symbol_substitution_loop_end2:
           num_file_symbols = end_symbol_ptr - start_symbol_ptr;
 #ifdef PRINTON
           if (fast_mode == 0)
-            fprintf(stderr, "Replaced %u of %u words\r", num_candidates_processed, num_candidates);
+            fprintf(stderr, "Replaced %u of %u words\n", num_candidates_processed, num_candidates);
 #endif
         } while (num_candidates_processed != num_candidates);
         memset(candidate_bad, 0, num_candidates);
@@ -5111,7 +5332,11 @@ wmain_symbol_substitution_loop_end2:
             while (j++ != max_run_length[i])
               *out_symbol_ptr++ = i;
             symbol_counts[i] -= max_run_length[i] * (symbol_counts[new_symbol_number[i]] - 1);
-            num_compound_symbols++;
+            o1c[i][i] -= (max_run_length[i] - 1) * (symbol_counts[new_symbol_number[i]] - 1);
+            num_ends[i] -= (max_run_length[i] - 1) * (symbol_counts[new_symbol_number[i]] - 1);
+            num_starts[i] -= (max_run_length[i] - 1) * (symbol_counts[new_symbol_number[i]] - 1);
+            symbol_ends[num_simple_symbols + num_compound_symbols].start = i;
+            symbol_ends[num_simple_symbols + num_compound_symbols++].end = i;
           }
         }
         end_symbol_ptr = out_symbol_ptr;
@@ -5444,8 +5669,8 @@ done_building_lcp_tree:
       rank_scores_data_ptr->max_scores = max_scores;
       pthread_create(&rank_scores_thread1, NULL, rank_scores_thread, (void *)rank_scores_data_ptr);
       score_symbol_tree(0, main_max_symbol, rank_scores_data_ptr->rank_scores_buffer, node_data, &node_ptrs_num,
-          production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy,
-          cap_encoded, UTF8_compliant, symbol_counts);
+          production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, log2_instances,
+          new_symbol_cost, symbol_entropy, order_ratio, cap_encoded, UTF8_compliant, symbol_counts);
 #ifdef PRINTON
       fprintf(stderr, ".");
 #endif
@@ -5456,8 +5681,8 @@ done_building_lcp_tree:
 #endif
       score_symbol_tree(lcp_thread_data[0].min_symbol, lcp_thread_data[0].max_symbol,
           rank_scores_data_ptr->rank_scores_buffer, node_data, &node_ptrs_num, production_cost, profit_ratio_power,
-          log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy, cap_encoded, UTF8_compliant,
-          symbol_counts);
+          log2_num_symbols_plus_substitution_cost, log2_instances, new_symbol_cost, symbol_entropy, order_ratio, cap_encoded,
+          UTF8_compliant, symbol_counts);
       for (i = 1 ; i <= 5 ; i++) {
 #ifdef PRINTON
         if (fast_mode == 0)
@@ -5470,8 +5695,8 @@ done_building_lcp_tree:
 #endif
         score_symbol_tree(lcp_thread_data[i].min_symbol, lcp_thread_data[i].max_symbol,
             rank_scores_data_ptr->rank_scores_buffer, node_data, &node_ptrs_num, production_cost, profit_ratio_power,
-            log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy, cap_encoded, UTF8_compliant,
-            symbol_counts);
+            log2_num_symbols_plus_substitution_cost, log2_instances, new_symbol_cost, symbol_entropy, order_ratio, cap_encoded,
+            UTF8_compliant, symbol_counts);
       }
       for (i = 6 ; i <= 11 ; i++) {
 #ifdef PRINTON
@@ -5483,8 +5708,8 @@ done_building_lcp_tree:
 #endif
         score_symbol_tree(lcp_thread_data[i].min_symbol, lcp_thread_data[i].max_symbol,
             rank_scores_data_ptr->rank_scores_buffer, node_data, &node_ptrs_num, production_cost, profit_ratio_power,
-            log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy, cap_encoded, UTF8_compliant,
-            symbol_counts);
+            log2_num_symbols_plus_substitution_cost, log2_instances, new_symbol_cost, symbol_entropy, order_ratio, cap_encoded,
+            UTF8_compliant, symbol_counts);
       }
       if ((node_ptrs_num & 0xFFF) == 0)
         while ((uint16_t)(node_ptrs_num - atomic_load_explicit(&rank_scores_read_index, memory_order_acquire))
@@ -5527,22 +5752,22 @@ done_building_lcp_tree:
       pthread_join(build_lcp_threads[0], NULL);
       pthread_create(&rank_scores_thread1, NULL, rank_scores_thread_fast, (void *)rank_scores_data_fast_ptr);
       score_symbol_tree_fast(0, lcp_thread_data[0].max_symbol, rank_scores_data_fast_ptr->rank_scores_buffer, node_data,
-          &node_ptrs_num, production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, new_symbol_cost,
-          symbol_entropy, cap_encoded, UTF8_compliant, symbol_counts);
+          &node_ptrs_num, production_cost, profit_ratio_power, log2_num_symbols_plus_substitution_cost, log2_instances,
+          new_symbol_cost, symbol_entropy, cap_encoded, UTF8_compliant, symbol_counts);
       for (i = 1 ; i <= 6 ; i++) {
         pthread_join(build_lcp_threads[i], NULL);
         pthread_create(&build_lcp_threads[i - 1], NULL, build_lcp_thread, (void *)&lcp_thread_data[i + 6]);
         score_symbol_tree_fast(lcp_thread_data[i].min_symbol, lcp_thread_data[i].max_symbol,
             rank_scores_data_fast_ptr->rank_scores_buffer, node_data, &node_ptrs_num, production_cost,
-            profit_ratio_power, log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy, cap_encoded,
-            UTF8_compliant, symbol_counts);
+            profit_ratio_power, log2_num_symbols_plus_substitution_cost, log2_instances,
+            new_symbol_cost, symbol_entropy, cap_encoded, UTF8_compliant, symbol_counts);
       }
       for (i = 7 ; i <= 12 ; i++) {
         pthread_join(build_lcp_threads[i - 7], NULL);
         score_symbol_tree_fast(lcp_thread_data[i].min_symbol, lcp_thread_data[i].max_symbol,
             rank_scores_data_fast_ptr->rank_scores_buffer, node_data, &node_ptrs_num, production_cost,
-            profit_ratio_power, log2_num_symbols_plus_substitution_cost, new_symbol_cost, symbol_entropy, cap_encoded,
-            UTF8_compliant, symbol_counts);
+            profit_ratio_power, log2_num_symbols_plus_substitution_cost, log2_instances,
+            new_symbol_cost, symbol_entropy, cap_encoded, UTF8_compliant, symbol_counts);
       }
       if ((node_ptrs_num & 0xFFF) == 0)
         while ((uint16_t)(node_ptrs_num - atomic_load_explicit(&rank_scores_read_index, memory_order_acquire))
@@ -5887,7 +6112,8 @@ done_building_lcp_tree:
           overlap_check_data[i].num_overlaps = num_candidates;
           overlap_check_data[i].match_nodes = match_nodes;
           if (overlap_check_data[i].stop_symbol_ptr - start_symbol_ptr + MAX_MATCH_LENGTH < first_define_index)
-            pthread_create(&overlap_check_threads[i - 1], NULL, overlap_check_no_defs_thread, (void *)&overlap_check_data[i]);
+            pthread_create(&overlap_check_threads[i - 1], NULL, overlap_check_no_defs_thread,
+               (void *)&overlap_check_data[i]);
           else
             pthread_create(&overlap_check_threads[i - 1], NULL, overlap_check_thread, (void *)&overlap_check_data[i]);
         }
@@ -5961,9 +6187,11 @@ main_overlap_check_loop_match:
                   high_score = node_score_number;
                 }
                 int32_t * next_overlap_num_ptr = &overlap_check_data[0].next[low_score];
-                while ((*next_overlap_num_ptr != -1) && (overlap_check_data[0].second[*next_overlap_num_ptr] < high_score))
+                while ((*next_overlap_num_ptr != -1)
+                    && (overlap_check_data[0].second[*next_overlap_num_ptr] < high_score))
                   next_overlap_num_ptr = &overlap_check_data[0].next[*next_overlap_num_ptr];
-                if ((*next_overlap_num_ptr == -1) || (overlap_check_data[0].second[*next_overlap_num_ptr] != high_score)) {
+                if ((*next_overlap_num_ptr == -1)
+                    || (overlap_check_data[0].second[*next_overlap_num_ptr] != high_score)) {
                   if (num_overlaps < 150000) {
                     overlap_check_data[0].second[num_overlaps] = high_score;
                     overlap_check_data[0].next[num_overlaps] = *next_overlap_num_ptr;
@@ -6527,6 +6755,7 @@ main_symbol_substitution_loop_end:
           while ((uint16_t)(substitute_index - atomic_load_explicit(&substitute_data_read_index, memory_order_acquire))
               >= 0x8000) /* wait */ ;
         substitute_data[substitute_index++] = stop_symbol_ptr - previous_in_symbol_ptr;
+        atomic_store_explicit(&substitute_data_write_index, substitute_index, memory_order_release);
       }
 main_symbol_substitution_loop_end2:
       if ((substitute_index & 0x7FFF) == 0)
@@ -6751,10 +6980,21 @@ main_symbol_substitution_loop_end2:
           else
             match_string_end_ptr = match_string_ptr + candidates_fast[candidate_num++].num_symbols;
           uint32_t num_repeats = symbol_counts[num_simple_symbols + num_compound_symbols - 1] - 1;
+          uint32_t sym1, sym2;
+          sym1 = *match_string_ptr;
+          symbol_ends[num_simple_symbols + num_compound_symbols - 1].start = symbol_ends[sym1].start;
+          symbol_counts[sym1] -= num_repeats;
+          *out_symbol_ptr++ = *match_string_ptr++;
           while (match_string_ptr != match_string_end_ptr) {
-            symbol_counts[*match_string_ptr] -= num_repeats;
+            sym2 = *match_string_ptr;
+            symbol_counts[sym2] -= num_repeats;
+            o1c[symbol_ends[sym1].end][symbol_ends[sym2].start] -= num_repeats;
+            num_ends[symbol_ends[sym1].end] -= num_repeats;
+            num_starts[symbol_ends[sym2].start] -= num_repeats;
+            sym1 = sym2;
             *out_symbol_ptr++ = *match_string_ptr++;
           }
+          symbol_ends[num_simple_symbols + num_compound_symbols - 1].end = symbol_ends[sym1].end;
         }
         else
           candidate_bad[candidate_num++] = 0;
