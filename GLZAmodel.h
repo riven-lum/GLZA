@@ -11,13 +11,23 @@ enum { UP_FREQ_FIRST_CHAR = 8, FREQ_FIRST_CHAR_BOT = 0x2000 };
 enum { NOT_CAP = 0, CAP = 1 };
 enum { LEVEL0 = 0, LEVEL1 = 1, LEVEL0_CAP = 2, LEVEL1_CAP = 3 };
 
+#define START_UTF8_2BYTE_SYMBOLS 0x80
+#define START_UTF8_3BYTE_SYMBOLS 0x800
+#define START_UTF8_4BYTE_SYMBOLS 0x10000
+#define MTF_QUEUE_SIZE 64
+#define MAX_INSTANCES_FOR_MTF_QUEUE 15
+
+uint32_t ReadLow();
+uint32_t ReadRange();
+void NormalizeEncoder(uint32_t bot);
+void NormalizeDecoder(uint32_t bot);
 void InitSymbolFirstChar(uint8_t trailing_char, uint8_t leading_char);
 void InitFreqFirstChar(uint8_t trailing_char, uint8_t leading_char);
 void InitFirstCharBin(uint8_t trailing_char, uint8_t leading_char, uint8_t code_length, uint8_t cap_symbol_defined,
     uint8_t cap_lock_symbol_defined);
 void InitFirstCharBinBinary(uint8_t trailing_char, uint8_t leading_char, uint8_t code_length);
 void InitTrailingCharBin(uint8_t trailing_char, uint8_t leading_char, uint8_t code_length);
-void InitTrailingCharBinary(uint32_t trailing_char, uint8_t * symbol_lengths);
+void InitTrailingCharBinary(uint8_t trailing_char, uint8_t * symbol_lengths);
 void InitBaseSymbolCap(uint8_t BaseSymbol, uint8_t max_symbol, uint8_t new_symbol_code_length,
     uint8_t * cap_symbol_defined_ptr, uint8_t * cap_lock_symbol_defined_ptr, uint8_t * symbol_lengths);
 void UpFreqMtfQueueNum(uint8_t Context, uint8_t mtf_queue_number);
@@ -41,10 +51,10 @@ void EncodeExtraLength(uint8_t Symbol);
 void EncodeINST(uint8_t Context, uint8_t SIDSymbol, uint8_t Symbol);
 void EncodeERG(uint8_t Context, uint8_t Symbol);
 void EncodeWordTag(uint8_t Symbol);
-void EncodeShortDictionarySymbol(uint8_t Length, uint16_t BinNum, uint16_t DictionaryBins, uint16_t CodeBins);
+void EncodeShortDictionarySymbol(uint16_t BinNum, uint16_t DictionaryBins, uint16_t CodeBins);
 void EncodeLongDictionarySymbol(uint32_t BinCode, uint16_t BinNum, uint16_t DictionaryBins, uint8_t CodeLength,
     uint16_t CodeBins);
-void EncodeBaseSymbol(uint32_t BaseSymbol, uint8_t Bits, uint32_t NumBaseSymbols);
+void EncodeBaseSymbol(uint32_t BaseSymbol, uint32_t NumBaseSymbols, uint32_t NormBaseSymbols);
 void EncodeFirstChar(uint8_t Symbol, uint8_t SymType, uint8_t LastChar);
 void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar);
 void WriteInCharNum(uint32_t value);
@@ -53,7 +63,7 @@ uint32_t ReadOutCharNum();
 void InitEncoder(uint8_t max_regular_code_length, uint8_t num_inst_codes, uint8_t cap_encoded, uint8_t UTF8_compliant,
     uint8_t use_mtf, uint8_t use_mtfg);
 void FinishEncoder();
-void DecodeSymTypeStart(uint8_t Context);
+void DecodeSymTypeStart();
 uint8_t DecodeSymTypeCheckDict(uint8_t Context);
 void DecodeSymTypeFinishDict(uint8_t Context);
 uint8_t DecodeSymTypeCheckNew(uint8_t Context);
@@ -63,7 +73,7 @@ void DecodeSymTypeFinishMtfg(uint8_t Context);
 void DecodeSymTypeFinishMtf(uint8_t Context);
 void DecodeMtfQueueNumStart(uint8_t Context);
 uint8_t DecodeMtfQueueNumCheck0(uint8_t Context);
-void DecodeMtfQueueNumFinish0(uint8_t Context);
+void DecodeMtfQueueNumFinish0();
 uint8_t DecodeMtfQueueNumFinish(uint8_t Context);
 void DecodeMtfQueuePosStart(uint8_t Context, uint8_t mtf_queue_number, uint8_t * mtf_queue_size);
 uint8_t DecodeMtfQueuePosCheck0(uint8_t Context, uint8_t mtf_queue_number);
@@ -84,10 +94,10 @@ void DecodeINSTFinish0(uint8_t Context, uint8_t SIDSymbol);
 uint8_t DecodeINSTFinish(uint8_t Context, uint8_t SIDSymbol);
 uint8_t DecodeERG(uint8_t Context);
 uint8_t DecodeWordTag();
-uint16_t DecodeDictionaryBin(uint8_t FirstChar, uint8_t * lookup_bits, uint8_t * CodeLengthPtr, uint16_t DictionaryBins,
+uint16_t DecodeDictionaryBin(uint8_t * lookup_bits, uint8_t * CodeLengthPtr, uint16_t DictionaryBins,
     uint8_t bin_extra_bits);
 uint32_t DecodeBinCode(uint8_t Bits);
-uint32_t DecodeBaseSymbol(uint8_t Bits, uint32_t NumBaseSymbols);
+uint32_t DecodeBaseSymbol(uint32_t NumBaseSymbols, uint8_t cap_encoded);
 uint8_t DecodeFirstChar(uint8_t SymType, uint8_t LastChar);
 uint8_t DecodeFirstCharBinary(uint8_t LastChar);
 void InitDecoder(uint8_t max_regular_code_length, uint8_t num_inst_codes, uint8_t cap_encoded, uint8_t UTF8_compliant,

@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright 2014-2016 Kennon Conrad
+Copyright 2014-2017 Kennon Conrad
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,13 +26,10 @@ limitations under the License.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "GLZA.h"
 #include "GLZAmodel.h"
 
-#define START_UTF8_2BYTE_SYMBOLS 0x80
-#define START_UTF8_3BYTE_SYMBOLS 0x800
-#define START_UTF8_4BYTE_SYMBOLS 0x10000
-#define MAX_INSTANCES_FOR_MTF_QUEUE 15
-#define MTF_QUEUE_SIZE 64
+#include <time.h>
 
 const uint32_t CHARS_TO_WRITE = 0x40000;
 const uint32_t MAX_SYMBOLS_DEFINED = 0x00900000;
@@ -41,41 +38,42 @@ const uint16_t FREE_SYMBOL_LIST_SIZE = 0x400;
 const uint8_t FREE_STRING_LIST_SIZE = 0x40;
 const uint8_t FREE_SYMBOL_LIST_WAIT_SIZE = 0x40;
 
-uint32_t num_symbols_defined, symbol, symbol_number, base_symbol, num_base_symbols, dictionary_size, outbuf_index;
-uint32_t chars_to_write, symbol_index, symbol_to_move, min_extra_reduce_index, max_symbols_defined;
-uint32_t free_symbol_list[0x400], free_symbol_list_wait1[0x40], free_symbol_list_wait2[0x40];
-uint32_t symbol_buffer[0x200];
+uint32_t num_symbols_defined, symbol, num_base_symbols, dictionary_size, outbuf_index, max_symbols_defined;
+uint32_t free_symbol_list[0x400], free_symbol_list_wait1[0x40], free_symbol_list_wait2[0x40], symbol_buffer[0x200];
 uint32_t mtfg_queue_0[8], mtfg_queue_8[8], mtfg_queue_16[0x10], mtfg_queue_32[0x20];
-uint32_t mtfg_queue_64[0x40], mtfg_queue_128[0x40], mtfg_queue_192[0x40];
-uint32_t mtf_queue[16][64], nsob[0x100][26], *sym_list_ptrs[0x100][26];
-uint32_t *mtf_queue_ptr, *mtf_queue_top_ptr;
-uint16_t free_symbol_list_length, symbol_buffer_write_index, symbol_buffer_read_index, BinNum;
-uint16_t nbob[0x100][26], sum_nbob[0x100], fbob[0x100][26];
-uint8_t symbol_count, max_code_length, max_regular_code_length, find_first_symbol, end_symbol;
-uint8_t CodeLength, FirstChar, SIDSymbol, Instances;
-uint8_t UTF8_compliant, base_bits, cap_encoded, use_mtf, use_mtfg, prior_is_cap, two_threads;
+uint32_t mtfg_queue_64[0x40], mtfg_queue_128[0x40], mtfg_queue_192[0x40], mtf_queue[16][64];
+uint16_t free_symbol_list_length, symbol_buffer_write_index, symbol_buffer_read_index, sum_nbob[0x100];
+uint8_t max_code_length, max_regular_code_length, find_first_symbol, end_char;
+uint8_t UTF8_compliant, cap_encoded, use_mtf, use_mtfg, prior_is_cap, two_threads;
 uint8_t write_cap_on, write_cap_lock_on, skip_space_on, delta_on, delta_format, stride, prior_end;
-uint8_t out_buffer_num, out_buffers_sent, no_embed, cap_symbol_defined, cap_lock_symbol_defined;
-uint8_t mtf_queue_number, mtfg_queue_position;
+uint8_t out_buffers_sent, no_embed, cap_symbol_defined, cap_lock_symbol_defined;
 uint8_t mtfg_queue_0_offset, mtfg_queue_8_offset, mtfg_queue_16_offset, mtfg_queue_32_offset;
 uint8_t mtfg_queue_64_offset, mtfg_queue_128_offset, mtfg_queue_192_offset;
 uint8_t free_symbol_list_wait1_length, free_symbol_list_wait2_length;
 uint8_t free_string_list_length, free_string_list_wait1, free_string_list_wait2;
-uint8_t symbol_lengths[0x100], bin_code_length[0x100];
+uint8_t symbol_lengths[0x100], bin_code_length[0x100], lookup_bits[0x100][0x1000];
 uint8_t out_char0[0x40064], out_char1[0x40064], temp_buf[0x30000];
 uint8_t mtf_queue_miss_code_length[16], mtf_queue_size[16], mtf_queue_offset[16];
-uint8_t lookup_bits[0x100][0x1000], sym_list_bits[0x100][26];
-uint8_t *symbol_string_ptr, *next_string_ptr, *out_char_ptr, *start_char_ptr, *extra_out_char_ptr;
-uint8_t *symbol_strings, *outbuf;
+uint8_t *out_char_ptr, *start_char_ptr, *extra_out_char_ptr, *outbuf, *symbol_strings;
 atomic_uchar done_parsing, symbol_buffer_pt1_owner, symbol_buffer_pt2_owner;
 FILE * fd;
+
+
+struct bin_data {
+  uint32_t nsob;
+  uint16_t nbob;
+  uint16_t fbob;
+  uint32_t * sym_list;
+  uint8_t sym_list_bits;
+} bin_data[0x100][26];
 
 
 struct sym_data {
   uint8_t type;  // bit 0: removable, bit1: string starts a-z, bit2: nonergodic, bit3: in queue
       // bit 4: "word", bit 5: non-"word", bit 6: likely to be followed by ' ', bit 7: not likely to be followed by ' '
   uint8_t instances;
-  uint8_t remaining;
+  uint8_t remaining_m1;
+  uint8_t starts;
   uint8_t ends;
   uint32_t string_index;
   uint32_t string_length;
@@ -89,10 +87,9 @@ struct free_str_list {
 } free_string_list[0x40];
 
 
-void check_free_symbol() {
+void push_free_symbol(uint32_t symbol_number) {
   if ((symbol_data[symbol_number].type & 1) != 0) {
     symbol_data[symbol_number].type &= 0xFE;
-    uint32_t symbol_strings_index = symbol_data[symbol_number].string_index;
     uint32_t len = symbol_data[symbol_number].string_length;
     if ((free_string_list_length < FREE_STRING_LIST_SIZE)
         || ((len > free_string_list[FREE_STRING_LIST_SIZE - 1].string_length) && (free_string_list_wait2 < 0x10))) {
@@ -107,7 +104,7 @@ void check_free_symbol() {
         free_string_list[free_string_list_index].wait_cycles = free_string_list[free_string_list_index - 1].wait_cycles;
         free_string_list_index--;
       }
-      free_string_list[free_string_list_index].string_index = symbol_strings_index;
+      free_string_list[free_string_list_index].string_index = symbol_data[symbol_number].string_index;
       free_string_list[free_string_list_index].string_length = len;
       free_string_list[free_string_list_index].wait_cycles = 2;
       free_string_list_wait2++;
@@ -124,7 +121,7 @@ void check_free_symbol() {
           free_string_list[free_string_list_index].wait_cycles = free_string_list[free_string_list_index - 1].wait_cycles;
           free_string_list_index--;
         }
-        free_string_list[free_string_list_index].string_index = symbol_strings_index;
+        free_string_list[free_string_list_index].string_index = symbol_data[symbol_number].string_index;
         free_string_list[free_string_list_index].string_length = len;
         free_string_list[free_string_list_index].wait_cycles = 2;
         free_string_list_wait2++;
@@ -137,7 +134,144 @@ void check_free_symbol() {
 }
 
 
-void dremove_mtfg_queue_symbol_16() {
+uint8_t dadd_dictionary_symbol(uint32_t index, uint8_t bits) {
+  uint8_t first_char = symbol_data[index].starts;
+  struct bin_data * bin_info = &bin_data[first_char][bits];
+  if ((bin_info->nsob >> bin_info->sym_list_bits) != 0) {
+    if (0 == (bin_info->sym_list
+        = (uint32_t *)realloc(bin_info->sym_list, sizeof(uint32_t) * (1 << ++bin_info->sym_list_bits)))) {
+      fprintf(stderr,"FATAL ERROR - symbol list realloc failure\n");
+      return(0);
+    }
+  }
+  symbol_data[index].dictionary_index = bin_info->nsob;
+  bin_info->sym_list[bin_info->nsob] = index;
+  if ((bin_info->nsob++ << (32 - bits)) == ((uint32_t)bin_info->nbob << (32 - bin_code_length[first_char]))) {
+    if (bits >= bin_code_length[first_char]) { /* add one bin */
+      if (sum_nbob[first_char] < 0x1000) {
+        sum_nbob[first_char]++;
+        if (bits == max_code_length)
+          bin_info->nbob++;
+        else {
+          lookup_bits[first_char][bin_info->fbob + bin_info->nbob++] = bits;
+          while (++bits != max_code_length) {
+            if (bin_data[first_char][bits].nbob != 0)
+              lookup_bits[first_char][bin_data[first_char][bits].fbob + bin_data[first_char][bits].nbob] = bits;
+            bin_data[first_char][bits].fbob++;
+          }
+          bin_data[first_char][max_code_length].fbob++;
+        }
+      }
+      else {
+        bin_info->nbob++;
+        bin_code_length[first_char]--;
+        uint16_t first_max_code_length = bin_data[first_char][max_code_length].fbob;
+        sum_nbob[first_char] = (bin_data[first_char][2].nbob = (bin_data[first_char][2].nbob + 1) >> 1);
+        for (bits = 3 ; bits <= max_code_length ; bits++) {
+          bin_data[first_char][bits].fbob = sum_nbob[first_char];
+          sum_nbob[first_char] += (bin_data[first_char][bits].nbob = (bin_data[first_char][bits].nbob + 1) >> 1);
+        }
+        uint16_t bin = bin_data[first_char][2].fbob;
+        for (bits = 2 ; bits < max_code_length ; bits++)
+          while (bin < bin_data[first_char][bits+1].fbob)
+            lookup_bits[first_char][bin++] = bits;
+        while (bin < first_max_code_length)
+          lookup_bits[first_char][bin++] = max_code_length;
+      }
+    }
+    else { /* add multiple bins */
+      uint32_t new_bins = 1 << (bin_code_length[first_char] - bits);
+      if (sum_nbob[first_char] + new_bins <= 0x1000) {
+        bin_info->nbob += new_bins;
+        sum_nbob[first_char] += new_bins;
+        if (bits != max_code_length) {
+          uint8_t code_length = max_code_length;
+          do {
+            bin_data[first_char][code_length--].fbob += new_bins;
+            uint16_t bin;
+            if (bin_data[first_char][code_length].nbob >= new_bins)
+              for (bin = bin_data[first_char][code_length + 1].fbob - new_bins ; bin < bin_data[first_char][code_length + 1].fbob ; bin++)
+                lookup_bits[first_char][bin] = code_length;
+            else
+              for (bin = bin_data[first_char][code_length].fbob + new_bins ;
+                  bin < bin_data[first_char][code_length].fbob + new_bins + bin_data[first_char][code_length].nbob ; bin++)
+                lookup_bits[first_char][bin] = code_length;
+          } while (code_length > bits);
+        }
+      }
+      else if (new_bins <= 0x1000) {
+        bin_info->nbob += new_bins;
+        uint16_t first_max_code_length = bin_data[first_char][max_code_length].fbob;
+        do {
+          bin_code_length[first_char]--;
+          sum_nbob[first_char] = (bin_data[first_char][2].nbob = (bin_data[first_char][2].nbob + 1) >> 1);
+          for (bits = 3 ; bits <= max_code_length ; bits++)
+            sum_nbob[first_char] += (bin_data[first_char][bits].nbob = (bin_data[first_char][bits].nbob + 1) >> 1);
+        } while (sum_nbob[first_char] > 0x1000);
+        uint16_t bin = bin_data[first_char][2].nbob;
+        for (bits = 3 ; bits <= max_code_length ; bits++) {
+          bin_data[first_char][bits].fbob = bin;
+          bin += bin_data[first_char][bits].nbob;
+        }
+        bin = bin_data[first_char][2].fbob;
+        for (bits = 2 ; bits < max_code_length ; bits++)
+          while (bin < bin_data[first_char][bits+1].fbob)
+            lookup_bits[first_char][bin++] = bits;
+        while (bin < first_max_code_length)
+          lookup_bits[first_char][bin++] = max_code_length;
+      }
+      else {
+        if (sum_nbob[first_char] == 0) {
+          uint8_t bin_shift = bin_code_length[first_char] - 12 - bits;
+          bin_code_length[first_char] -= bin_shift;
+          bin_info->nbob = (new_bins >>= bin_shift);
+          sum_nbob[first_char] = new_bins;
+          uint16_t bin = 0;
+          while (bin < sum_nbob[first_char])
+            lookup_bits[first_char][bin++] = bits;
+          while (++bits <= max_code_length)
+            bin_data[first_char][bits].fbob = sum_nbob[first_char];
+        }
+        else {
+          uint16_t first_max_code_length = bin_data[first_char][max_code_length].fbob;
+          uint8_t bin_shift = bin_code_length[first_char] - 11 - bits;
+          bin_code_length[first_char] -= bin_shift;
+          bin_data[first_char][2].nbob = ((bin_data[first_char][2].nbob - 1) >> bin_shift) + 1;
+          sum_nbob[first_char] = bin_data[first_char][2].nbob;
+          uint8_t code_length;
+          for (code_length = 3 ; code_length <= max_code_length ; code_length++)
+            sum_nbob[first_char]
+                += (bin_data[first_char][code_length].nbob = ((bin_data[first_char][code_length].nbob - 1) >> bin_shift) + 1);
+          bin_info->nbob += (new_bins >>= bin_shift);
+          sum_nbob[first_char] += new_bins;
+          uint16_t bin = 0;
+          for (bits = 3 ; bits <= max_code_length ; bits++)
+            bin_data[first_char][bits].fbob = (bin += bin_data[first_char][bits-1].nbob);
+          bin = bin_data[first_char][2].fbob;
+          for (bits = 2 ; bits < max_code_length ; bits++)
+            while (bin < bin_data[first_char][bits+1].fbob)
+              lookup_bits[first_char][bin++] = bits;
+          while (bin < first_max_code_length)
+            lookup_bits[first_char][bin++] = max_code_length;
+        }
+      }
+    }
+  }
+  return(1);
+}
+
+
+void dremove_dictionary_symbol(uint32_t symbol, uint8_t bits) {
+  uint8_t first_char = symbol_data[symbol].starts;
+  struct bin_data * bin_info = &bin_data[first_char][bits];
+  uint32_t last_symbol = bin_info->sym_list[--bin_info->nsob];
+  bin_info->sym_list[symbol_data[symbol].dictionary_index] = last_symbol;
+  symbol_data[last_symbol].dictionary_index = symbol_data[symbol].dictionary_index;
+  return;
+}
+
+
+void dremove_mtfg_queue_symbol_16(uint8_t mtfg_queue_position) {
   while (mtfg_queue_position != 31) {
     *(mtfg_queue_16 + ((mtfg_queue_16_offset + mtfg_queue_position) & 0xF))
         = *(mtfg_queue_16 + ((mtfg_queue_16_offset + mtfg_queue_position + 1) & 0xF));
@@ -156,7 +290,7 @@ void dremove_mtfg_queue_symbol_16() {
 }
 
 
-void dremove_mtfg_queue_symbol_32() {
+void dremove_mtfg_queue_symbol_32(uint8_t mtfg_queue_position) {
   while (mtfg_queue_position != 63) {
     *(mtfg_queue_32 + ((mtfg_queue_32_offset + mtfg_queue_position) & 0x1F))
         = *(mtfg_queue_32 + ((mtfg_queue_32_offset + mtfg_queue_position + 1) & 0x1F));
@@ -173,7 +307,7 @@ void dremove_mtfg_queue_symbol_32() {
 }
 
 
-void dremove_mtfg_queue_symbol_64() {
+void dremove_mtfg_queue_symbol_64(uint8_t mtfg_queue_position) {
   while (mtfg_queue_position != 127) {
     *(mtfg_queue_64 + ((mtfg_queue_64_offset + mtfg_queue_position) & 0x3F))
         = *(mtfg_queue_64 + ((mtfg_queue_64_offset + mtfg_queue_position + 1) & 0x3F));
@@ -188,7 +322,7 @@ void dremove_mtfg_queue_symbol_64() {
 }
 
 
-void dremove_mtfg_queue_symbol_128() {
+void dremove_mtfg_queue_symbol_128(uint8_t mtfg_queue_position) {
   while (mtfg_queue_position != 191) {
     *(mtfg_queue_128 + ((mtfg_queue_128_offset + mtfg_queue_position) & 0x3F))
         = *(mtfg_queue_128 + ((mtfg_queue_128_offset + mtfg_queue_position + 1) & 0x3F));
@@ -201,7 +335,7 @@ void dremove_mtfg_queue_symbol_128() {
 }
 
 
-void dremove_mtfg_queue_symbol_192() {
+void dremove_mtfg_queue_symbol_192(uint8_t mtfg_queue_position) {
   while (mtfg_queue_position != 255) {
     *(mtfg_queue_192 + ((mtfg_queue_192_offset + mtfg_queue_position) & 0x3F))
         = *(mtfg_queue_192 + ((mtfg_queue_192_offset + mtfg_queue_position + 1) & 0x3F));
@@ -213,7 +347,6 @@ void dremove_mtfg_queue_symbol_192() {
 
 
 void add_new_symbol_to_mtfg_queue(uint32_t symbol_number) {
-  symbol_data[symbol_number].type |= 8;
   mtfg_queue_8_offset = (mtfg_queue_8_offset - 1) & 7;
   uint32_t mtfg_queue_symbol_15 = *(mtfg_queue_8 + mtfg_queue_8_offset);
   mtfg_queue_0_offset = (mtfg_queue_0_offset - 1) & 7;
@@ -237,28 +370,36 @@ void add_new_symbol_to_mtfg_queue(uint32_t symbol_number) {
           *(mtfg_queue_128 + mtfg_queue_128_offset) = mtfg_queue_symbol_127;
           if (symbol_data[mtfg_queue_symbol_191].instances - MAX_INSTANCES_FOR_MTF_QUEUE != 16) {
             mtfg_queue_192_offset = (mtfg_queue_192_offset - 1) & 0x3F;
-            symbol_data[*(mtfg_queue_192 + mtfg_queue_192_offset)].type &= 0xF7;
+            if (*(mtfg_queue_192 + mtfg_queue_192_offset) != max_symbols_defined - 1)
+              dadd_dictionary_symbol(*(mtfg_queue_192 + mtfg_queue_192_offset),
+                  symbol_data[*(mtfg_queue_192 + mtfg_queue_192_offset)].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
             *(mtfg_queue_192 + mtfg_queue_192_offset) = mtfg_queue_symbol_191;
           }
-          else
-            symbol_data[mtfg_queue_symbol_191].type &= 0xF7;
+          else if (mtfg_queue_symbol_191 != max_symbols_defined - 1)
+            dadd_dictionary_symbol(mtfg_queue_symbol_191,
+                symbol_data[mtfg_queue_symbol_191].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
         }
-        else
-          symbol_data[mtfg_queue_symbol_127].type &= 0xF7;
+        else if (mtfg_queue_symbol_127 != max_symbols_defined - 1)
+          dadd_dictionary_symbol(mtfg_queue_symbol_127,
+              symbol_data[mtfg_queue_symbol_127].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
       }
-      else
-        symbol_data[mtfg_queue_symbol_63].type &= 0xF7;
+      else if (mtfg_queue_symbol_63 != max_symbols_defined - 1)
+        dadd_dictionary_symbol(mtfg_queue_symbol_63,
+            symbol_data[mtfg_queue_symbol_63].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
     }
-    else
-      symbol_data[mtfg_queue_symbol_31].type &= 0xF7;
+    else if (mtfg_queue_symbol_31 != max_symbols_defined - 1)
+      dadd_dictionary_symbol(mtfg_queue_symbol_31,
+          symbol_data[mtfg_queue_symbol_31].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
   }
-  else
-    symbol_data[mtfg_queue_symbol_15].type &= 0xF7;
+  else if (mtfg_queue_symbol_15 != max_symbols_defined - 1)
+    dadd_dictionary_symbol(mtfg_queue_symbol_15,
+        symbol_data[mtfg_queue_symbol_15].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
   return;
 }
 
 
-void update_mtfg_queue() {
+uint32_t update_mtfg_queue(uint8_t mtfg_queue_position) {
+  uint32_t symbol_number;
   uint32_t mtfg_queue_symbol_15, mtfg_queue_symbol_31, mtfg_queue_symbol_63, mtfg_queue_symbol_127, mtfg_queue_symbol_191;
   if (mtfg_queue_position < 8) {
     symbol_number = mtfg_queue_0[(mtfg_queue_position += mtfg_queue_0_offset) & 7];
@@ -282,26 +423,28 @@ void update_mtfg_queue() {
     mtfg_queue_symbol_15 = *(mtfg_queue_8 + mtfg_queue_8_offset);
     *(mtfg_queue_8 + mtfg_queue_8_offset) = *(mtfg_queue_0 + mtfg_queue_0_offset);
     if (symbol_data[mtfg_queue_symbol_15].instances - MAX_INSTANCES_FOR_MTF_QUEUE <= 12) {
-      symbol_data[mtfg_queue_symbol_15].type &= 0xF7;
+      if (mtfg_queue_symbol_15 != max_symbols_defined - 1)
+        dadd_dictionary_symbol(mtfg_queue_symbol_15,
+            symbol_data[mtfg_queue_symbol_15].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
       if (mtfg_queue_position < 32) {
         symbol_number = *(mtfg_queue_16 + ((mtfg_queue_position + mtfg_queue_16_offset) & 0xF));
-        dremove_mtfg_queue_symbol_16();
+        dremove_mtfg_queue_symbol_16(mtfg_queue_position);
       }
       else if (mtfg_queue_position < 64) {
         symbol_number = *(mtfg_queue_32 + ((mtfg_queue_position + mtfg_queue_32_offset) & 0x1F));
-        dremove_mtfg_queue_symbol_32();
+        dremove_mtfg_queue_symbol_32(mtfg_queue_position);
       }
       else if (mtfg_queue_position < 128) {
         symbol_number = *(mtfg_queue_64 + ((mtfg_queue_position + mtfg_queue_64_offset) & 0x3F));
-        dremove_mtfg_queue_symbol_64();
+        dremove_mtfg_queue_symbol_64(mtfg_queue_position);
       }
       else if (mtfg_queue_position < 192) {
         symbol_number = *(mtfg_queue_128 + ((mtfg_queue_position + mtfg_queue_128_offset) & 0x3F));
-        dremove_mtfg_queue_symbol_128();
+        dremove_mtfg_queue_symbol_128(mtfg_queue_position);
       }
       else {
         symbol_number = *(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F));
-        dremove_mtfg_queue_symbol_192();
+        dremove_mtfg_queue_symbol_192(mtfg_queue_position);
       }
     }
     else if (mtfg_queue_position < 32) {
@@ -318,22 +461,24 @@ void update_mtfg_queue() {
       mtfg_queue_symbol_31 = *(mtfg_queue_16 + mtfg_queue_16_offset);
       *(mtfg_queue_16 + mtfg_queue_16_offset) = mtfg_queue_symbol_15;
       if (symbol_data[mtfg_queue_symbol_31].instances - MAX_INSTANCES_FOR_MTF_QUEUE == 13) {
-        symbol_data[mtfg_queue_symbol_31].type &= 0xF7;
+        if (mtfg_queue_symbol_31 != max_symbols_defined - 1)
+          dadd_dictionary_symbol(mtfg_queue_symbol_31,
+              symbol_data[mtfg_queue_symbol_31].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
         if (mtfg_queue_position < 64) {
           symbol_number = *(mtfg_queue_32 + ((mtfg_queue_position + mtfg_queue_32_offset) & 0x1F));
-          dremove_mtfg_queue_symbol_32();
+          dremove_mtfg_queue_symbol_32(mtfg_queue_position);
         }
         else if (mtfg_queue_position < 128) {
           symbol_number = *(mtfg_queue_64 + ((mtfg_queue_position + mtfg_queue_64_offset) & 0x3F));
-          dremove_mtfg_queue_symbol_64();
+          dremove_mtfg_queue_symbol_64(mtfg_queue_position);
         }
         else if (mtfg_queue_position < 192) {
           symbol_number = *(mtfg_queue_128 + ((mtfg_queue_position + mtfg_queue_128_offset) & 0x3F));
-          dremove_mtfg_queue_symbol_128();
+          dremove_mtfg_queue_symbol_128(mtfg_queue_position);
         }
         else {
           symbol_number = *(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F));
-          dremove_mtfg_queue_symbol_192();
+          dremove_mtfg_queue_symbol_192(mtfg_queue_position);
         }
       }
       else if (mtfg_queue_position < 64) {
@@ -350,18 +495,20 @@ void update_mtfg_queue() {
         mtfg_queue_symbol_63 = *(mtfg_queue_32 + mtfg_queue_32_offset);
         *(mtfg_queue_32 + mtfg_queue_32_offset) = mtfg_queue_symbol_31;
         if (symbol_data[mtfg_queue_symbol_63].instances - MAX_INSTANCES_FOR_MTF_QUEUE == 14) {
-          symbol_data[mtfg_queue_symbol_63].type &= 0xF7;
+          if (mtfg_queue_symbol_63 != max_symbols_defined - 1)
+            dadd_dictionary_symbol(mtfg_queue_symbol_63,
+                symbol_data[mtfg_queue_symbol_63].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
           if (mtfg_queue_position < 128) {
             symbol_number = *(mtfg_queue_64 + ((mtfg_queue_position + mtfg_queue_64_offset) & 0x3F));
-            dremove_mtfg_queue_symbol_64();
+            dremove_mtfg_queue_symbol_64(mtfg_queue_position);
           }
           else if (mtfg_queue_position < 192) {
             symbol_number = *(mtfg_queue_128 + ((mtfg_queue_position + mtfg_queue_128_offset) & 0x3F));
-            dremove_mtfg_queue_symbol_128();
+            dremove_mtfg_queue_symbol_128(mtfg_queue_position);
           }
           else {
             symbol_number = *(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F));
-            dremove_mtfg_queue_symbol_192();
+            dremove_mtfg_queue_symbol_192(mtfg_queue_position);
           }
         }
         else if (mtfg_queue_position < 128) {
@@ -378,14 +525,16 @@ void update_mtfg_queue() {
           mtfg_queue_symbol_127 = *(mtfg_queue_64 + mtfg_queue_64_offset);
           *(mtfg_queue_64 + mtfg_queue_64_offset) = mtfg_queue_symbol_63;
           if (symbol_data[mtfg_queue_symbol_127].instances - MAX_INSTANCES_FOR_MTF_QUEUE == 15) {
-            symbol_data[mtfg_queue_symbol_127].type &= 0xF7;
+            if (mtfg_queue_symbol_127 != max_symbols_defined - 1)
+              dadd_dictionary_symbol(mtfg_queue_symbol_127,
+                  symbol_data[mtfg_queue_symbol_127].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
             if (mtfg_queue_position < 192) {
               symbol_number = *(mtfg_queue_128 + ((mtfg_queue_position + mtfg_queue_128_offset) & 0x3F));
-              dremove_mtfg_queue_symbol_128();
+              dremove_mtfg_queue_symbol_128(mtfg_queue_position);
             }
             else {
               symbol_number = *(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F));
-              dremove_mtfg_queue_symbol_192();
+              dremove_mtfg_queue_symbol_192(mtfg_queue_position);
             }
           }
           else if (mtfg_queue_position < 192) {
@@ -403,8 +552,10 @@ void update_mtfg_queue() {
             mtfg_queue_symbol_191 = *(mtfg_queue_128 + mtfg_queue_128_offset);
            *(mtfg_queue_128 + mtfg_queue_128_offset) = mtfg_queue_symbol_127;
             if (symbol_data[mtfg_queue_symbol_191].instances - MAX_INSTANCES_FOR_MTF_QUEUE == 16) {
-              symbol_data[mtfg_queue_symbol_191].type &= 0xF7;
-              dremove_mtfg_queue_symbol_192();
+              if (mtfg_queue_symbol_191 != max_symbols_defined - 1)
+                dadd_dictionary_symbol(mtfg_queue_symbol_191,
+                    symbol_data[mtfg_queue_symbol_191].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
+              dremove_mtfg_queue_symbol_192(mtfg_queue_position);
             }
             else {
               mtfg_queue_position += mtfg_queue_192_offset - 192;
@@ -420,11 +571,12 @@ void update_mtfg_queue() {
     }
   }
   *(mtfg_queue_0 + mtfg_queue_0_offset) = symbol_number;
-  return;
+  return(symbol_number);
 }
 
 
-void get_mtfg_symbol() {
+uint32_t get_mtfg_symbol() {
+  uint8_t mtfg_queue_position;
   DecodeMtfgQueuePosStart(NOT_CAP);
   if (DecodeMtfgQueuePosCheck0(NOT_CAP) != 0) {
     mtfg_queue_position = DecodeMtfgQueuePosFinish0(NOT_CAP);
@@ -432,15 +584,13 @@ void get_mtfg_symbol() {
   else {
     mtfg_queue_position = DecodeMtfgQueuePosFinish(NOT_CAP);
   }
-  update_mtfg_queue();
-  return;
+  return(update_mtfg_queue(mtfg_queue_position));
 }
 
 
 #define process_cap_mtfg_position0(mtfg_queue, position_mask) { \
   if ((symbol_data[*(mtfg_queue + cap_queue_position)].type & 2) != 0) { \
-    update_mtfg_queue(); \
-    return; \
+    return(update_mtfg_queue(mtfg_queue_position)); \
   } \
   else \
     mtfg_queue_position++; \
@@ -451,8 +601,7 @@ void get_mtfg_symbol() {
 #define process_cap_mtfg_position(mtfg_queue, position_mask) { \
   if ((symbol_data[*(mtfg_queue + cap_queue_position)].type & 2) != 0) { \
     if (--find_caps == 0) { \
-      update_mtfg_queue(); \
-      return; \
+      return(update_mtfg_queue(mtfg_queue_position)); \
     } \
   } \
   else \
@@ -461,7 +610,8 @@ void get_mtfg_symbol() {
 }
 
 
-void get_mtfg_symbol_cap() {
+uint32_t get_mtfg_symbol_cap() {
+  uint8_t mtfg_queue_position;
   DecodeMtfgQueuePosStart(CAP);
   if (DecodeMtfgQueuePosCheck0(CAP) != 0) {
     mtfg_queue_position = DecodeMtfgQueuePosFinish0(CAP);
@@ -558,12 +708,12 @@ void get_mtfg_symbol_cap() {
       }
     }
   }
-  update_mtfg_queue();
-  return;
+  return(update_mtfg_queue(mtfg_queue_position));
 }
 
 
-uint8_t get_first_char(uint32_t symbol, uint8_t first_char) {
+uint8_t get_first_char(uint32_t symbol) {
+  uint8_t first_char = symbol_strings[symbol_data[symbol].string_index];
   if (first_char < 0xE0) {
     if ((first_char < 0xC9) ||
         ((first_char == 0xC9) && (symbol_strings[symbol_data[symbol].string_index + 1] < 0x90)))
@@ -612,295 +762,224 @@ uint8_t get_first_char(uint32_t symbol, uint8_t first_char) {
 }
 
 
-uint8_t dadd_dictionary_symbol(uint32_t symbol, uint8_t bits) {
-  uint8_t first_char = symbol_strings[symbol_data[symbol].string_index];
-  if ((UTF8_compliant != 0) && (first_char > START_UTF8_2BYTE_SYMBOLS))
-    first_char = get_first_char(symbol, first_char);
-  if (nsob[first_char][bits] == ((uint32_t)1 << sym_list_bits[first_char][bits])) {
-    sym_list_bits[first_char][bits]++;
-    if (0 == (sym_list_ptrs[first_char][bits]
-        = (uint32_t *)realloc(sym_list_ptrs[first_char][bits], sizeof(uint32_t) * (1 << sym_list_bits[first_char][bits])))) {
-      fprintf(stderr,"FATAL ERROR - symbol list realloc failure\n");
-      return(0);
-    }
-  }
-  symbol_data[symbol].dictionary_index = nsob[first_char][bits];
-  sym_list_ptrs[first_char][bits][nsob[first_char][bits]++] = symbol;
-  if ((nsob[first_char][bits] << (32 - bits)) > ((uint32_t)nbob[first_char][bits] << (32 - bin_code_length[first_char]))) {
-    if (bits >= bin_code_length[first_char]) { /* add a bin */
-      if (++sum_nbob[first_char] <= 0x1000) {
-        if (bits == max_code_length)
-          nbob[first_char][bits]++;
-        else {
-          lookup_bits[first_char][fbob[first_char][bits] + nbob[first_char][bits]++] = bits;
-          uint8_t temp_bits = bits;
-          while (++temp_bits != max_code_length) {
-            if (nbob[first_char][temp_bits])
-              lookup_bits[first_char][fbob[first_char][temp_bits] + nbob[first_char][temp_bits]] = temp_bits;
-            fbob[first_char][temp_bits]++;
-          }
-          fbob[first_char][max_code_length]++;
-        }
-      }
-      else {
-        nbob[first_char][bits]++;
-        uint8_t code_length;
-        do {
-          bin_code_length[first_char]--;
-          sum_nbob[first_char] = 0;
-          for (code_length = 1 ; code_length <= max_code_length ; code_length++)
-            sum_nbob[first_char] += (nbob[first_char][code_length] = (nbob[first_char][code_length] + 1) >> 1);
-        } while (sum_nbob[first_char] > 0x1000);
-        uint16_t bin = nbob[first_char][1];
-        uint8_t temp_bits;
-        for (temp_bits = 1 ; temp_bits <= max_code_length ; temp_bits++) {
-          fbob[first_char][temp_bits] = bin;
-          bin += nbob[first_char][temp_bits];
-        }
-        bin = 0;
-        for (code_length = 1 ; code_length < max_code_length ; code_length++)
-          while (bin < fbob[first_char][code_length+1])
-            lookup_bits[first_char][bin++] = code_length;
-        while (bin < 0x1000)
-          lookup_bits[first_char][bin++] = max_code_length;
-      }
-    }
-    else { /* add multiple bins */
-      uint32_t new_bins = 1 << (bin_code_length[first_char] - bits);
-      if (sum_nbob[first_char] + new_bins <= 0x1000) {
-        sum_nbob[first_char] += new_bins;
-        do {
-          lookup_bits[first_char][fbob[first_char][bits] + nbob[first_char][bits]] = bits;
-          nbob[first_char][bits]++;
-          uint8_t temp_bits = bits;
-          while (++temp_bits != max_code_length) {
-            if (nbob[first_char][temp_bits])
-              lookup_bits[first_char][fbob[first_char][temp_bits] + nbob[first_char][temp_bits]] = temp_bits;
-            fbob[first_char][temp_bits]++;
-          }
-        } while ((nsob[first_char][bits] << (bin_code_length[first_char] - bits)) > (uint32_t)nbob[first_char][bits]);
-        fbob[first_char][max_code_length] += 1 << (bin_code_length[first_char] - bits);
-      }
-      else if (new_bins <= 0x1000) {
-        nbob[first_char][bits] += new_bins;
-        uint8_t code_length;
-        do {
-          bin_code_length[first_char]--;
-          sum_nbob[first_char] = 0;
-          for (code_length = 1 ; code_length <= max_code_length ; code_length++)
-            sum_nbob[first_char] += (nbob[first_char][code_length] = (nbob[first_char][code_length] + 1) >> 1);
-        } while (sum_nbob[first_char] > 0x1000);
-        uint16_t bin = nbob[first_char][1];
-        uint8_t temp_bits;
-        for (temp_bits = 2 ; temp_bits <= max_code_length ; temp_bits++) {
-          fbob[first_char][temp_bits] = bin;
-          bin += nbob[first_char][temp_bits];
-        }
-        bin = 0;
-        for (code_length = 1 ; code_length < max_code_length ; code_length++)
-          while (bin < fbob[first_char][code_length+1])
-            lookup_bits[first_char][bin++] = code_length;
-        while (bin < 0x1000)
-          lookup_bits[first_char][bin++] = max_code_length;
-      }
-      else {
-        uint8_t bin_shift = bin_code_length[first_char] - 12 - bits;
-        if (sum_nbob[first_char])
-          bin_shift++;
-        bin_code_length[first_char] -= bin_shift;
-        sum_nbob[first_char] = 0;
-        uint8_t code_length;
-        for (code_length = 1 ; code_length <= max_code_length ; code_length++)
-          sum_nbob[first_char] += (nbob[first_char][code_length]
-              = (nbob[first_char][code_length] + (1 << bin_shift) - 1) >> bin_shift);
-        nbob[first_char][bits] += new_bins >> bin_shift;
-        sum_nbob[first_char] += new_bins >> bin_shift;
-        uint16_t bin = nbob[first_char][1];
-        uint8_t temp_bits;
-        for (temp_bits = 1 ; temp_bits <= max_code_length ; temp_bits++) {
-          fbob[first_char][temp_bits] = bin;
-          bin += nbob[first_char][temp_bits];
-        }
-        bin = 0;
-        for (code_length = 1 ; code_length < max_code_length ; code_length++)
-          while (bin < fbob[first_char][code_length+1])
-            lookup_bits[first_char][bin++] = code_length;
-        while (bin < 0x1000)
-          lookup_bits[first_char][bin++] = max_code_length;
-      }
-    }
-  }
-  return(1);
-}
-
-
-void dremove_dictionary_symbol(uint32_t symbol, uint8_t bits) {
-  uint8_t first_char = symbol_strings[symbol_data[symbol].string_index];
-  if ((UTF8_compliant != 0) && (first_char > START_UTF8_2BYTE_SYMBOLS))
-    first_char = get_first_char(symbol, first_char);
-  uint32_t list_length = --nsob[first_char][bits];
-  uint32_t last_symbol = sym_list_ptrs[first_char][bits][list_length];
-  sym_list_ptrs[first_char][bits][symbol_data[symbol].dictionary_index] = last_symbol;
-  symbol_data[last_symbol].dictionary_index = symbol_data[symbol].dictionary_index;
-  return;
-}
-
-
-uint8_t insert_mtf_queue(uint8_t cap_type) {
-  dremove_dictionary_symbol(symbol_number,CodeLength);
-  if (--symbol_data[symbol_number].remaining) {
-    symbol_count = symbol_data[symbol_number].instances;
-    mtf_queue_number = symbol_count - 2;
+uint8_t insert_mtf_queue(uint32_t symbol_number, uint8_t code_length, uint8_t cap_type) {
+  dremove_dictionary_symbol(symbol_number, code_length);
+  if (symbol_data[symbol_number].remaining_m1 != 0) {
+    symbol_data[symbol_number].remaining_m1--;
+    uint8_t symbol_count = symbol_data[symbol_number].instances;
+    uint8_t mtf_queue_number = symbol_count - 2;
     UpFreqMtfQueueNum(cap_type, mtf_queue_number);
     if (mtf_queue_size[symbol_count] != MTF_QUEUE_SIZE)
-      mtf_queue[symbol_count][((mtf_queue_offset[symbol_count] + mtf_queue_size[symbol_count]++) & 0x3F)] = symbol_number;
+      mtf_queue[symbol_count][((mtf_queue_offset[symbol_count] + mtf_queue_size[symbol_count]++) & 0x3F)]
+          = symbol_number;
     else {
-      mtf_queue_ptr = &mtf_queue[symbol_count][mtf_queue_offset[symbol_count]++ & 0x3F];
-      if (dadd_dictionary_symbol(*mtf_queue_ptr, CodeLength) == 0)
+      uint32_t * mtf_queue_ptr = &mtf_queue[symbol_count][mtf_queue_offset[symbol_count]++ & 0x3F];
+      if (dadd_dictionary_symbol(*mtf_queue_ptr, code_length) == 0)
         return(0);
       *mtf_queue_ptr = symbol_number;
     }
   }
-  else {
-    check_free_symbol();
-  }
+  else
+    push_free_symbol(symbol_number);
   return(1);
 }
 
 
-uint32_t decode_dictionary_symbol(uint8_t Bits, uint16_t FirstBin, uint16_t BinNum, uint8_t CodeLength, uint32_t * SymbolArray) {
-  uint32_t BinCode = DecodeBinCode(Bits);
-  uint32_t SymbolIndex = (1 << (Bits)) * (BinNum - FirstBin) + BinCode;
-  uint32_t symbol_number;
-  if (SymbolIndex >= min_extra_reduce_index) {
-    BinCode &= -2;
-    SymbolIndex = (SymbolIndex + min_extra_reduce_index) >> 1;
-    if (CodeLength <= max_regular_code_length) {
-      uint32_t index = SymbolIndex;
-      uint32_t extra_code_bins = 0;
-      while ((BinCode != 0) && ((symbol_data[SymbolArray[--index]].type & 8) != 0)) {
-        uint8_t bins = (index >= min_extra_reduce_index) ? 2 : 1;
-        extra_code_bins += bins;
-        BinCode -= bins;
-      }
-      IncreaseLow(BinCode);
-      uint32_t * SymbolArrayPtr = &SymbolArray[SymbolIndex];
-      while ((symbol_data[*SymbolArrayPtr].type & 8) != 0) {
-        extra_code_bins += 2;
-        SymbolArrayPtr++;
-      }
-      MultiplyRange(2 + extra_code_bins);
-      symbol_number = *SymbolArrayPtr;
-    }
-    else {
-      IncreaseLow(BinCode);
-      DoubleRange();
-      symbol_number = SymbolArray[SymbolIndex];
-    }
+uint32_t decode_dictionary_symbol(uint8_t bits, uint8_t code_length, uint8_t first_char, uint16_t bin_num,
+    uint32_t * symbol_array, uint32_t shifted_max_symbols) {
+  uint32_t bin_code = DecodeBinCode(bits);
+  uint32_t symbol_index = ((bin_num - bin_data[first_char][code_length].fbob) << bits) + bin_code;
+  uint32_t min_extra_reduce_index = (bin_data[first_char][code_length].nsob << 1) - shifted_max_symbols; \
+  if (symbol_index >= min_extra_reduce_index) {
+    symbol_index = (symbol_index + min_extra_reduce_index) >> 1;
+    if ((bin_code & 1) != 0)
+      DecreaseLow(1);
+    DoubleRange();
+  }
+  return(symbol_array[symbol_index]);
+}
+
+
+#define get_embedded_long_symbol(bin_num, code_length, first_char) { \
+  int8_t index_bits = code_length - bin_code_length[first_char]; \
+  struct bin_data * bin_info = &bin_data[first_char][code_length]; \
+  uint32_t shifted_max_symbols = bin_info->nbob << index_bits; \
+  uint32_t * sym_list = bin_info->sym_list; \
+  if ((shifted_max_symbols >> 1) >= bin_info->nsob) { \
+    uint32_t num_symbols = bin_info->nsob; \
+    uint16_t num_bins = bin_info->nbob; \
+    shifted_max_symbols >>= 1; \
+    index_bits--; \
+    while ((shifted_max_symbols >> 1) >= num_symbols) { \
+      shifted_max_symbols >>= 1; \
+      index_bits--; \
+    } \
+    if (index_bits <= 0) { \
+      if (index_bits == 0) { \
+        uint32_t symbol_index; \
+        uint16_t std_index = bin_num - bin_info->fbob; \
+        uint16_t extra_bins = num_bins - num_symbols; \
+        if (std_index >= 2 * extra_bins) \
+          symbol_index = std_index - extra_bins; \
+        else { \
+          symbol_index = std_index >> 1; \
+          if ((std_index & 1) != 0) \
+            DecreaseLow(1); \
+          DoubleRange(); \
+        } \
+        symbol_number = sym_list[symbol_index]; \
+      } \
+      else { \
+        uint32_t symbol_index; \
+        uint16_t std_index = bin_num - bin_info->fbob; \
+        uint16_t bins_per_symbol = num_bins / num_symbols; \
+        uint16_t extra_bins = num_bins - num_symbols * bins_per_symbol; \
+        uint16_t end_extra_index = extra_bins * (bins_per_symbol + 1); \
+        if (std_index >= end_extra_index) { \
+          uint32_t end_extra_std_index = std_index - end_extra_index; \
+          uint32_t extra_index = end_extra_std_index / bins_per_symbol; \
+          symbol_index = extra_bins + extra_index; \
+          DecreaseLow(end_extra_std_index - extra_index * bins_per_symbol); \
+        } \
+        else { \
+          symbol_index = std_index / (bins_per_symbol + 1); \
+          DecreaseLow(std_index - symbol_index * (bins_per_symbol + 1)); \
+        } \
+        uint16_t bins = bins_per_symbol; \
+        if (symbol_index < extra_bins) \
+          bins++; \
+        MultiplyRange(bins); \
+        symbol_number = sym_list[symbol_index]; \
+      } \
+    } \
+    else \
+      symbol_number = decode_dictionary_symbol(index_bits, code_length, first_char, bin_num, \
+          sym_list, shifted_max_symbols); \
+  } \
+  else \
+    symbol_number = decode_dictionary_symbol(index_bits, code_length, first_char, bin_num, \
+        sym_list, shifted_max_symbols); \
+}
+
+
+#define get_long_symbol(bin_num, code_length, first_char, end_char) { \
+  int8_t index_bits = code_length - bin_code_length[first_char]; \
+  struct bin_data * bin_info = &bin_data[first_char][code_length]; \
+  uint32_t shifted_max_symbols = bin_info->nbob << index_bits; \
+  uint32_t * sym_list = bin_info->sym_list; \
+  if ((shifted_max_symbols >> 1) >= bin_info->nsob) { \
+    uint32_t num_symbols = bin_info->nsob; \
+    uint16_t num_bins = bin_info->nbob; \
+    shifted_max_symbols >>= 1; \
+    index_bits--; \
+    while ((shifted_max_symbols >> 1) >= num_symbols) { \
+      shifted_max_symbols >>= 1; \
+      index_bits--; \
+    } \
+    if (index_bits <= 0) { \
+      if (index_bits == 0) { \
+        uint32_t symbol_index; \
+        uint16_t std_index = bin_num - bin_info->fbob; \
+        uint16_t extra_bins = num_bins - num_symbols; \
+        if (std_index >= 2 * extra_bins) \
+          symbol_index = std_index - extra_bins; \
+        else { \
+          symbol_index = std_index >> 1; \
+          if ((std_index & 1) != 0) \
+            DecreaseLow(1); \
+          DoubleRange(); \
+        } \
+        if ((symbol_index == 0) && (first_char == end_char) && (code_length == max_code_length)) \
+          break; /* EOF */ \
+        symbol_number = sym_list[symbol_index]; \
+      } \
+      else { \
+        uint32_t symbol_index; \
+        uint16_t std_index = bin_num - bin_info->fbob; \
+        uint16_t bins_per_symbol = num_bins / num_symbols; \
+        uint16_t extra_bins = num_bins - num_symbols * bins_per_symbol; \
+        uint16_t end_extra_index = extra_bins * (bins_per_symbol + 1); \
+        if (std_index >= end_extra_index) { \
+          uint32_t end_extra_std_index = std_index - end_extra_index; \
+          uint32_t extra_index = end_extra_std_index / bins_per_symbol; \
+          symbol_index = extra_bins + extra_index; \
+          DecreaseLow(end_extra_std_index - extra_index * bins_per_symbol); \
+        } \
+        else { \
+          symbol_index = std_index / (bins_per_symbol + 1); \
+          DecreaseLow(std_index - symbol_index * (bins_per_symbol + 1)); \
+        } \
+        uint16_t bins = bins_per_symbol; \
+        if (symbol_index < extra_bins) \
+          bins++; \
+        MultiplyRange(bins); \
+        if ((symbol_index == 0) && (first_char == end_char) && (code_length == max_code_length)) \
+          break; /* EOF */ \
+        symbol_number = sym_list[symbol_index]; \
+      } \
+    } \
+    else \
+      symbol_number = decode_dictionary_symbol(index_bits, code_length, first_char, bin_num, \
+          sym_list, shifted_max_symbols); \
+  } \
+  else \
+    symbol_number = decode_dictionary_symbol(index_bits, code_length, first_char, bin_num, \
+        sym_list, shifted_max_symbols); \
+}
+
+
+inline uint32_t get_short_symbol(uint16_t bin_num, uint8_t code_length, uint8_t first_char) {
+  struct bin_data * bin_info = &bin_data[first_char][code_length];
+  uint32_t num_symbols = bin_info->nsob;
+  uint16_t num_bins = bin_info->nbob;
+  uint8_t bin_shift = bin_code_length[first_char] - code_length;
+  if ((num_symbols << bin_shift) == num_bins) {  // the bins are full
+    uint16_t std_index = bin_num - bin_info->fbob;
+    uint32_t symbol_index = std_index >> bin_shift;
+    DecreaseLow(std_index - (symbol_index << bin_shift));
+    MultiplyRange(1 << bin_shift);
+    return(bin_info->sym_list[symbol_index]);
   }
   else {
-    if (CodeLength <= max_regular_code_length) {
-      uint32_t * SymbolArrayPtr = &SymbolArray[SymbolIndex];
-      uint32_t OrigBinCode = BinCode;
-      while ((BinCode != 0) && ((symbol_data[*(--SymbolArrayPtr)].type & 8) != 0))
-        BinCode--;
-      uint32_t extra_code_bins = OrigBinCode - BinCode;
-      IncreaseLow(BinCode);
-      while ((symbol_data[SymbolArray[SymbolIndex]].type & 8) != 0)
-        extra_code_bins += (++SymbolIndex >= min_extra_reduce_index) ? 2 : 1;
-      MultiplyRange(1 + extra_code_bins);
-      symbol_number = SymbolArray[SymbolIndex];
+    uint16_t std_index = bin_num - bin_info->fbob;
+    if (num_bins < 2 * num_symbols) {
+      uint16_t extra_bins = num_bins - num_symbols;
+      if (std_index >= 2 * extra_bins)
+        return(bin_info->sym_list[std_index - extra_bins]);
+      if ((std_index & 1) != 0)
+        DecreaseLow(1);
+      DoubleRange();
+      return(bin_info->sym_list[std_index >> 1]);
     }
     else {
-      IncreaseLow(BinCode);
-      symbol_number = SymbolArray[SymbolIndex];
+      uint32_t symbol_index;
+      uint16_t bins_per_symbol = num_bins / num_symbols;
+      uint16_t extra_bins = num_bins - num_symbols * bins_per_symbol;
+      uint16_t end_extra_index = extra_bins * (bins_per_symbol + 1);
+      if (std_index >= end_extra_index) {
+        uint32_t end_extra_std_index = std_index - end_extra_index;
+        uint32_t extra_index = end_extra_std_index / bins_per_symbol;
+        symbol_index = extra_bins + extra_index;
+        DecreaseLow(end_extra_std_index - extra_index * bins_per_symbol);
+      }
+      else {
+        symbol_index = std_index / (bins_per_symbol + 1);
+        DecreaseLow(std_index - symbol_index * (bins_per_symbol + 1));
+      }
+      if (symbol_index < extra_bins)
+        bins_per_symbol++;
+      MultiplyRange(bins_per_symbol);
+      return(bin_info->sym_list[symbol_index]);
     }
   }
-  return(symbol_number);
 }
 
 
-#define get_long_symbol() { \
-  uint8_t index_bits = CodeLength - bin_code_length[FirstChar]; \
-  uint32_t msib = nbob[FirstChar][CodeLength] << index_bits; \
-  uint32_t shifted_max_symbols = msib >> 1; \
-  uint32_t * sym_list_ptr = sym_list_ptrs[FirstChar][CodeLength]; \
-  if (shifted_max_symbols >= nsob[FirstChar][CodeLength]) { \
-    uint8_t reduce_bits = 1; \
-    while ((shifted_max_symbols >>= 1) >= nsob[FirstChar][CodeLength]) \
-      reduce_bits++; \
-    if (index_bits <= reduce_bits) { \
-      uint32_t SymbolIndex = BinNum - fbob[FirstChar][CodeLength]; \
-      uint32_t extra_code_bins = 0; \
-      if (SymbolIndex) { \
-        int32_t index = SymbolIndex; \
-        if ((symbol_data[sym_list_ptr[--index]].type & 8) != 0) { \
-          extra_code_bins++; \
-          while ((index != 0) && ((symbol_data[sym_list_ptr[--index]].type & 8) != 0)) \
-            extra_code_bins++; \
-        } \
-        DecreaseLow(extra_code_bins); \
-        while ((symbol_data[sym_list_ptr[SymbolIndex]].type & 8) != 0) { \
-          extra_code_bins++; \
-          SymbolIndex++; \
-        } \
-        MultiplyRange(1 + extra_code_bins); \
-        symbol_number = sym_list_ptr[SymbolIndex]; \
-      } \
-      else if ((FirstChar == end_symbol) && (CodeLength == max_code_length)) \
-        break; /* EOF */ \
-      else { \
-        if ((symbol_data[sym_list_ptr[SymbolIndex]].type & 8) != 0) { \
-          while ((symbol_data[sym_list_ptr[++SymbolIndex]].type & 8) != 0) \
-            extra_code_bins++; \
-          MultiplyRange(2 + extra_code_bins); \
-        } \
-        symbol_number = sym_list_ptr[SymbolIndex]; \
-      } \
-    } \
-    else { \
-      index_bits -= reduce_bits; \
-      min_extra_reduce_index = (nsob[FirstChar][CodeLength] << 1) - (msib >> reduce_bits); \
-      symbol_number = decode_dictionary_symbol(index_bits, fbob[FirstChar][CodeLength], BinNum, CodeLength, sym_list_ptr); \
-    } \
-  } \
-  else { \
-    min_extra_reduce_index = (nsob[FirstChar][CodeLength] << 1) - msib; \
-    symbol_number = decode_dictionary_symbol(index_bits, fbob[FirstChar][CodeLength], BinNum, CodeLength, sym_list_ptr); \
-  } \
-}
-
-
-void get_short_symbol() {
-  uint32_t extra_code_bins = 0;
-  uint32_t index = (BinNum - fbob[FirstChar][CodeLength]) >> (bin_code_length[FirstChar] - CodeLength);
-  uint32_t temp_index = index;
-  if ((temp_index != 0) && ((symbol_data[sym_list_ptrs[FirstChar][CodeLength][--temp_index]].type & 8) != 0)) {
-    extra_code_bins++;
-    while ((temp_index != 0) && ((symbol_data[sym_list_ptrs[FirstChar][CodeLength][--temp_index]].type & 8) != 0))
-      extra_code_bins++;
-    DecreaseLow(extra_code_bins);
-    while ((symbol_data[sym_list_ptrs[FirstChar][CodeLength][index]].type & 8) != 0) {
-      index++;
-      extra_code_bins++;
-    }
-    MultiplyRange(1 + extra_code_bins);
-  }
-  else if ((symbol_data[sym_list_ptrs[FirstChar][CodeLength][index]].type & 8) != 0) {
-    extra_code_bins++;
-    while ((symbol_data[sym_list_ptrs[FirstChar][CodeLength][++index]].type & 8) != 0)
-      extra_code_bins++;
-    MultiplyRange(1 + extra_code_bins);
-  }
-  symbol_number = sym_list_ptrs[FirstChar][CodeLength][index];
-  return;
-}
-
-
-void get_mtf_symbol() {
+uint32_t get_mtf_symbol() {
+  uint32_t symbol_number;
   DecodeMtfQueueNumStart(NOT_CAP);
   if (DecodeMtfQueueNumCheck0(NOT_CAP) != 0) {
-    DecodeMtfQueueNumFinish0(NOT_CAP);
+    DecodeMtfQueueNumFinish0();
     DecodeMtfQueuePosStart(NOT_CAP, 0, mtf_queue_size);
     if (DecodeMtfQueuePosCheck0(NOT_CAP, 0) != 0) {
       DecodeMtfQueuePosFinish0(NOT_CAP, 0);
@@ -910,15 +989,16 @@ void get_mtf_symbol() {
       uint8_t position = DecodeMtfQueuePosFinish(NOT_CAP, 0);
       uint8_t mtf_queue_last_position = (mtf_queue_offset[2] + --mtf_queue_size[2]) & 0x3F;
       uint8_t mtf_queue_position = (mtf_queue_last_position - position) & 0x3F;
-      symbol_number = *((mtf_queue_ptr = &mtf_queue[2][0]) + mtf_queue_position);
+      uint32_t * mtf_queue_ptr = &mtf_queue[2][0];
+      symbol_number = *(mtf_queue_ptr + mtf_queue_position);
       do { // move the newer symbols up
         *(mtf_queue_ptr + mtf_queue_position) = *(mtf_queue_ptr + ((mtf_queue_position + 1) & 0x3F));
       } while ((mtf_queue_position = (mtf_queue_position + 1) & 0x3F) != mtf_queue_last_position);
     }
-    check_free_symbol();
+    push_free_symbol(symbol_number);
   }
   else {
-    mtf_queue_number = DecodeMtfQueueNumFinish(NOT_CAP);
+    uint8_t mtf_queue_number = DecodeMtfQueueNumFinish(NOT_CAP);
     DecodeMtfQueuePosStart(NOT_CAP, mtf_queue_number, mtf_queue_size);
     if (DecodeMtfQueuePosCheck0(NOT_CAP, mtf_queue_number) != 0) {
       DecodeMtfQueuePosFinish0(NOT_CAP, mtf_queue_number);
@@ -926,13 +1006,14 @@ void get_mtf_symbol() {
       symbol_number
           = mtf_queue[mtf_queue_number][(mtf_queue_offset[mtf_queue_number] + mtf_queue_size[mtf_queue_number] - 1) & 0x3F];
       // decrement the mtf queue size if this is the last instance of this symbol
-      if (--symbol_data[symbol_number].remaining) {
+      if (symbol_data[symbol_number].remaining_m1 != 0) {
+        symbol_data[symbol_number].remaining_m1--;
         mtf_queue_number -= 2;
         UpFreqMtfQueueNum(NOT_CAP, mtf_queue_number);
       }
       else {
         mtf_queue_size[mtf_queue_number]--;
-        check_free_symbol();
+        push_free_symbol(symbol_number);
       }
     }
     else {
@@ -941,34 +1022,38 @@ void get_mtf_symbol() {
       uint8_t mtf_queue_last_position = (mtf_queue_offset[mtf_queue_number] + mtf_queue_size[mtf_queue_number] - 1) & 0x3F;
       uint8_t mtf_queue_position = (mtf_queue_last_position - position) & 0x3F;
       // remove this symbol from its current mtf queue position
-      symbol_number = *((mtf_queue_ptr = &mtf_queue[mtf_queue_number][0]) + mtf_queue_position);
+      uint32_t * mtf_queue_ptr = &mtf_queue[mtf_queue_number][0];
+      symbol_number = *(mtf_queue_ptr + mtf_queue_position);
       do { // move the newer symbols up
         *(mtf_queue_ptr + mtf_queue_position) = *(mtf_queue_ptr + ((mtf_queue_position + 1) & 0x3F));
         mtf_queue_position = (mtf_queue_position + 1) & 0x3F;
       } while (mtf_queue_position != mtf_queue_last_position);
-      if (--symbol_data[symbol_number].remaining) { // put symbol on top of mtf queue
+      if (symbol_data[symbol_number].remaining_m1 != 0) { // put symbol on top of mtf queue
+        symbol_data[symbol_number].remaining_m1--;
         *(mtf_queue_ptr + mtf_queue_position) = symbol_number;
         mtf_queue_number -= 2;
         UpFreqMtfQueueNum(NOT_CAP, mtf_queue_number);
       }
       else { // last instance - decrement the mtf queue size
         mtf_queue_size[mtf_queue_number]--;
-        check_free_symbol();
+        push_free_symbol(symbol_number);
       }
     }
   }
-  return;
+  return(symbol_number);
 }
 
 
-void get_mtf_symbol_cap() {
+uint32_t get_mtf_symbol_cap() {
+  uint32_t symbol_number, *mtf_queue_ptr;
   DecodeMtfQueueNumStart(CAP);
   if (DecodeMtfQueueNumCheck0(CAP) != 0) {
-    DecodeMtfQueueNumFinish0(CAP);
+    DecodeMtfQueueNumFinish0();
     DecodeMtfQueuePosStart(CAP, 0, mtf_queue_size);
     if (DecodeMtfQueuePosCheck0(CAP, 0) != 0) {
       DecodeMtfQueuePosFinish0(CAP, 0);
-      mtf_queue_ptr = mtf_queue_top_ptr = &mtf_queue[2][(mtf_queue_offset[2] + --mtf_queue_size[2]) & 0x3F];
+      uint32_t * mtf_queue_top_ptr = &mtf_queue[2][(mtf_queue_offset[2] + --mtf_queue_size[2]) & 0x3F];
+      mtf_queue_ptr = mtf_queue_top_ptr;
       while ((symbol_data[*mtf_queue_ptr].type & 2) == 0) {
         if (mtf_queue_ptr-- == &mtf_queue[2][0])
           mtf_queue_ptr += MTF_QUEUE_SIZE;
@@ -988,7 +1073,8 @@ void get_mtf_symbol_cap() {
     else {
       uint8_t position = DecodeMtfQueuePosFinish(CAP, 0);
       uint8_t num_az = position + 1;
-      mtf_queue_ptr = (mtf_queue_top_ptr = &mtf_queue[2][(mtf_queue_offset[2] + --mtf_queue_size[2]) & 0x3F]) + 1;
+      uint32_t * mtf_queue_top_ptr = &mtf_queue[2][(mtf_queue_offset[2] + --mtf_queue_size[2]) & 0x3F];
+      mtf_queue_ptr = mtf_queue_top_ptr + 1;
       // remove this symbol from its current mtf queue position
       do {
         if (mtf_queue_ptr != &mtf_queue[2][0])
@@ -1010,16 +1096,17 @@ void get_mtf_symbol_cap() {
         }
       } while (mtf_queue_ptr != mtf_queue_top_ptr);
     }
-    check_free_symbol();
+    push_free_symbol(symbol_number);
   }
   else {
-    mtf_queue_number = DecodeMtfQueueNumFinish(CAP);
+    uint8_t mtf_queue_number = DecodeMtfQueueNumFinish(CAP);
     DecodeMtfQueuePosStart(CAP, mtf_queue_number, mtf_queue_size);
     if (DecodeMtfQueuePosCheck0(CAP, mtf_queue_number) != 0) {
       DecodeMtfQueuePosFinish0(CAP, mtf_queue_number);
       mtf_queue_number += 2;
-      mtf_queue_ptr = mtf_queue_top_ptr = &mtf_queue[mtf_queue_number]
+      uint32_t * mtf_queue_top_ptr = &mtf_queue[mtf_queue_number]
           [(mtf_queue_offset[mtf_queue_number] + mtf_queue_size[mtf_queue_number] - 1) & 0x3F];
+      mtf_queue_ptr = mtf_queue_top_ptr;
       while ((symbol_data[*mtf_queue_ptr].type & 2) == 0) {
         if (mtf_queue_ptr-- == &mtf_queue[mtf_queue_number][0])
           mtf_queue_ptr += MTF_QUEUE_SIZE;
@@ -1039,8 +1126,9 @@ void get_mtf_symbol_cap() {
     else {
       uint8_t position = DecodeMtfQueuePosFinish(CAP, mtf_queue_number);
       mtf_queue_number += 2;
-      mtf_queue_ptr = (mtf_queue_top_ptr = &mtf_queue[mtf_queue_number]
-          [(mtf_queue_offset[mtf_queue_number] + mtf_queue_size[mtf_queue_number] - 1) & 0x3F]) + 1;
+      uint32_t * mtf_queue_top_ptr = &mtf_queue[mtf_queue_number]
+          [(mtf_queue_offset[mtf_queue_number] + mtf_queue_size[mtf_queue_number] - 1) & 0x3F];
+      mtf_queue_ptr = mtf_queue_top_ptr + 1;
       // remove this symbol from its current mtf queue position
       uint8_t num_az = position + 1;
       do {
@@ -1064,17 +1152,18 @@ void get_mtf_symbol_cap() {
         }
       } while (mtf_queue_ptr != mtf_queue_top_ptr);
     }
-    if (--symbol_data[symbol_number].remaining) { // put symbol on top of mtf queue
+    if (symbol_data[symbol_number].remaining_m1 != 0) { // put symbol on top of mtf queue
+      symbol_data[symbol_number].remaining_m1--;
       *mtf_queue_ptr = symbol_number;
       mtf_queue_number -= 2;
       UpFreqMtfQueueNum(CAP, mtf_queue_number);
     }
     else { // last instance - decrement the mtf queue size
       mtf_queue_size[mtf_queue_number]--;
-      check_free_symbol();
+      push_free_symbol(symbol_number);
     }
   }
-  return;
+  return(symbol_number);
 }
 
 
@@ -1104,7 +1193,7 @@ uint32_t get_extra_length() {
 }
 
 
-void check_free_strings(uint32_t define_string_index, uint32_t string_length) {
+void check_free_strings(uint32_t symbol_number, uint32_t define_string_index, uint32_t string_length) {
   if (no_embed && free_string_list_length) {
     uint8_t free_string_list_index = free_string_list_length - 1;
     do {
@@ -1151,15 +1240,10 @@ void check_free_strings(uint32_t define_string_index, uint32_t string_length) {
 
 void create_EOF_symbol() {
   find_first_symbol = 0;
-  end_symbol = prior_end;
-  sym_list_ptrs[end_symbol][max_code_length][0] = max_symbols_defined - 1;
-  nsob[end_symbol][max_code_length] = 1;
-  if (max_code_length >= 12) {
-    bin_code_length[end_symbol] = max_code_length;
-    sum_nbob[end_symbol] = nbob[end_symbol][max_code_length] = 1;
-  }
-  else
-    sum_nbob[end_symbol] = nbob[end_symbol][max_code_length] = 1 << (12 - max_code_length);
+  end_char = prior_end;
+  bin_data[end_char][max_code_length].sym_list[0] = max_symbols_defined - 1;
+  bin_data[end_char][max_code_length].nsob = 1;
+  sum_nbob[end_char] = bin_data[end_char][max_code_length].nbob = 1;
   return;
 }
 
@@ -1292,7 +1376,7 @@ uint8_t increase_dictionary_size() {
 }
 
 
-uint8_t create_extended_UTF8_symbol(uint32_t * end_define_string_index_ptr) {
+uint8_t create_extended_UTF8_symbol(uint32_t base_symbol, uint32_t * end_define_string_index_ptr) {
   if (base_symbol < START_UTF8_3BYTE_SYMBOLS) {
     symbol_strings[(*end_define_string_index_ptr)++] = (uint8_t)(base_symbol >> 6) + 0xC0;
     symbol_strings[(*end_define_string_index_ptr)++] = (uint8_t)(base_symbol & 0x3F) + 0x80;
@@ -1346,41 +1430,43 @@ uint8_t create_extended_UTF8_symbol(uint32_t * end_define_string_index_ptr) {
 }
 
 
-uint32_t decode_define(uint32_t define_string_index) {
-  uint8_t define_symbol_instances, new_symbol_code_length;
-  uint32_t symbols_in_definition, end_define_string_index;
+uint8_t decode_define(uint32_t * symbol_number_ptr, uint32_t * define_string_index_ptr) {
+  uint8_t new_symbol_code_length, SID_symbol, instances;
+  uint32_t symbols_in_definition;
+  uint32_t symbol_number = *symbol_number_ptr;
+  uint32_t define_string_index = *define_string_index_ptr;
+  uint32_t end_define_string_index = define_string_index;
 
-  end_define_string_index = define_string_index;
   DecodeSIDStart(NOT_CAP);
   if (DecodeSIDCheck0(NOT_CAP) != 0) {
-    SIDSymbol = DecodeSIDFinish0(NOT_CAP);
-    DecodeINSTStart(NOT_CAP, SIDSymbol);
-    if (DecodeINSTCheck0(NOT_CAP, SIDSymbol) != 0) {
-      DecodeINSTFinish0(NOT_CAP, SIDSymbol);
-      define_symbol_instances = 2;
+    SID_symbol = DecodeSIDFinish0(NOT_CAP);
+    DecodeINSTStart(NOT_CAP, SID_symbol);
+    if (DecodeINSTCheck0(NOT_CAP, SID_symbol) != 0) {
+      DecodeINSTFinish0(NOT_CAP, SID_symbol);
+      instances = 2;
       new_symbol_code_length = max_code_length;
     }
     else {
-      Instances = DecodeINSTFinish(NOT_CAP, SIDSymbol);
-      if (Instances >= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        define_symbol_instances = 0;
-        new_symbol_code_length = max_regular_code_length + MAX_INSTANCES_FOR_MTF_QUEUE - Instances;
+      instances = DecodeINSTFinish(NOT_CAP, SID_symbol);
+      if (instances >= MAX_INSTANCES_FOR_MTF_QUEUE) {
+        new_symbol_code_length = max_regular_code_length + MAX_INSTANCES_FOR_MTF_QUEUE - instances;
+        instances = 0;
       }
-      else if (Instances != MAX_INSTANCES_FOR_MTF_QUEUE - 1) {
-        define_symbol_instances = Instances + 2;
-        new_symbol_code_length = mtf_queue_miss_code_length[define_symbol_instances];
+      else if (instances != MAX_INSTANCES_FOR_MTF_QUEUE - 1) {
+        instances += 2;
+        new_symbol_code_length = mtf_queue_miss_code_length[instances];
       }
       else {
-        define_symbol_instances = 1;
+        instances = 1;
         new_symbol_code_length = 0x20;
       }
     }
 
-    base_symbol = DecodeBaseSymbol(base_bits, num_base_symbols);
+    uint32_t base_symbol = DecodeBaseSymbol(num_base_symbols, 0);
     if ((end_define_string_index + 4 >= dictionary_size) && (increase_dictionary_size() == 0))
       return(0);
     if ((UTF8_compliant == 0) || (base_symbol < START_UTF8_2BYTE_SYMBOLS)) {
-      if (symbol_lengths[base_symbol]) {
+      if (symbol_lengths[base_symbol] != 0) {
         if (base_symbol & 1) {
           base_symbol -= 1;
           DoubleRangeDown();
@@ -1391,18 +1477,19 @@ uint32_t decode_define(uint32_t define_string_index) {
         }
       }
       else if (base_symbol & 1) {
-        if (symbol_lengths[base_symbol - 1]) {
+        if (symbol_lengths[base_symbol - 1] != 0)
           DoubleRangeDown();
-        }
       }
       else if (symbol_lengths[base_symbol + 1])
         DoubleRange();
     }
 
     symbol_number = (free_symbol_list_length == 0) ? num_symbols_defined : free_symbol_list[--free_symbol_list_length];
+    symbol_data[symbol_number].string_index = define_string_index;
     if (UTF8_compliant != 0) {
       if (base_symbol < START_UTF8_2BYTE_SYMBOLS) {
-        symbol_strings[end_define_string_index++] = symbol_data[symbol_number].ends = prior_end = (uint8_t)base_symbol;
+        symbol_strings[end_define_string_index++]
+            = symbol_data[symbol_number].starts = symbol_data[symbol_number].ends = prior_end = (uint8_t)base_symbol;
         symbol_lengths[prior_end] = new_symbol_code_length;
         uint8_t j1 = 0x90;
         do {
@@ -1416,7 +1503,12 @@ uint32_t decode_define(uint32_t define_string_index) {
         } while (j1-- != 0);
       }
       else {
-        prior_end = create_extended_UTF8_symbol(&end_define_string_index);
+        uint8_t * temp_char_ptr = &symbol_strings[end_define_string_index];
+        prior_end = create_extended_UTF8_symbol(base_symbol, &end_define_string_index);
+        if (UTF8_compliant == 0)
+          symbol_data[symbol_number].starts = *temp_char_ptr;
+        else
+          symbol_data[symbol_number].starts = get_first_char(symbol_number);
         symbol_data[symbol_number].ends = prior_end;
         if (symbol_lengths[prior_end] == 0) {
           symbol_lengths[prior_end] = new_symbol_code_length;
@@ -1435,7 +1527,8 @@ uint32_t decode_define(uint32_t define_string_index) {
       }
     }
     else {
-      symbol_strings[end_define_string_index++] = symbol_data[symbol_number].ends = prior_end = (uint8_t)base_symbol;
+      symbol_strings[end_define_string_index++]
+          = symbol_data[symbol_number].starts = symbol_data[symbol_number].ends = prior_end = (uint8_t)base_symbol;
       symbol_lengths[prior_end] = new_symbol_code_length;
       uint8_t j1 = 0xFF;
       do {
@@ -1444,68 +1537,75 @@ uint32_t decode_define(uint32_t define_string_index) {
       InitTrailingCharBinary(prior_end, symbol_lengths);
     }
 
-    if (find_first_symbol)
+    if (find_first_symbol != 0)
       create_EOF_symbol();
-    if (define_symbol_instances == 1) {
-      symbol_data[symbol_number].string_index = define_string_index;
+    if (instances == 1) {
       symbol_data[symbol_number].string_length = end_define_string_index - define_string_index;
       symbol_data[symbol_number].type = 0;
       if (symbol_number == num_symbols_defined)
         num_symbols_defined++;
       symbol_data[num_symbols_defined].string_index = end_define_string_index;
-      return(end_define_string_index);
+      *define_string_index_ptr = end_define_string_index;
+      *symbol_number_ptr = symbol_number;
+      return(1);
     }
   }
   else {
-    SIDSymbol = DecodeSIDFinish(NOT_CAP);
-    symbols_in_definition = SIDSymbol + 1;
-    if (symbols_in_definition == 16) {
+    SID_symbol = DecodeSIDFinish(NOT_CAP);
+    symbols_in_definition = SID_symbol + 1;
+    if (symbols_in_definition == 16)
       symbols_in_definition = get_extra_length();
-    }
-    DecodeINSTStart(NOT_CAP, SIDSymbol);
-    if (DecodeINSTCheck0(NOT_CAP, SIDSymbol) != 0) {
-      DecodeINSTFinish0(NOT_CAP, SIDSymbol);
-      define_symbol_instances = 2;
+    DecodeINSTStart(NOT_CAP, SID_symbol);
+    if (DecodeINSTCheck0(NOT_CAP, SID_symbol) != 0) {
+      DecodeINSTFinish0(NOT_CAP, SID_symbol);
+      instances = 2;
       new_symbol_code_length = max_code_length;
     }
     else {
-      Instances = DecodeINSTFinish(NOT_CAP, SIDSymbol);
-      if (Instances >= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        define_symbol_instances = 0;
-        new_symbol_code_length = max_regular_code_length + MAX_INSTANCES_FOR_MTF_QUEUE - Instances;
+      instances = DecodeINSTFinish(NOT_CAP, SID_symbol);
+      if (instances >= MAX_INSTANCES_FOR_MTF_QUEUE) {
+        new_symbol_code_length = max_regular_code_length + MAX_INSTANCES_FOR_MTF_QUEUE - instances;
+        instances = 0;
       }
       else {
-        define_symbol_instances = Instances + 2;
-        new_symbol_code_length = mtf_queue_miss_code_length[define_symbol_instances];
+        instances += 2;
+        new_symbol_code_length = mtf_queue_miss_code_length[instances];
       }
     }
 
     do { // Build the symbol string from the next symbols_in_definition symbols
-      DecodeSymTypeStart(LEVEL1);
+      DecodeSymTypeStart();
       if (DecodeSymTypeCheckDict(LEVEL1) != 0) {
         DecodeSymTypeFinishDict(LEVEL1);
+        uint8_t first_char;
         if (UTF8_compliant != 0)
-          FirstChar = DecodeFirstChar(0, prior_end);
+          first_char = DecodeFirstChar(0, prior_end);
         else
-          FirstChar = DecodeFirstCharBinary(prior_end);
-        BinNum = DecodeDictionaryBin(FirstChar, lookup_bits[FirstChar], &CodeLength, sum_nbob[FirstChar], bin_code_length[FirstChar]);
-        if (CodeLength > bin_code_length[FirstChar]) {
-          get_long_symbol();
+          first_char = DecodeFirstCharBinary(prior_end);
+        uint8_t code_length;
+        uint16_t bin_num = DecodeDictionaryBin(lookup_bits[first_char], &code_length, sum_nbob[first_char],
+            bin_code_length[first_char]);
+        if (code_length > bin_code_length[first_char]) {
+          get_embedded_long_symbol(bin_num, code_length, first_char);
         }
         else
-          get_short_symbol();
+          symbol_number = get_short_symbol(bin_num, code_length, first_char);
         if (symbol_data[symbol_number].instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-          if (use_mtf) {
-            if (insert_mtf_queue(NOT_CAP) == 0)
+          if (use_mtf != 0) {
+            if (insert_mtf_queue(symbol_number, code_length, NOT_CAP) == 0)
               return(0);
           }
-          else if (--symbol_data[symbol_number].remaining == 0) {
-            dremove_dictionary_symbol(symbol_number,CodeLength);
-            check_free_symbol();
+          else if (symbol_data[symbol_number].remaining_m1 == 0) {
+            dremove_dictionary_symbol(symbol_number, code_length);
+            push_free_symbol(symbol_number);
           }
+          else
+            symbol_data[symbol_number].remaining_m1--;
         }
-        else if ((symbol_data[symbol_number].type & 4) != 0)
+        else if ((symbol_data[symbol_number].type & 4) != 0) {
+          dremove_dictionary_symbol(symbol_number,symbol_data[symbol_number].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
           add_new_symbol_to_mtfg_queue(symbol_number);
+        }
         prior_end = symbol_data[symbol_number].ends;
         uint32_t string_length = symbol_data[symbol_number].string_length;
         if ((end_define_string_index + string_length >= dictionary_size) && (increase_dictionary_size() == 0))
@@ -1517,17 +1617,17 @@ uint32_t decode_define(uint32_t define_string_index) {
       else if (DecodeSymTypeCheckNew(LEVEL1) != 0) {
         DecodeSymTypeFinishNew(LEVEL1);
         no_embed = 0;
-        if ((end_define_string_index = decode_define(end_define_string_index)) == 0)
+        if (decode_define(&symbol_number, &end_define_string_index) == 0)
           return(0);
       }
       else {
         if (DecodeSymTypeCheckMtfg(LEVEL1) != 0) {
           DecodeSymTypeFinishMtfg(LEVEL1);
-          get_mtfg_symbol();
+          symbol_number = get_mtfg_symbol();
         }
         else {
           DecodeSymTypeFinishMtf(LEVEL1);
-          get_mtf_symbol();
+          symbol_number = get_mtf_symbol();
         }
         prior_end = symbol_data[symbol_number].ends;
         uint32_t string_length = symbol_data[symbol_number].string_length;
@@ -1539,89 +1639,95 @@ uint32_t decode_define(uint32_t define_string_index) {
       }
     } while (--symbols_in_definition);
     symbol_number = (free_symbol_list_length == 0) ? num_symbols_defined : free_symbol_list[--free_symbol_list_length];
+    symbol_data[symbol_number].string_index = define_string_index;
+    if ((UTF8_compliant == 0) || (symbol_strings[*define_string_index_ptr] < 0x80))
+      symbol_data[symbol_number].starts = symbol_strings[*define_string_index_ptr];
+    else
+      symbol_data[symbol_number].starts = get_first_char(symbol_number);
     symbol_data[symbol_number].ends = prior_end;
   }
   uint32_t string_length = end_define_string_index - define_string_index;
   symbol_data[symbol_number].string_length = string_length;
   symbol_data[symbol_number].type = no_embed;
-  symbol_data[symbol_number].string_index = define_string_index;
 
-  if (define_symbol_instances) { // mtf queue symbol
-    symbol_data[symbol_number].instances = define_symbol_instances;
-    symbol_data[symbol_number].remaining = define_symbol_instances - 1;
-    if (use_mtf) {
-      mtf_queue_number = define_symbol_instances - 2;
-      UpFreqMtfQueueNum(NOT_CAP, mtf_queue_number);
+  if (instances != 0) { // mtf queue symbol
+    symbol_data[symbol_number].instances = instances;
+    symbol_data[symbol_number].remaining_m1 = instances - 2;
+    if (use_mtf != 0) {
+      UpFreqMtfQueueNum(NOT_CAP, instances - 2);
       // put the new symbol in the mtf queue
-      if (mtf_queue_size[define_symbol_instances] != MTF_QUEUE_SIZE)
-        mtf_queue[define_symbol_instances]
-              [(mtf_queue_size[define_symbol_instances]++ + mtf_queue_offset[define_symbol_instances]) & 0x3F]
-            = symbol_number;
+      if (mtf_queue_size[instances] != MTF_QUEUE_SIZE)
+        mtf_queue[instances][(mtf_queue_size[instances]++ + mtf_queue_offset[instances]) & 0x3F] = symbol_number;
       else {
-        uint32_t temp_symbol_number
-            = *(mtf_queue_ptr = &mtf_queue[define_symbol_instances][mtf_queue_offset[define_symbol_instances]++ & 0x3F]);
+        uint32_t * mtf_queue_ptr = &mtf_queue[instances][mtf_queue_offset[instances]++ & 0x3F];
+        uint32_t temp_symbol_number = *mtf_queue_ptr;
+        *mtf_queue_ptr = symbol_number;
         if (dadd_dictionary_symbol(temp_symbol_number, new_symbol_code_length) == 0)
           return(0);
-        *mtf_queue_ptr = symbol_number;
       }
     }
     else if (dadd_dictionary_symbol(symbol_number, new_symbol_code_length) == 0)
       return(0);
   }
   else {
-    if ((new_symbol_code_length > 10) && use_mtfg) {
+    symbol_data[symbol_number].instances = MAX_INSTANCES_FOR_MTF_QUEUE + new_symbol_code_length;
+    if ((new_symbol_code_length > 10) && (use_mtfg != 0)) {
       uint8_t nonergodic = DecodeERG(0);
-      if (nonergodic) {
+      if (nonergodic != 0) {
         symbol_data[symbol_number].type = 4;
         add_new_symbol_to_mtfg_queue(symbol_number);
       }
+      else if (dadd_dictionary_symbol(symbol_number, new_symbol_code_length) == 0)
+        return(0);
     }
-    symbol_data[symbol_number].instances = MAX_INSTANCES_FOR_MTF_QUEUE + new_symbol_code_length;
-    if (dadd_dictionary_symbol(symbol_number, new_symbol_code_length) == 0)
+    else if (dadd_dictionary_symbol(symbol_number, new_symbol_code_length) == 0)
       return(0);
   }
   if (symbol_number == num_symbols_defined)
     num_symbols_defined++;
   symbol_data[num_symbols_defined].string_index = end_define_string_index;
-  check_free_strings(define_string_index, string_length);
-  return(end_define_string_index);
+  check_free_strings(symbol_number, define_string_index, string_length);
+  *define_string_index_ptr = end_define_string_index;
+  *symbol_number_ptr = symbol_number;
+  return(1);
 }
 
 
-uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
-  uint32_t symbols_in_definition, end_define_string_index;
-  uint8_t define_symbol_instances, new_symbol_code_length, char_before_define_is_cap;
+uint8_t decode_define_cap_encoded(uint32_t * symbol_number_ptr, uint32_t * define_string_index_ptr) {
+  uint8_t new_symbol_code_length, SID_symbol, instances;
+  uint8_t char_before_define_is_cap = prior_is_cap;
   uint8_t tag_type = 0;
-
-  char_before_define_is_cap = prior_is_cap;
-  end_define_string_index = define_string_index;
+  uint32_t symbols_in_definition;
+  uint32_t symbol_number = *symbol_number_ptr;
+  uint32_t define_string_index = *define_string_index_ptr;
+  uint32_t end_define_string_index = define_string_index;
 
   DecodeSIDStart(prior_is_cap);
   if (DecodeSIDCheck0(prior_is_cap) != 0) {
-    SIDSymbol = DecodeSIDFinish0(prior_is_cap);
-    DecodeINSTStart(prior_is_cap, SIDSymbol);
-    if (DecodeINSTCheck0(prior_is_cap, SIDSymbol) != 0) {
-      DecodeINSTFinish0(prior_is_cap, SIDSymbol);
-      define_symbol_instances = 2;
+    SID_symbol = DecodeSIDFinish0(prior_is_cap);
+    DecodeINSTStart(prior_is_cap, SID_symbol);
+    if (DecodeINSTCheck0(prior_is_cap, SID_symbol) != 0) {
+      DecodeINSTFinish0(prior_is_cap, SID_symbol);
+      instances = 2;
       new_symbol_code_length = max_code_length;
     }
     else {
-      Instances = DecodeINSTFinish(prior_is_cap, SIDSymbol);
-      if (Instances >= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        define_symbol_instances = 0;
-        new_symbol_code_length = max_regular_code_length + MAX_INSTANCES_FOR_MTF_QUEUE - Instances;
+      instances = DecodeINSTFinish(prior_is_cap, SID_symbol);
+      if (instances >= MAX_INSTANCES_FOR_MTF_QUEUE) {
+        new_symbol_code_length = max_regular_code_length + MAX_INSTANCES_FOR_MTF_QUEUE - instances;
+        instances = 0;
       }
-      else if (Instances != MAX_INSTANCES_FOR_MTF_QUEUE - 1) {
-        define_symbol_instances = Instances + 2;
-        new_symbol_code_length = mtf_queue_miss_code_length[define_symbol_instances];
+      else if (instances != MAX_INSTANCES_FOR_MTF_QUEUE - 1) {
+        instances += 2;
+        new_symbol_code_length = mtf_queue_miss_code_length[instances];
       }
       else {
-        define_symbol_instances = 1;
+        instances = 1;
         new_symbol_code_length = 0x20;
       }
     }
 
-    base_symbol = DecodeBaseSymbol(base_bits, num_base_symbols);
+    uint32_t base_symbol = DecodeBaseSymbol(num_base_symbols, 1);
     if (base_symbol > 0x42)
       base_symbol += 24;
     else if (base_symbol > 0x40)
@@ -1630,9 +1736,10 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
       return(0);
 
     symbol_number = (free_symbol_list_length == 0) ? num_symbols_defined : free_symbol_list[--free_symbol_list_length];
+    symbol_data[symbol_number].string_index = define_string_index;
 
     if ((UTF8_compliant == 0) || (base_symbol < START_UTF8_2BYTE_SYMBOLS)) {
-      if (symbol_lengths[base_symbol]) {
+      if (symbol_lengths[base_symbol] != 0) {
         if (base_symbol & 1) {
           base_symbol -= 1;
           DoubleRangeDown();
@@ -1643,12 +1750,12 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
         }
       }
       else if (base_symbol & 1) {
-        if (symbol_lengths[base_symbol - 1]) {
+        if (symbol_lengths[base_symbol - 1])
           DoubleRangeDown();
-        }
       }
       else if (symbol_lengths[base_symbol + 1])
         DoubleRange();
+
       symbol_lengths[base_symbol] = new_symbol_code_length;
       if (UTF8_compliant != 0)
         InitBaseSymbolCap(base_symbol, 0x90, new_symbol_code_length, &cap_symbol_defined, &cap_lock_symbol_defined,
@@ -1656,7 +1763,8 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
       else
         InitBaseSymbolCap(base_symbol, 0xFF, new_symbol_code_length, &cap_symbol_defined, &cap_lock_symbol_defined,
             symbol_lengths);
-      symbol_strings[end_define_string_index++] = symbol_data[symbol_number].ends = prior_end = base_symbol;
+      symbol_strings[end_define_string_index++]
+          = symbol_data[symbol_number].starts = symbol_data[symbol_number].ends = prior_end = base_symbol;
 
       if (prior_end < START_UTF8_2BYTE_SYMBOLS) {
         if (base_symbol == 'C') {
@@ -1686,7 +1794,7 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
       }
     }
     else {
-      prior_end = create_extended_UTF8_symbol(&end_define_string_index);
+      prior_end = create_extended_UTF8_symbol(base_symbol, &end_define_string_index);
       if (symbol_lengths[prior_end] == 0) {
         symbol_lengths[prior_end] = new_symbol_code_length;
         uint8_t j1 = 0x90;
@@ -1708,84 +1816,92 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
       symbol_data[symbol_number].type = 0;
       symbol_data[symbol_number].ends = prior_end;
       symbol_data[symbol_number].string_length = end_define_string_index - define_string_index;
+      symbol_data[symbol_number].starts = get_first_char(symbol_number);
     }
 
-    if (find_first_symbol)
+    if (find_first_symbol != 0)
       create_EOF_symbol();
-    if (define_symbol_instances == 1) {
-      symbol_data[symbol_number].string_index = define_string_index;
+    if (instances == 1) {
       if (symbol_number == num_symbols_defined)
         num_symbols_defined++;
       symbol_data[num_symbols_defined].string_index = end_define_string_index;
-      return(end_define_string_index);
+      *define_string_index_ptr = end_define_string_index;
+      *symbol_number_ptr = symbol_number;
+      return(1);
     }
   }
   else {
-    SIDSymbol = DecodeSIDFinish(prior_is_cap);
-    if ((symbols_in_definition = SIDSymbol + 1) == 16) {
+    SID_symbol = DecodeSIDFinish(prior_is_cap);
+    if ((symbols_in_definition = SID_symbol + 1) == 16)
       symbols_in_definition = get_extra_length();
-    }
-    DecodeINSTStart(prior_is_cap, SIDSymbol);
-    if (DecodeINSTCheck0(prior_is_cap, SIDSymbol) != 0) {
-      DecodeINSTFinish0(prior_is_cap, SIDSymbol);
-      define_symbol_instances = 2;
+    DecodeINSTStart(prior_is_cap, SID_symbol);
+    if (DecodeINSTCheck0(prior_is_cap, SID_symbol) != 0) {
+      DecodeINSTFinish0(prior_is_cap, SID_symbol);
+      instances = 2;
       new_symbol_code_length = max_code_length;
     }
     else {
-      Instances = DecodeINSTFinish(prior_is_cap, SIDSymbol);
-      if (Instances >= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        define_symbol_instances = 0;
-        new_symbol_code_length = max_regular_code_length + MAX_INSTANCES_FOR_MTF_QUEUE - Instances;
+      instances = DecodeINSTFinish(prior_is_cap, SID_symbol);
+      if (instances >= MAX_INSTANCES_FOR_MTF_QUEUE) {
+        new_symbol_code_length = max_regular_code_length + MAX_INSTANCES_FOR_MTF_QUEUE - instances;
+        instances = 0;
       }
       else {
-        define_symbol_instances = Instances + 2;
-        new_symbol_code_length = mtf_queue_miss_code_length[define_symbol_instances];
+        instances += 2;
+        new_symbol_code_length = mtf_queue_miss_code_length[instances];
       }
     }
 
     do { // Build the symbol string from the next symbols_in_definition symbols
+      DecodeSymTypeStart();
       if (prior_is_cap == 0) {
-        DecodeSymTypeStart(LEVEL1);
         if (DecodeSymTypeCheckDict(LEVEL1) != 0) {
           DecodeSymTypeFinishDict(LEVEL1);
+          uint8_t first_char;
           if (prior_end != 0xA) {
             if ((symbol_data[symbol_number].type & 0x20) != 0) {
               if ((symbol_data[symbol_number].type & 0x80) != 0)
-                FirstChar = DecodeFirstChar(2, prior_end);
+                first_char = DecodeFirstChar(2, prior_end);
               else if ((symbol_data[symbol_number].type & 0x40) != 0)
-                FirstChar = DecodeFirstChar(3, prior_end);
+                first_char = DecodeFirstChar(3, prior_end);
               else
-                FirstChar = DecodeFirstChar(1, prior_end);
+                first_char = DecodeFirstChar(1, prior_end);
             }
             else
-              FirstChar = DecodeFirstChar(0, prior_end);
+              first_char = DecodeFirstChar(0, prior_end);
           }
           else
-            FirstChar = 0x20;
-          BinNum = DecodeDictionaryBin(FirstChar, lookup_bits[FirstChar], &CodeLength, sum_nbob[FirstChar], bin_code_length[FirstChar]);
-          if (CodeLength > bin_code_length[FirstChar]) {
-            get_long_symbol();
+            first_char = 0x20;
+          uint8_t code_length;
+          uint16_t bin_num = DecodeDictionaryBin(lookup_bits[first_char], &code_length, sum_nbob[first_char],
+              bin_code_length[first_char]);
+          if (code_length > bin_code_length[first_char]) {
+            get_embedded_long_symbol(bin_num, code_length, first_char);
           }
           else
-            get_short_symbol();
+            symbol_number = get_short_symbol(bin_num, code_length, first_char);
           if (symbol_data[symbol_number].instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-            if (use_mtf) {
-              if (insert_mtf_queue(NOT_CAP) == 0)
+            if (use_mtf != 0) {
+              if (insert_mtf_queue(symbol_number, code_length, NOT_CAP) == 0)
                 return(0);
             }
-            else if (--symbol_data[symbol_number].remaining == 0) {
-              dremove_dictionary_symbol(symbol_number,CodeLength);
-              check_free_symbol();
+            else if (symbol_data[symbol_number].remaining_m1 == 0) {
+              dremove_dictionary_symbol(symbol_number,code_length);
+              push_free_symbol(symbol_number);
             }
+            else
+              symbol_data[symbol_number].remaining_m1--;
           }
-          else if ((symbol_data[symbol_number].type & 4) != 0)
+          else if ((symbol_data[symbol_number].type & 4) != 0) {
+            dremove_dictionary_symbol(symbol_number,symbol_data[symbol_number].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
             add_new_symbol_to_mtfg_queue(symbol_number);
+          }
           prior_end = symbol_data[symbol_number].ends;
           prior_is_cap = (prior_end == 'C');
           uint32_t string_length = symbol_data[symbol_number].string_length;
           if ((end_define_string_index + string_length >= dictionary_size) && (increase_dictionary_size() == 0))
             return(0);
-          symbol_string_ptr = &symbol_strings[symbol_data[symbol_number].string_index];
+          uint8_t * symbol_string_ptr = &symbol_strings[symbol_data[symbol_number].string_index];
           uint8_t * string_ptr = &symbol_strings[end_define_string_index];
           end_define_string_index += string_length;
           uint8_t * end_string_ptr = &symbol_strings[end_define_string_index];
@@ -1795,24 +1911,24 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
         else if (DecodeSymTypeCheckNew(LEVEL1) != 0) {
           DecodeSymTypeFinishNew(LEVEL1);
           no_embed = 0;
-          if ((end_define_string_index = decode_define_cap_encoded(end_define_string_index)) == 0)
+          if (decode_define_cap_encoded(&symbol_number, &end_define_string_index) == 0)
             return(0);
         }
         else {
           if (DecodeSymTypeCheckMtfg(LEVEL1) != 0) {
             DecodeSymTypeFinishMtfg(LEVEL1);
-            get_mtfg_symbol();
+            symbol_number = get_mtfg_symbol();
           }
           else {
             DecodeSymTypeFinishMtf(LEVEL1);
-            get_mtf_symbol();
+            symbol_number = get_mtf_symbol();
           }
           prior_end = symbol_data[symbol_number].ends;
           prior_is_cap = (prior_end == 'C');
           uint32_t string_length = symbol_data[symbol_number].string_length;
           if ((end_define_string_index + string_length >= dictionary_size) && (increase_dictionary_size() == 0))
             return(0);
-          symbol_string_ptr = &symbol_strings[symbol_data[symbol_number].string_index];
+          uint8_t * symbol_string_ptr = &symbol_strings[symbol_data[symbol_number].string_index];
           uint8_t * string_ptr = &symbol_strings[end_define_string_index];
           end_define_string_index += string_length;
           uint8_t * end_string_ptr = &symbol_strings[end_define_string_index];
@@ -1821,34 +1937,39 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
         }
       }
       else { // prior_is_cap
-        DecodeSymTypeStart(LEVEL1_CAP);
         if (DecodeSymTypeCheckDict(LEVEL1_CAP) != 0) {
           DecodeSymTypeFinishDict(LEVEL1_CAP);
-          FirstChar = DecodeFirstChar(0, 'C');
-          BinNum = DecodeDictionaryBin(FirstChar, lookup_bits[FirstChar], &CodeLength, sum_nbob[FirstChar], bin_code_length[FirstChar]);
-          if (CodeLength > bin_code_length[FirstChar]) {
-            get_long_symbol();
+          uint8_t first_char = DecodeFirstChar(0, 'C');
+          uint8_t code_length;
+          uint16_t bin_num = DecodeDictionaryBin(lookup_bits[first_char], &code_length, sum_nbob[first_char],
+              bin_code_length[first_char]);
+          if (code_length > bin_code_length[first_char]) {
+            get_embedded_long_symbol(bin_num, code_length, first_char);
           }
           else
-            get_short_symbol();
+            symbol_number = get_short_symbol(bin_num, code_length, first_char);
           if (symbol_data[symbol_number].instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-            if (use_mtf) {
-              if (insert_mtf_queue(CAP) == 0)
+            if (use_mtf != 0) {
+              if (insert_mtf_queue(symbol_number, code_length, CAP) == 0)
                 return(0);
             }
-            else if (--symbol_data[symbol_number].remaining == 0) {
-              dremove_dictionary_symbol(symbol_number,CodeLength);
-              check_free_symbol();
+            else if (symbol_data[symbol_number].remaining_m1 == 0) {
+              dremove_dictionary_symbol(symbol_number,code_length);
+              push_free_symbol(symbol_number);
             }
+            else
+              symbol_data[symbol_number].remaining_m1--;
           }
-          else if ((symbol_data[symbol_number].type & 4) != 0)
+          else if ((symbol_data[symbol_number].type & 4) != 0) {
+            dremove_dictionary_symbol(symbol_number,symbol_data[symbol_number].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
             add_new_symbol_to_mtfg_queue(symbol_number);
+          }
           prior_end = symbol_data[symbol_number].ends;
           prior_is_cap = (prior_end == 'C');
           uint32_t string_length = symbol_data[symbol_number].string_length;
           if ((end_define_string_index + string_length >= dictionary_size) && (increase_dictionary_size() == 0))
             return(0);
-          symbol_string_ptr = &symbol_strings[symbol_data[symbol_number].string_index];
+          uint8_t * symbol_string_ptr = &symbol_strings[symbol_data[symbol_number].string_index];
           uint8_t * string_ptr = &symbol_strings[end_define_string_index];
           end_define_string_index += string_length;
           uint8_t * end_string_ptr = &symbol_strings[end_define_string_index];
@@ -1858,24 +1979,24 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
         else if (DecodeSymTypeCheckNew(LEVEL1_CAP) != 0) {
           DecodeSymTypeFinishNew(LEVEL1_CAP);
           no_embed = 0;
-          if ((end_define_string_index = decode_define_cap_encoded(end_define_string_index)) == 0)
+          if (decode_define_cap_encoded(&symbol_number, &end_define_string_index) == 0)
             return(0);
         }
         else {
           if (DecodeSymTypeCheckMtfg(LEVEL1_CAP) != 0) {
             DecodeSymTypeFinishMtfg(LEVEL1_CAP);
-            get_mtfg_symbol_cap();
+            symbol_number = get_mtfg_symbol_cap();
           }
           else {
             DecodeSymTypeFinishMtf(LEVEL1_CAP);
-            get_mtf_symbol_cap();
+            symbol_number = get_mtf_symbol_cap();
           }
           prior_end = symbol_data[symbol_number].ends;
           prior_is_cap = (prior_end == 'C');
           uint32_t string_length = symbol_data[symbol_number].string_length;
           if ((end_define_string_index + string_length >= dictionary_size) && (increase_dictionary_size() == 0))
             return(0);
-          symbol_string_ptr = &symbol_strings[symbol_data[symbol_number].string_index];
+          uint8_t * symbol_string_ptr = &symbol_strings[symbol_data[symbol_number].string_index];
           uint8_t * string_ptr = &symbol_strings[end_define_string_index];
           end_define_string_index += string_length;
           uint8_t * end_string_ptr = &symbol_strings[end_define_string_index];
@@ -1883,10 +2004,15 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
             *string_ptr++ = *symbol_string_ptr++;
         }
       }
-    } while (--symbols_in_definition);
+    } while (--symbols_in_definition != 0);
 
     uint32_t subsymbol_number = symbol_number;
     symbol_number = (free_symbol_list_length == 0) ? num_symbols_defined : free_symbol_list[--free_symbol_list_length];
+    symbol_data[symbol_number].string_index = define_string_index;
+    if ((UTF8_compliant == 0) || (symbol_strings[*define_string_index_ptr] < 0x80))
+      symbol_data[symbol_number].starts = symbol_strings[*define_string_index_ptr];
+    else
+      symbol_data[symbol_number].starts = get_first_char(symbol_number);
     symbol_data[symbol_number].ends = prior_end;
     uint32_t string_length = end_define_string_index - define_string_index;
     symbol_data[symbol_number].string_length = string_length;
@@ -1899,7 +2025,7 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
         if ((symbol_data[symbol_number].type & 0x20) != 0) {
           if ((symbol_data[subsymbol_number].type & 0x80) != 0)
             symbol_data[symbol_number].type |= 0xC0;
-          else if (define_symbol_instances == 0) {
+          else if (instances == 0) {
             uint8_t tag = DecodeWordTag();
             tag_type = 1 + tag;
             symbol_data[symbol_number].type |= 0x40 + (tag << 7);
@@ -1909,15 +2035,14 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
         }
       }
       else {
-        symbol_string_ptr = &symbol_strings[end_define_string_index];
-        symbol_string_ptr--;
+        uint8_t * symbol_string_ptr = &symbol_strings[end_define_string_index - 1];
         if ((symbol_data[symbol_number].ends == 'C') || (*symbol_string_ptr == (uint32_t)' '))
           symbol_data[symbol_number].type |= 0x10;
         else {
           while (symbol_string_ptr-- != &symbol_strings[define_string_index]) {
             if (*symbol_string_ptr == (uint32_t)' ') {
               symbol_data[symbol_number].type |= 0x30;
-              if (define_symbol_instances == 0) {
+              if (instances == 0) {
                 uint8_t tag = DecodeWordTag();
                 tag_type = 1 + tag;
                 symbol_data[symbol_number].type |= 0x40 + (tag << 7);
@@ -1933,51 +2058,47 @@ uint32_t decode_define_cap_encoded(uint32_t define_string_index) {
   uint32_t string_length = end_define_string_index - define_string_index;
   symbol_data[symbol_number].string_length = string_length;
   symbol_data[symbol_number].type |= no_embed;
-  symbol_data[symbol_number].string_index = define_string_index;
-
-  if (define_symbol_instances) {
-    symbol_data[symbol_number].instances = define_symbol_instances;
-    symbol_data[symbol_number].remaining = define_symbol_instances - 1;
-    if (use_mtf) {
-      mtf_queue_number = define_symbol_instances - 2;
-      if (char_before_define_is_cap == 0)
-        UpFreqMtfQueueNum(NOT_CAP, mtf_queue_number);
-      else
-        UpFreqMtfQueueNum(CAP, mtf_queue_number);
+  if (instances != 0) {
+    symbol_data[symbol_number].instances = instances;
+    symbol_data[symbol_number].remaining_m1 = instances - 2;
+    if (use_mtf != 0) {
+      UpFreqMtfQueueNum(char_before_define_is_cap, instances - 2);
       // put the new symbol in the mtf queue
-      if (mtf_queue_size[define_symbol_instances] != MTF_QUEUE_SIZE)
-        mtf_queue[define_symbol_instances]
-              [(mtf_queue_size[define_symbol_instances]++ + mtf_queue_offset[define_symbol_instances]) & 0x3F]
-            = symbol_number;
+      if (mtf_queue_size[instances] != MTF_QUEUE_SIZE)
+        mtf_queue[instances][(mtf_queue_size[instances]++ + mtf_queue_offset[instances]) & 0x3F] = symbol_number;
       else {
-        uint32_t temp_symbol_number
-            = *(mtf_queue_ptr = &mtf_queue[define_symbol_instances][mtf_queue_offset[define_symbol_instances]++ & 0x3F]);
+        uint32_t * mtf_queue_ptr = &mtf_queue[instances][mtf_queue_offset[instances]++ & 0x3F];
+        uint32_t temp_symbol_number = *mtf_queue_ptr;
+        *mtf_queue_ptr = symbol_number;
         if (dadd_dictionary_symbol(temp_symbol_number, new_symbol_code_length) == 0)
           return(0);
-        *mtf_queue_ptr = symbol_number;
       }
     }
     else if (dadd_dictionary_symbol(symbol_number, new_symbol_code_length) == 0)
       return(0);
   }
   else {
-    if ((new_symbol_code_length > 10) && use_mtfg) {
+    symbol_data[symbol_number].instances = MAX_INSTANCES_FOR_MTF_QUEUE + new_symbol_code_length;
+    if ((new_symbol_code_length > 10) && (use_mtfg != 0)) {
       uint8_t nonergodic = DecodeERG(tag_type);
-      if (nonergodic) {
+      if (nonergodic != 0) {
         symbol_data[symbol_number].type |= 4;
         add_new_symbol_to_mtfg_queue(symbol_number);
       }
+      else if (dadd_dictionary_symbol(symbol_number, new_symbol_code_length) == 0)
+        return(0);
     }
-    symbol_data[symbol_number].instances = MAX_INSTANCES_FOR_MTF_QUEUE + new_symbol_code_length;
-    if (dadd_dictionary_symbol(symbol_number, new_symbol_code_length) == 0)
+    else if (dadd_dictionary_symbol(symbol_number, new_symbol_code_length) == 0)
       return(0);
   }
 
   if (symbol_number == num_symbols_defined)
     num_symbols_defined++;
   symbol_data[num_symbols_defined].string_index = end_define_string_index;
-  check_free_strings(define_string_index, string_length);
-  return(end_define_string_index);
+  check_free_strings(symbol_number, define_string_index, string_length);
+  *define_string_index_ptr = end_define_string_index;
+  *symbol_number_ptr = symbol_number;
+  return(1);
 }
 
 
@@ -2038,32 +2159,29 @@ void transpose4(uint8_t * buffer, uint32_t len) {
 
 
 void write_output_buffer() {
-  chars_to_write = out_char_ptr - start_char_ptr;
+  uint32_t chars_to_write = out_char_ptr - start_char_ptr;
   if (fd != 0) {
     fflush(fd);
     fwrite(start_char_ptr, 1, chars_to_write, fd);
-    if (out_buffer_num == 0) {
-      out_buffer_num = 1;
+    if ((out_buffers_sent & 1) == 0)
       out_char_ptr = out_char1;
-    }
-    else {
-      out_buffer_num = 0;
+    else
       out_char_ptr = out_char0;
-    }
   }
   outbuf_index += chars_to_write;
   start_char_ptr = out_char_ptr;
   extra_out_char_ptr = out_char_ptr + CHARS_TO_WRITE;
 #ifdef PRINTON
-  if ((out_buffers_sent++ & 0x7F) == 0)
+  if ((out_buffers_sent & 0x7F) == 0)
     fprintf(stderr,"%u\r",(unsigned int)outbuf_index);
 #endif
+  out_buffers_sent++;
   return;
 }
 
 
 void write_output_buffer_delta() {
-  chars_to_write = out_char_ptr - start_char_ptr;
+  uint32_t chars_to_write = out_char_ptr - start_char_ptr;
   uint32_t len = out_char_ptr - start_char_ptr;
   if (stride == 4) {
     transpose4(start_char_ptr, len);
@@ -2077,15 +2195,13 @@ void write_output_buffer_delta() {
   if (fd != 0) {
     fflush(fd);
     fwrite(start_char_ptr, 1, chars_to_write, fd);
-    if (out_buffer_num == 0) {
-      out_buffer_num = 1;
+    if ((out_buffers_sent & 1) == 0) {
       uint8_t k;
       for (k = 1 ; k <= stride ; k++)
         out_char1[100 - k] = *(out_char_ptr - k);
       out_char_ptr = out_char1 + 100;
     }
     else {
-      out_buffer_num = 0;
       uint8_t k;
       for (k = 1 ; k <= stride ; k++)
         out_char0[100 - k] = *(out_char_ptr - k);
@@ -2096,9 +2212,10 @@ void write_output_buffer_delta() {
   start_char_ptr = out_char_ptr;
   extra_out_char_ptr = out_char_ptr + CHARS_TO_WRITE;
 #ifdef PRINTON
-  if ((out_buffers_sent++ & 0x7F) == 0)
+  if ((out_buffers_sent & 0x7F) == 0)
     fprintf(stderr,"%u\r",(unsigned int)outbuf_index);
 #endif
+  out_buffers_sent++;
   return;
 }
 
@@ -2225,6 +2342,7 @@ void write_output_buffer_delta() {
 
 
 void write_single_threaded_output() {
+  uint8_t * symbol_string_ptr;
   if (cap_encoded != 0) {
     while (symbol_buffer_read_index != symbol_buffer_write_index) {
       symbol = symbol_buffer[symbol_buffer_read_index++];
@@ -2259,7 +2377,7 @@ void write_single_threaded_output() {
 }
 
 
-void write_symbol() {
+void write_symbol(uint32_t symbol_number) {
   symbol_buffer[symbol_buffer_write_index++] = symbol_number;
   if ((symbol_buffer_write_index & 0xFF) == 0) {
     uint8_t free_index;
@@ -2296,16 +2414,14 @@ void write_symbol() {
 }
 
 
-void *write_output_thread(void *arg) {
-  uint8_t *symbol_string_ptr;
-  uint8_t write_cap_on, write_cap_lock_on, skip_space_on, next_queue_buffer;
+void *write_output_thread() {
+  uint8_t write_cap_on, write_cap_lock_on, skip_space_on, next_queue_buffer, *symbol_string_ptr;
   uint32_t symbol, *buffer_ptr, *buffer1_end_ptr, *buffer2_end_ptr;
 
   symbol_buffer_read_index = 0;
   write_cap_on = 0;
   write_cap_lock_on = 0;
   skip_space_on = 0;
-  out_buffer_num = 0;
   next_queue_buffer = 0;
 
   if (fd != 0)
@@ -2318,13 +2434,10 @@ void *write_output_thread(void *arg) {
   buffer1_end_ptr = &symbol_buffer[0x100];
   buffer2_end_ptr = &symbol_buffer[0x200];
 
-  while ((atomic_load_explicit(&done_parsing, memory_order_acquire) == 0)
-      && (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_acquire) == 0));
-
   if (cap_encoded != 0) {
     while ((atomic_load_explicit(&done_parsing, memory_order_acquire) == 0)
-        || (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_relaxed) != 0)
-        || (atomic_load_explicit(&symbol_buffer_pt2_owner, memory_order_relaxed) != 0)) {
+        || (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_acquire) != 0)
+        || (atomic_load_explicit(&symbol_buffer_pt2_owner, memory_order_acquire) != 0)) {
       if (next_queue_buffer == 0) {
         if (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_acquire) != 0) {
           do {
@@ -2359,8 +2472,8 @@ void *write_output_thread(void *arg) {
   }
   else if (stride == 0) {
     while ((atomic_load_explicit(&done_parsing, memory_order_acquire) == 0)
-        || (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_relaxed) != 0)
-        || (atomic_load_explicit(&symbol_buffer_pt2_owner, memory_order_relaxed) != 0)) {
+        || (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_acquire) != 0)
+        || (atomic_load_explicit(&symbol_buffer_pt2_owner, memory_order_acquire) != 0)) {
       if (next_queue_buffer == 0) {
         if (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_acquire) != 0) {
           do {
@@ -2395,8 +2508,8 @@ void *write_output_thread(void *arg) {
   }
   else {
     while ((atomic_load_explicit(&done_parsing, memory_order_acquire) == 0)
-        || (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_relaxed) != 0)
-        || (atomic_load_explicit(&symbol_buffer_pt2_owner, memory_order_relaxed) != 0)) {
+        || (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_acquire) != 0)
+        || (atomic_load_explicit(&symbol_buffer_pt2_owner, memory_order_acquire) != 0)) {
       if (next_queue_buffer == 0) {
         if (atomic_load_explicit(&symbol_buffer_pt1_owner, memory_order_acquire) != 0) {
           do {
@@ -2429,7 +2542,7 @@ void *write_output_thread(void *arg) {
       write_string_delta(string_length);
     }
   }
-  chars_to_write = out_char_ptr - start_char_ptr;
+  uint32_t chars_to_write = out_char_ptr - start_char_ptr;
   if (stride) {
     uint32_t len = chars_to_write;
     if (stride == 4) {
@@ -2450,7 +2563,7 @@ void *write_output_thread(void *arg) {
 
 
 #define send_symbol() { \
-  write_symbol(); \
+  write_symbol(symbol_number); \
   prior_end = symbol_data[symbol_number].ends; \
 }
 
@@ -2461,16 +2574,20 @@ void *write_output_thread(void *arg) {
 }
 
 
-uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, uint8_t * OutBuffer, FILE * fd_out) {
-  uint8_t num_inst_codes, i1, i2;
+uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, uint8_t * OutBuffer, FILE * fd_out,
+    struct param_data * params) {
+  uint8_t num_inst_codes, i, j;
+  uint32_t symbol_number;
   pthread_t output_thread;
 
   fd = fd_out;
   two_threads = 1;
-  out_buffers_sent = 0;
+  if ((params != 0) && (params->two_threads == 0))
+    two_threads = 0;
   symbol_buffer_write_index = 0;
   delta_on = 0;
   outbuf = OutBuffer;
+  out_buffers_sent = 0;
   outbuf_index = 0;
 
   dictionary_size = ((uint32_t)pow(2.0, 0.25 * (double)InBuffer[0]) >> 1) + 10;
@@ -2492,14 +2609,13 @@ uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, u
     atomic_init(&done_parsing, 0);
     atomic_init(&symbol_buffer_pt1_owner, 0);
     atomic_init(&symbol_buffer_pt2_owner, 0);
-    pthread_create(&output_thread,NULL,write_output_thread,outbuf);
+    pthread_create(&output_thread, NULL, write_output_thread, outbuf);
   }
   else {
     symbol_buffer_read_index = 0;
     write_cap_on = 0;
     write_cap_lock_on = 0;
     skip_space_on = 0;
-    out_buffer_num = 0;
     if (fd != 0)
       out_char_ptr = out_char0 + 100;
     else
@@ -2508,9 +2624,9 @@ uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, u
     extra_out_char_ptr = out_char_ptr + CHARS_TO_WRITE;
   }
 
-  for (i1 = 2 ; i1 <= MAX_INSTANCES_FOR_MTF_QUEUE ; i1++) {
-    mtf_queue_size[i1] = 0;
-    mtf_queue_offset[i1] = 0;
+  for (i = 2 ; i <= MAX_INSTANCES_FOR_MTF_QUEUE ; i++) {
+    mtf_queue_size[i] = 0;
+    mtf_queue_offset[i] = 0;
   }
   mtfg_queue_0_offset = 0;
   mtfg_queue_8_offset = 0;
@@ -2519,7 +2635,7 @@ uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, u
   mtfg_queue_64_offset = 0;
   mtfg_queue_128_offset = 0;
   mtfg_queue_192_offset = 0;
-  symbol_data[0].string_index = 0;
+  symbol_data[0].string_index = 1;
   num_symbols_defined = 0;
 
   if (in_size < 5)
@@ -2534,29 +2650,25 @@ uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, u
   use_mtfg = 0;
   if (use_mtf && (max_regular_code_length >= 11))
     use_mtfg = 1;
-  i1 = 3;
+  i = 3;
   do {
-    mtf_queue_miss_code_length[i1] = mtf_queue_miss_code_length[i1-1] - ((InBuffer[2] >> (i1 + 3)) & 1);
-  } while (++i1 != 5);
+    mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i-1] - ((InBuffer[2] >> (i + 3)) & 1);
+  } while (++i != 5);
   do {
-    mtf_queue_miss_code_length[i1] = mtf_queue_miss_code_length[i1-1] - ((InBuffer[3] >> i1) & 1);
-  } while (++i1 != 8);
+    mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i-1] - ((InBuffer[3] >> i) & 1);
+  } while (++i != 8);
   do {
-    mtf_queue_miss_code_length[i1] = mtf_queue_miss_code_length[i1-1] - ((InBuffer[4] >> (i1-8)) & 1);
-  } while (++i1 != 16);
+    mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i-1] - ((InBuffer[4] >> (i-8)) & 1);
+  } while (++i != 16);
   num_inst_codes = MAX_INSTANCES_FOR_MTF_QUEUE + max_regular_code_length - (InBuffer[2] & 0x1F);
   stride = 0;
   if (UTF8_compliant != 0) {
     WriteInCharNum(6);
     if (in_size == 5)
       goto finish_decode;
-    base_bits = InBuffer[5];
-    num_base_symbols = 1 << base_bits;
-    if (cap_encoded != 0)
-      num_base_symbols -= 24;
+    num_base_symbols = 1 << InBuffer[5];
   }
   else {
-    base_bits = 8;
     num_base_symbols = 0x100;
     delta_format = (InBuffer[2] & 0x20) >> 5;
     if (delta_format) {
@@ -2579,45 +2691,45 @@ uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, u
     *lookup_bits_ptr = max_code_length;
   prior_is_cap = 0;
 
-  for (i1 = 0 ; i1 < 8 ; i1++)
-    mtfg_queue_0[i1] = max_symbols_defined - 1;
-  for (i1 = 0 ; i1 < 8 ; i1++)
-    mtfg_queue_8[i1] = max_symbols_defined - 1;
-  for (i1 = 0 ; i1 < 16 ; i1++)
-    mtfg_queue_16[i1] = max_symbols_defined - 1;
-  for (i1 = 0 ; i1 < 32 ; i1++)
-    mtfg_queue_32[i1] = max_symbols_defined - 1;
-  for (i1 = 0 ; i1 < 64 ; i1++) {
-    mtfg_queue_64[i1] = max_symbols_defined - 1;
-    mtfg_queue_128[i1] = max_symbols_defined - 1;
-    mtfg_queue_192[i1] = max_symbols_defined - 1;
+  for (i = 0 ; i < 8 ; i++)
+    mtfg_queue_0[i] = max_symbols_defined - 1;
+  for (i = 0 ; i < 8 ; i++)
+    mtfg_queue_8[i] = max_symbols_defined - 1;
+  for (i = 0 ; i < 16 ; i++)
+    mtfg_queue_16[i] = max_symbols_defined - 1;
+  for (i = 0 ; i < 32 ; i++)
+    mtfg_queue_32[i] = max_symbols_defined - 1;
+  for (i = 0 ; i < 64 ; i++) {
+    mtfg_queue_64[i] = max_symbols_defined - 1;
+    mtfg_queue_128[i] = max_symbols_defined - 1;
+    mtfg_queue_192[i] = max_symbols_defined - 1;
   }
 
   InitDecoder(max_regular_code_length, num_inst_codes, cap_encoded, UTF8_compliant, use_mtf, use_mtfg, InBuffer);
-  i1 = 0xFF;
+  i = 0xFF;
   if (UTF8_compliant != 0)
-    i1 = 0x90;
+    i = 0x90;
   do {
-    for (i2 = max_code_length ; i2 >= 2 ; i2--) {
-      sym_list_bits[i1][i2] = 2;
-      if (0 == (sym_list_ptrs[i1][i2] = (uint32_t *)malloc(sizeof(uint32_t) * 4))) {
+    for (j = max_code_length ; j >= 1 ; j--) {
+      bin_data[i][j].sym_list_bits = 2;
+      if (0 == (bin_data[i][j].sym_list = (uint32_t *)malloc(sizeof(uint32_t) * 4))) {
         fprintf(stderr,"FATAL ERROR - symbol list malloc failure\n");
         return(0);
       }
-      nsob[i1][i2] = 0;
-      nbob[i1][i2] = 0;
-      fbob[i1][i2] = 0;
+      bin_data[i][j].nsob = 0;
+      bin_data[i][j].nbob = 0;
+      bin_data[i][j].fbob = 0;
     }
-    sum_nbob[i1] = 0;
-    symbol_lengths[i1] = 0;
-    bin_code_length[i1] = max_code_length;
-  } while (i1--);
+    sum_nbob[i] = 0;
+    symbol_lengths[i] = 0;
+    bin_code_length[i] = max_code_length;
+  } while (i--);
   find_first_symbol = 1;
   free_string_list_length = 0;
-  i1 = FREE_STRING_LIST_SIZE - 1;
+  i = FREE_STRING_LIST_SIZE - 1;
   do {
-    free_string_list[i1].string_length = 0;
-  } while (i1-- != 0);
+    free_string_list[i].string_length = 0;
+  } while (i-- != 0);
   free_string_list_wait1 = 0;
   free_string_list_wait2 = 0;
   free_symbol_list_length = 0;
@@ -2629,105 +2741,121 @@ uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, u
     cap_symbol_defined = 0;
     cap_lock_symbol_defined = 0;
     while (1) {
+      DecodeSymTypeStart();
       if (prior_is_cap == 0) {
-        DecodeSymTypeStart(LEVEL0);
         if (DecodeSymTypeCheckDict(LEVEL0) != 0) { // dictionary symbol
           DecodeSymTypeFinishDict(LEVEL0);
+          uint8_t first_char;
           if (prior_end != 0xA) {
             if ((symbol_data[symbol_number].type & 0x20) != 0) {
               if ((symbol_data[symbol_number].type & 0x80) != 0)
-                FirstChar = DecodeFirstChar(2, prior_end);
+                first_char = DecodeFirstChar(2, prior_end);
               else if ((symbol_data[symbol_number].type & 0x40) != 0)
-                FirstChar = DecodeFirstChar(3, prior_end);
+                first_char = DecodeFirstChar(3, prior_end);
               else
-                FirstChar = DecodeFirstChar(1, prior_end);
+                first_char = DecodeFirstChar(1, prior_end);
             }
             else
-              FirstChar = DecodeFirstChar(0, prior_end);
+              first_char = DecodeFirstChar(0, prior_end);
           }
           else
-            FirstChar = ' ';
-          BinNum = DecodeDictionaryBin(FirstChar, lookup_bits[FirstChar], &CodeLength, sum_nbob[FirstChar], bin_code_length[FirstChar]); 
-          if (CodeLength > bin_code_length[FirstChar]) {
-            get_long_symbol();
+            first_char = ' ';
+          uint8_t code_length;
+          uint16_t bin_num = DecodeDictionaryBin(lookup_bits[first_char], &code_length, sum_nbob[first_char],
+              bin_code_length[first_char]);
+          if (code_length > bin_code_length[first_char]) {
+            get_long_symbol(bin_num, code_length, first_char, end_char);
           }
           else {
-            get_short_symbol();
-            if ((CodeLength == max_code_length) && (FirstChar == end_symbol) && (BinNum == fbob[FirstChar][max_code_length]))
+            symbol_number = get_short_symbol(bin_num, code_length, first_char);
+            if ((code_length == max_code_length) && (first_char == end_char)
+                && (bin_num == bin_data[first_char][max_code_length].fbob))
               break; // EOF
           }
           send_symbol_cap();
           if (symbol_data[symbol_number].instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-            if (use_mtf) {
-              if (insert_mtf_queue(NOT_CAP) == 0)
+            if (use_mtf != 0) {
+              if (insert_mtf_queue(symbol_number, code_length, NOT_CAP) == 0)
                 return(0);
             }
-            else if (--symbol_data[symbol_number].remaining == 0)
-              dremove_dictionary_symbol(symbol_number,CodeLength);
+            else if (symbol_data[symbol_number].remaining_m1 == 0)
+              dremove_dictionary_symbol(symbol_number,code_length);
+            else
+              symbol_data[symbol_number].remaining_m1--;
           }
-          else if ((symbol_data[symbol_number].type & 4) != 0)
+          else if ((symbol_data[symbol_number].type & 4) != 0) {
+            dremove_dictionary_symbol(symbol_number,symbol_data[symbol_number].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
             add_new_symbol_to_mtfg_queue(symbol_number);
+          }
         }
         else if (DecodeSymTypeCheckNew(LEVEL0) != 0) {
           DecodeSymTypeFinishNew(LEVEL0);
           no_embed = 1;
-          if (decode_define_cap_encoded(symbol_data[num_symbols_defined].string_index) == 0)
+          uint32_t string_index = symbol_data[num_symbols_defined].string_index;
+          if (decode_define_cap_encoded(&symbol_number, &string_index) == 0)
             return(0);
-          write_symbol();
+          write_symbol(symbol_number);
         }
         else {
           if (DecodeSymTypeCheckMtfg(LEVEL0) != 0) {
             DecodeSymTypeFinishMtfg(LEVEL0);
-            get_mtfg_symbol();
+            symbol_number = get_mtfg_symbol();
           }
           else {
             DecodeSymTypeFinishMtf(LEVEL0);
-            get_mtf_symbol();
+            symbol_number = get_mtf_symbol();
           }
           send_symbol_cap();
         }
       }
       else { // prior_is_cap
-        DecodeSymTypeStart(LEVEL0_CAP);
         if (DecodeSymTypeCheckDict(LEVEL0_CAP) != 0) { // dictionary symbol
           DecodeSymTypeFinishDict(LEVEL0_CAP);
-          FirstChar = DecodeFirstChar(0, 'C');
-          BinNum = DecodeDictionaryBin(FirstChar, lookup_bits[FirstChar], &CodeLength, sum_nbob[FirstChar], bin_code_length[FirstChar]);
-          if (CodeLength > bin_code_length[FirstChar]) {
-            get_long_symbol();
+          uint8_t first_char = DecodeFirstChar(0, 'C');
+          uint8_t code_length;
+          uint16_t bin_num = DecodeDictionaryBin(lookup_bits[first_char], &code_length, sum_nbob[first_char],
+              bin_code_length[first_char]);
+          if (code_length > bin_code_length[first_char]) {
+            get_long_symbol(bin_num, code_length, first_char, end_char);
           }
           else {
-            get_short_symbol();
-            if ((CodeLength == max_code_length) && (FirstChar == end_symbol) && (BinNum == fbob[FirstChar][max_code_length]))
+            symbol_number = get_short_symbol(bin_num, code_length, first_char);
+            if ((code_length == max_code_length) && (first_char == end_char)
+                && (bin_num == bin_data[first_char][max_code_length].fbob))
               break; // EOF
           }
           send_symbol_cap();
           if (symbol_data[symbol_number].instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-            if (use_mtf) {
-              if (insert_mtf_queue(CAP) == 0)
+            if (use_mtf != 0) {
+              if (insert_mtf_queue(symbol_number, code_length, CAP) == 0)
                 return(0);
             }
-            else if (--symbol_data[symbol_number].remaining == 0)
-              dremove_dictionary_symbol(symbol_number,CodeLength);
+            else if (symbol_data[symbol_number].remaining_m1 == 0)
+              dremove_dictionary_symbol(symbol_number,code_length);
+            else
+              symbol_data[symbol_number].remaining_m1--;
           }
-          else if ((symbol_data[symbol_number].type & 4) != 0)
+          else if ((symbol_data[symbol_number].type & 4) != 0) {
+            dremove_dictionary_symbol(symbol_number,symbol_data[symbol_number].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
             add_new_symbol_to_mtfg_queue(symbol_number);
+          }
         }
         else if (DecodeSymTypeCheckNew(LEVEL0_CAP) != 0) {
           DecodeSymTypeFinishNew(LEVEL0_CAP);
           no_embed = 1;
-          if (decode_define_cap_encoded(symbol_data[num_symbols_defined].string_index) == 0)
+          uint32_t string_index = symbol_data[num_symbols_defined].string_index;
+          if (decode_define_cap_encoded(&symbol_number, &string_index) == 0)
             return(0);
-          write_symbol();
+          write_symbol(symbol_number);
         }
         else {
           if (DecodeSymTypeCheckMtfg(LEVEL0_CAP) != 0) {
             DecodeSymTypeFinishMtfg(LEVEL0_CAP);
-            get_mtfg_symbol_cap();
+            symbol_number = get_mtfg_symbol_cap();
           }
           else {
             DecodeSymTypeFinishMtf(LEVEL0_CAP);
-            get_mtf_symbol_cap();
+            symbol_number = get_mtf_symbol_cap();
           }
           send_symbol_cap();
         }
@@ -2736,51 +2864,60 @@ uint8_t * GLZAdecode(size_t in_size, uint8_t * InBuffer, size_t * outsize_ptr, u
   }
   else { // not cap encoded
     while (1) {
-      DecodeSymTypeStart(LEVEL0);
+      DecodeSymTypeStart();
       if (DecodeSymTypeCheckDict(LEVEL0) != 0) { // dictionary symbol
         DecodeSymTypeFinishDict(LEVEL0);
+        uint8_t first_char;
         if (UTF8_compliant != 0)
-          FirstChar = DecodeFirstChar(0, prior_end);
+          first_char = DecodeFirstChar(0, prior_end);
         else
-          FirstChar = DecodeFirstCharBinary(prior_end);
-        BinNum = DecodeDictionaryBin(FirstChar, lookup_bits[FirstChar], &CodeLength, sum_nbob[FirstChar], bin_code_length[FirstChar]);
-        if (CodeLength > bin_code_length[FirstChar]) {
-          get_long_symbol();
+          first_char = DecodeFirstCharBinary(prior_end);
+        uint8_t code_length;
+        uint16_t bin_num = DecodeDictionaryBin(lookup_bits[first_char], &code_length, sum_nbob[first_char],
+            bin_code_length[first_char]);
+        if (code_length > bin_code_length[first_char]) {
+          get_long_symbol(bin_num, code_length, first_char, end_char);
         }
         else {
-          get_short_symbol();
-          if ((CodeLength == max_code_length) && (FirstChar == end_symbol) && (BinNum == fbob[FirstChar][max_code_length]))
+          symbol_number = get_short_symbol(bin_num, code_length, first_char);
+          if ((code_length == max_code_length) && (first_char == end_char)
+              && (bin_num == bin_data[first_char][max_code_length].fbob))
             break; // EOF
         }
         send_symbol();
         if (symbol_data[symbol_number].instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-          if (use_mtf) {
-            if (insert_mtf_queue(NOT_CAP) == 0)
+          if (use_mtf != 0) {
+            if (insert_mtf_queue(symbol_number, code_length, NOT_CAP) == 0)
               return(0);
           }
-          else if (--symbol_data[symbol_number].remaining == 0) {
-            dremove_dictionary_symbol(symbol_number,CodeLength);
-            check_free_symbol();
+          else if (symbol_data[symbol_number].remaining_m1 == 0) {
+            dremove_dictionary_symbol(symbol_number, code_length);
+            push_free_symbol(symbol_number);
           }
+          else
+            symbol_data[symbol_number].remaining_m1--;
         }
-        else if ((symbol_data[symbol_number].type & 4) != 0)
+        else if ((symbol_data[symbol_number].type & 4) != 0) {
+          dremove_dictionary_symbol(symbol_number,symbol_data[symbol_number].instances - MAX_INSTANCES_FOR_MTF_QUEUE);
           add_new_symbol_to_mtfg_queue(symbol_number);
+        }
       }
       else if (DecodeSymTypeCheckNew(LEVEL0) != 0) {
         DecodeSymTypeFinishNew(LEVEL0);
         no_embed = 1;
-        if (decode_define(symbol_data[num_symbols_defined].string_index) == 0)
+        uint32_t string_index = symbol_data[num_symbols_defined].string_index;
+        if (decode_define(&symbol_number, &string_index) == 0)
           return(0);
-        write_symbol();
+        write_symbol(symbol_number);
       }
       else {
         if (DecodeSymTypeCheckMtfg(LEVEL0) != 0) {
           DecodeSymTypeFinishMtfg(LEVEL0);
-          get_mtfg_symbol();
+          symbol_number = get_mtfg_symbol();
         }
         else {
           DecodeSymTypeFinishMtf(LEVEL0);
-          get_mtf_symbol();
+          symbol_number = get_mtf_symbol();
         }
         send_symbol();
       }
@@ -2791,18 +2928,18 @@ finish_decode:
   symbol_buffer[symbol_buffer_write_index] = MAX_U32_VALUE;
   if (two_threads)
     atomic_store_explicit(&done_parsing, 1, memory_order_release);
-  i1 = 0xFF;
+  i = 0xFF;
   if (UTF8_compliant != 0)
-    i1 = 0x90;
+    i = 0x90;
   do {
-    for (i2 = max_code_length ; i2 >= 2 ; i2--)
-      free(sym_list_ptrs[i1][i2]);
-  } while (i1--);
+    for (j = max_code_length ; j >= 2 ; j--)
+      free(bin_data[i][j].sym_list);
+  } while (i--);
   if (two_threads)
     pthread_join(output_thread,NULL);
   else {
     write_single_threaded_output();
-    chars_to_write = out_char_ptr - start_char_ptr;
+    uint32_t chars_to_write = out_char_ptr - start_char_ptr;
     if (stride) {
       uint32_t len = out_char_ptr - start_char_ptr;
       if (stride == 4) {

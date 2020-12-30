@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright 2015 - 2016 Kennon Conrad
+Copyright 2015 - 2017 Kennon Conrad
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,25 +17,17 @@ limitations under the License.
 ***********************************************************************/
 
 #include <inttypes.h>
+#include <math.h>
 #include "GLZAmodel.h"
-#include <stdio.h>
 
 uint32_t InCharNum, OutCharNum;
-uint32_t RangeLow, RangeHigh, count;
-uint32_t low, code, range, extra_range;
-uint8_t * InBuffer;
-uint8_t FoundIndex;
-uint8_t SymbolFirstChar[4][0x100][0x100];
-uint8_t RangeScaleERG[3], RangeScaleWordTag;
-uint8_t FreqERG[3], FreqWordTag, *OutBuffer;
+uint32_t RangeLow, RangeHigh, count, low, code, range, extra_range;
+uint8_t SymbolFirstChar[4][0x100][0x100], RangeScaleERG[3], RangeScaleWordTag, FreqERG[3], FreqWordTag;
+uint8_t *InBuffer, *OutBuffer;
 uint16_t RangeScaleMtfQueueNum[2], RangeScaleMtfQueuePos[2][14], RangeScaleMtfgQueuePos[2];
-uint16_t RangeScaleSID[2], RangeScaleINST[2][16];
-uint16_t RangeScaleFirstChar[4][0x100];
-uint16_t RangeScaleFirstCharSection[0x100][7];
+uint16_t RangeScaleSID[2], RangeScaleINST[2][16], RangeScaleFirstChar[4][0x100], RangeScaleFirstCharSection[0x100][7];
 uint16_t FreqSymType[4][4], FreqMtfQueueNum[2][14], FreqMtfQueuePos[2][14][64], FreqMtfgQueuePos[2][256];
 uint16_t FreqSID[2][16], FreqINST[2][16][38], FreqFirstChar[4][0x100][0x100], FreqFirstCharBinary[0x100][0x100];
-const uint32_t MTF_QUEUE_SIZE = 64;
-
 uint32_t ReadLow() {return(low);}
 uint32_t ReadRange() {return(range);}
 
@@ -454,7 +446,7 @@ void InitTrailingCharBin(uint8_t trailing_char, uint8_t leading_char, uint8_t co
   return;
 }
 
-void InitTrailingCharBinary(uint32_t trailing_char, uint8_t * symbol_lengths) {
+void InitTrailingCharBinary(uint8_t trailing_char, uint8_t * symbol_lengths) {
   uint8_t leading_char = 0xFF;
   do {
     uint16_t init_freq;
@@ -643,7 +635,7 @@ void EncodeMtfQueueNum(uint8_t Context, uint8_t mtf_queue_number) {
   }
   else {
     RangeLow = FreqMtfQueueNum[Context][0];
-    FoundIndex = 1;
+    uint8_t FoundIndex = 1;
     while (FoundIndex != mtf_queue_number)
       RangeLow += FreqMtfQueueNum[Context][FoundIndex++];
     low += RangeLow * (range /= RangeScaleMtfQueueNum[Context]);
@@ -661,7 +653,7 @@ void EncodeMtfQueueNumLastSymbol(uint8_t Context, uint8_t mtf_queue_number) {
     range = FreqMtfQueueNum[Context][0] * (range / RangeScaleMtfQueueNum[Context]);
   else {
     RangeLow = FreqMtfQueueNum[Context][0];
-    FoundIndex = 1;
+    uint8_t FoundIndex = 1;
     while (FoundIndex != mtf_queue_number)
       RangeLow += FreqMtfQueueNum[Context][FoundIndex++];
     low += RangeLow * (range /= RangeScaleMtfQueueNum[Context]);
@@ -685,7 +677,7 @@ void EncodeMtfQueuePos(uint8_t Context, uint8_t mtf_queue_number, uint8_t * mtf_
   }
   else {
     RangeLow = FreqMtfQueuePos[Context][mtf_queue_number][0];
-    FoundIndex = 1;
+    uint8_t FoundIndex = 1;
     while (FoundIndex != queue_position)
       RangeLow += FreqMtfQueuePos[Context][mtf_queue_number][FoundIndex++];
     low += RangeLow * (range /= RangeScale);
@@ -721,7 +713,7 @@ void EncodeMtfgQueuePos(uint8_t Context, uint8_t queue_position) {
   }
   else {
     RangeLow = FreqMtfgQueuePos[Context][0];
-    FoundIndex = 1;
+    uint8_t FoundIndex = 1;
     while (FoundIndex != queue_position)
       RangeLow += FreqMtfgQueuePos[Context][FoundIndex++];
     low += RangeLow * (range /= RangeScaleMtfgQueuePos[Context]);
@@ -792,7 +784,7 @@ void EncodeINST(uint8_t Context, uint8_t SIDSymbol, uint8_t Symbol) {
   }
   else {
     RangeLow = FreqINST[Context][SIDSymbol][0];
-    FoundIndex = 1;
+    uint8_t FoundIndex = 1;
     while (FoundIndex != Symbol)
       RangeLow += FreqINST[Context][SIDSymbol][FoundIndex++];
     low += RangeLow * (range /= RangeScaleINST[Context][SIDSymbol]);
@@ -844,10 +836,10 @@ void EncodeWordTag(uint8_t Symbol) {
   return;
 }
 
-void EncodeShortDictionarySymbol(uint8_t Length, uint16_t BinNum, uint16_t DictionaryBins, uint16_t CodeBins) {
+void EncodeShortDictionarySymbol(uint16_t BinNum, uint16_t DictionaryBins, uint16_t CodeBins) {
   NormalizeEncoder((uint32_t)1 << 12);
   low += BinNum * (range /= DictionaryBins);
-  range = (uint32_t)CodeBins * (range << (12 - (Length)));
+  range *= (uint32_t)CodeBins;
   return;
 }
 
@@ -855,14 +847,14 @@ void EncodeLongDictionarySymbol(uint32_t BinCode, uint16_t BinNum, uint16_t Dict
     uint16_t CodeBins) {
   NormalizeEncoder((uint32_t)1 << 12);
   low += BinNum * (range /= DictionaryBins);
-  NormalizeEncoder((uint32_t)1 << (CodeLength - 12));
-  low += BinCode * (range >>= CodeLength - 12);
+  NormalizeEncoder((uint32_t)1 << CodeLength);
+  low += BinCode * (range >>= CodeLength);
   range *= (uint32_t)CodeBins;
   return;
 }
 
-void EncodeBaseSymbol(uint32_t BaseSymbol, uint8_t Bits, uint32_t NumBaseSymbols) {
-  NormalizeEncoder((uint32_t)1 << Bits);
+void EncodeBaseSymbol(uint32_t BaseSymbol, uint32_t NumBaseSymbols, uint32_t NormBaseSymbols) {
+  NormalizeEncoder(NormBaseSymbols);
   low += BaseSymbol * (range /= NumBaseSymbols);
   return;
 }
@@ -883,7 +875,7 @@ void EncodeFirstChar(uint8_t Symbol, uint8_t SymType, uint8_t LastChar) {
   }
   else {
     RangeLow = FreqFirstChar[SymType][LastChar][0];
-    FoundIndex = 1;
+    uint8_t FoundIndex = 1;
     while (SymbolFirstChar[SymType][LastChar][FoundIndex] != Symbol)
       RangeLow += FreqFirstChar[SymType][LastChar][FoundIndex++];
     low += RangeLow * (range /= RangeScaleFirstChar[SymType][LastChar]);
@@ -924,7 +916,7 @@ void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar) {
         }
         else {
           RangeLow = FreqFirstCharBinary[LastChar][0];
-          FoundIndex = 1;
+          uint8_t FoundIndex = 1;
           while (FoundIndex != Symbol)
             RangeLow += FreqFirstCharBinary[LastChar][FoundIndex++];
           low += RangeLow * (range /= RangeScaleFirstChar[0][LastChar]);
@@ -934,7 +926,7 @@ void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar) {
       }
       else {
         RangeLow = RangeScaleFirstCharSection[LastChar][0];
-        FoundIndex = 0x20;
+        uint8_t FoundIndex = 0x20;
         while (FoundIndex != Symbol)
           RangeLow += FreqFirstCharBinary[LastChar][FoundIndex++];
         low += RangeLow * (range /= RangeScaleFirstChar[0][LastChar]);
@@ -946,7 +938,7 @@ void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar) {
       RangeLow = RangeScaleFirstCharSection[LastChar][1];
       if (RangeScaleFirstCharSection[LastChar][2] > count) {
         RangeScaleFirstCharSection[LastChar][2] += UP_FREQ_FIRST_CHAR;
-        FoundIndex = 0x40;
+        uint8_t FoundIndex = 0x40;
         while (FoundIndex != Symbol)
           RangeLow += FreqFirstCharBinary[LastChar][FoundIndex++];
         low += RangeLow * (range /= RangeScaleFirstChar[0][LastChar]);
@@ -955,7 +947,7 @@ void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar) {
       }
       else {
         RangeLow += RangeScaleFirstCharSection[LastChar][2];
-        FoundIndex = 0x60;
+        uint8_t FoundIndex = 0x60;
         while (FoundIndex != Symbol)
           RangeLow += FreqFirstCharBinary[LastChar][FoundIndex++];
         low += RangeLow * (range /= RangeScaleFirstChar[0][LastChar]);
@@ -970,7 +962,7 @@ void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar) {
       RangeScaleFirstCharSection[LastChar][5] += UP_FREQ_FIRST_CHAR;
       if (RangeScaleFirstCharSection[LastChar][4] > count) {
         RangeScaleFirstCharSection[LastChar][4] += UP_FREQ_FIRST_CHAR;
-        FoundIndex = 0x80;
+        uint8_t FoundIndex = 0x80;
         while (FoundIndex != Symbol)
           RangeLow += FreqFirstCharBinary[LastChar][FoundIndex++];
         low += RangeLow * (range /= RangeScaleFirstChar[0][LastChar]);
@@ -979,7 +971,7 @@ void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar) {
       }
       else {
         RangeLow += RangeScaleFirstCharSection[LastChar][4];
-        FoundIndex = 0xA0;
+        uint8_t FoundIndex = 0xA0;
         while (FoundIndex != Symbol)
           RangeLow += FreqFirstCharBinary[LastChar][FoundIndex++];
         low += RangeLow * (range /= RangeScaleFirstChar[0][LastChar]);
@@ -991,7 +983,7 @@ void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar) {
       RangeLow += RangeScaleFirstCharSection[LastChar][5];
       if (RangeScaleFirstCharSection[LastChar][6] > count) {
         RangeScaleFirstCharSection[LastChar][6] += UP_FREQ_FIRST_CHAR;
-        FoundIndex = 0xC0;
+        uint8_t FoundIndex = 0xC0;
         while (FoundIndex != Symbol)
           RangeLow += FreqFirstCharBinary[LastChar][FoundIndex++];
         low += RangeLow * (range /= RangeScaleFirstChar[0][LastChar]);
@@ -1000,7 +992,7 @@ void EncodeFirstCharBinary(uint8_t Symbol, uint8_t LastChar) {
       }
       else {
         RangeLow += RangeScaleFirstCharSection[LastChar][6];
-        FoundIndex = 0xE0;
+        uint8_t FoundIndex = 0xE0;
         while (FoundIndex != Symbol)
           RangeLow += FreqFirstCharBinary[LastChar][FoundIndex++];
         low += RangeLow * (range /= RangeScaleFirstChar[0][LastChar]);
@@ -1046,22 +1038,21 @@ void InitEncoder(uint8_t max_regular_code_length, uint8_t num_inst_codes, uint8_
 }
 
 void FinishEncoder() {
-  while (low ^ (low + range)) {
+  while (low != 0) {
     OutBuffer[OutCharNum++] = (uint8_t)(low >> 24);
+    low <<= 8;
+  }
+}
+
+void NormalizeDecoder(uint32_t bot) {
+  while ((low ^ (low + range)) < TOP || (range < (bot) && ((range = -low & ((bot) - 1)), 1))) {
+    code = (code << 8) | InBuffer[InCharNum++];
     low <<= 8;
     range <<= 8;
   }
 }
 
-#define NormalizeDecoder(bot) {                                                                  \
-  while ((low ^ (low + range)) < TOP || (range < (bot) && ((range = -low & ((bot) - 1)), 1))) {  \
-    code = (code << 8) | InBuffer[InCharNum++];                                                  \
-    low <<= 8;                                                                                   \
-    range <<= 8;                                                                                 \
-  }                                                                                              \
-}
-
-void DecodeSymTypeStart(uint8_t Context) {
+void DecodeSymTypeStart() {
   NormalizeDecoder(FREQ_SYM_TYPE_BOT);
   extra_range = range & (FREQ_SYM_TYPE_BOT - 1);
   count = (code - low) / (range >>= 14);
@@ -1162,7 +1153,7 @@ uint8_t DecodeMtfQueueNumCheck0(uint8_t Context) {
     return(0);
 }
 
-void DecodeMtfQueueNumFinish0(uint8_t Context) {
+void DecodeMtfQueueNumFinish0() {
   range *= RangeHigh;
   return;
 }
@@ -1406,28 +1397,28 @@ uint8_t DecodeWordTag() {
   return(Tag);
 }
 
-uint16_t DecodeDictionaryBin(uint8_t FirstChar, uint8_t * lookup_bits, uint8_t * CodeLengthPtr, uint16_t DictionaryBins,
-    uint8_t bin_extra_bits) {
+uint16_t DecodeDictionaryBin(uint8_t * lookup_bits, uint8_t * CodeLengthPtr, uint16_t DictionaryBins,
+    uint8_t bin_code_length) {
   uint16_t BinNum;
   NormalizeDecoder((uint32_t)1 << 12);
   *CodeLengthPtr = lookup_bits[BinNum = (code - low) / (range /= DictionaryBins)];
-  int8_t BitsUnderBinSize = bin_extra_bits - *CodeLengthPtr;
-  if (BitsUnderBinSize > 0)
-    low += (range <<= BitsUnderBinSize) * (BinNum >> BitsUnderBinSize);
-  else
-    low += range * BinNum;
+  low += range * BinNum;
   return(BinNum);
 }
 
 uint32_t DecodeBinCode(uint8_t Bits) {
   NormalizeDecoder((uint32_t)1 << Bits);
   uint32_t BinCode = (code - low) / (range >>= Bits);
+  low += BinCode * range;
   return(BinCode);
 }
 
-uint32_t DecodeBaseSymbol(uint8_t Bits, uint32_t NumBaseSymbols) {
-  NormalizeDecoder((uint32_t)1 << Bits);
-  range /= NumBaseSymbols;
+uint32_t DecodeBaseSymbol(uint32_t NumBaseSymbols, uint8_t cap_encoded) {
+  NormalizeDecoder(NumBaseSymbols);
+  if (cap_encoded == 0)
+    range /= NumBaseSymbols;
+  else
+    range /= (NumBaseSymbols - 24);
   uint32_t BaseSymbol;
   low += range * (BaseSymbol = (code - low) / range);
   return(BaseSymbol);
@@ -1465,7 +1456,7 @@ uint8_t DecodeFirstChar(uint8_t SymType, uint8_t LastChar) {
       *FreqPtr += UP_FREQ_FIRST_CHAR;
       RangeScaleFirstChar[SymType][LastChar] += UP_FREQ_FIRST_CHAR;
     }
-    FoundIndex = FreqPtr - &FreqFirstChar[SymType][LastChar][0];
+    uint8_t FoundIndex = FreqPtr - &FreqFirstChar[SymType][LastChar][0];
     FirstChar = SymbolFirstChar[SymType][LastChar][FoundIndex];
     if (*FreqPtr > *(FreqPtr - 1)) {
       uint16_t SavedFreq = *FreqPtr;

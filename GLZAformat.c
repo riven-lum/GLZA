@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright 2014-2016 Kennon Conrad
+Copyright 2014-2017 Kennon Conrad
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,19 +22,13 @@ limitations under the License.
 //     'B' followed by a series of lower case letters when text detected.
 //   For non-text files, checks order 1 entropy of standard coding vs. delta coding for strides
 //   1 - 100 (global).  Delta transforms data when appropriate.
-//
-// Usage:
-//   GLZAformat [-c#] [-d#] [-l#] <infilename> <outfilename>, where
-//       -c0 disables capital encoding
-//       -c1 forces text processing and capital encoding
-//       -d0 disables delta encoding
-//       -l0 disables capital lock encoding
 
 
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include "GLZA.h"
 
 void clear_counts(uint32_t symbol_counts[0x100], uint32_t order_1_counts[0x100][0x100]) {
   uint8_t i = 0xFF;
@@ -70,9 +64,9 @@ double calculate_order_1_entropy(uint32_t symbol_counts[0x100], uint32_t order_1
 }
 
 
-uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t ** outbuf) {
+uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t ** outbuf, struct param_data * params) {
   const uint32_t CHARS_TO_WRITE = 0x40000;
-  uint8_t this_char, prev_char, next_char, user_cap_encoded, user_cap_lock_encoded, user_delta_encoded, stride;
+  uint8_t this_char, prev_char, next_char, cap_encoded, cap_lock_disabled, delta_disabled, stride;
   uint8_t *in_char_ptr, *end_char_ptr, *out_char_ptr;
   uint32_t i, j, k;
   uint32_t num_AZ, num_az_pre_AZ, num_az_post_AZ, num_spaces;
@@ -82,10 +76,14 @@ uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t
 
   // format byte: B0: cap encoded, B3:B1 = stride (0 - 4), B5:B4 = log2 delta length (0 - 2), B6: little endian
 
-
-  user_cap_encoded = 0;
-  user_cap_lock_encoded = 0;
-  user_delta_encoded = 0;
+  cap_encoded = 0;
+  cap_lock_disabled = 0;
+  delta_disabled = 0;
+  if (params != 0) {
+    cap_encoded = params->cap_encoded;
+    cap_lock_disabled = params->cap_lock_disabled;
+    delta_disabled = params->delta_disabled;
+  }
 
   *outbuf = (uint8_t *)malloc(2 * insize + 1);
   if (*outbuf == 0)
@@ -127,8 +125,8 @@ uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t
 
   out_char_ptr = *outbuf;
 
-  if (((num_AZ && (4 * num_az_post_AZ > num_AZ) && (num_az_post_AZ > num_az_pre_AZ)
-      && (num_spaces > insize / 50)) && (user_cap_encoded != 1)) || (user_cap_encoded == 2)) {
+  if (((4 * num_az_post_AZ > num_AZ) && (num_az_post_AZ > num_az_pre_AZ) && (num_spaces > insize / 50)
+      && (cap_encoded != 2)) || (cap_encoded == 1)) {
 #ifdef PRINTON
     fprintf(stderr,"Converting textual data\n");
 #endif
@@ -136,7 +134,7 @@ uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t
     in_char_ptr = inbuf;
     while (in_char_ptr != end_char_ptr) {
       if ((*in_char_ptr >= 'A') && (*in_char_ptr <= 'Z')) {
-        if (((*(in_char_ptr + 1) >= 'A') && (*(in_char_ptr + 1) <= 'Z') && (user_cap_lock_encoded != 1))
+        if (((*(in_char_ptr + 1) >= 'A') && (*(in_char_ptr + 1) <= 'Z') && (cap_lock_disabled == 0))
             && ((*(in_char_ptr + 2) < 'a') || (*(in_char_ptr + 2) > 'z'))) {
           *out_char_ptr++ = 'B';
           *out_char_ptr++ = *in_char_ptr++ + ('a' - 'A');
@@ -151,10 +149,6 @@ uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t
           *out_char_ptr++ = *in_char_ptr++ + ('a' - 'A');
         }
       }
-      else if (*in_char_ptr >= 0xFE) {
-        *out_char_ptr++ = *in_char_ptr++;
-        *out_char_ptr++ = 0xFF;
-      }
       else if (*in_char_ptr == 0xA) {
         in_char_ptr++;
         *out_char_ptr++ = 0xA;
@@ -164,7 +158,7 @@ uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t
         *out_char_ptr++ = *in_char_ptr++;
     }
   }
-  else if ((user_delta_encoded != 1) && (insize > 4)) {
+  else if ((delta_disabled != 1) && (insize > 4)) {
     clear_counts(symbol_counts, order_1_counts);
     for (i = 0 ; i < insize - 1 ; i++) {
       symbol_counts[inbuf[i]]++;
@@ -239,15 +233,14 @@ uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t
     double min_entropy = best_stride_entropy;
 
 #ifdef PRINTON
-    if (stride)
+    if (stride != 0)
       fprintf(stderr,"Applying %u byte delta transformation\n",(unsigned int)stride);
     else
       fprintf(stderr,"Converting data\n");
 #endif
 
-    if (stride == 0) {
+    if (stride == 0)
       *out_char_ptr++ = 0;
-    }
     else if (stride == 1) {
       *out_char_ptr++ = 2;
       in_char_ptr = end_char_ptr - 1;
@@ -1074,26 +1067,14 @@ uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t
       }
 
       in_char_ptr = inbuf;
-      while (in_char_ptr != end_char_ptr) {
-        if (*in_char_ptr >= 0xFE) {
-          *out_char_ptr++ = *in_char_ptr++;
-          *out_char_ptr++ = 0xFF;
-        }
-        else
-          *out_char_ptr++ = *in_char_ptr++;
-      }
+      while (in_char_ptr != end_char_ptr)
+        *out_char_ptr++ = *in_char_ptr++;
       free(in_char2);
     }
     else {
       in_char_ptr = inbuf;
-      while (in_char_ptr != end_char_ptr) {
-        if (*in_char_ptr >= 0xFE) {
-          *out_char_ptr++ = *in_char_ptr++;
-          *out_char_ptr++ = 0xFF;
-        }
-        else
-          *out_char_ptr++ = *in_char_ptr++;
-      }
+      while (in_char_ptr != end_char_ptr)
+        *out_char_ptr++ = *in_char_ptr++;
     }
   }
   else {
@@ -1102,14 +1083,8 @@ uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t
 #endif
     *out_char_ptr++ = 0;
     in_char_ptr = inbuf;
-    while (in_char_ptr != end_char_ptr) {
-      if (*in_char_ptr >= 0xFE) {
-        *out_char_ptr++ = *in_char_ptr++;
-        *out_char_ptr++ = 0xFF;
-      }
-      else
-        *out_char_ptr++ = *in_char_ptr++;
-    }
+    while (in_char_ptr != end_char_ptr)
+      *out_char_ptr++ = *in_char_ptr++;
   }
 
   *outsize_ptr = out_char_ptr - *outbuf;
