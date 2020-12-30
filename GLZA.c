@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright 2014-2017 Kennon Conrad
+Copyright 2014-2018 Kennon Conrad
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,23 +29,21 @@ limitations under the License.
 
 void print_usage() {
   fprintf(stderr,"ERROR - Invalid format\n");
-  fprintf(stderr," Use GLZA c|d [-c#] [-d0] [-f] [-l0] [-m#] [-p#] [-r#] [-s] [-v0|1] [-w0] [-C0|1] [-D#]\n");
+  fprintf(stderr," Use GLZA c|d [-c#] [-d0] [-l0] [-m#] [-p#] [-r#] [-s] [-v0|1] [-w0] [-x] [-C0|1] [-D#]\n");
   fprintf(stderr,"   <infile> <outfile>\n");
   fprintf(stderr," where:\n");
   fprintf(stderr,"   -c#   sets the cost of a new grammar rule in bits\n");
   fprintf(stderr,"   -d0   disables delta transformation\n");
-  fprintf(stderr,"   -f    enables faster compression mode\n");
   fprintf(stderr,"   -l0   disables capital letter lock transformation\n");
   fprintf(stderr,"   -m0|1 overrides the program's decision on whether to use MTF queues\n");
   fprintf(stderr,"         -m0 disables MTF, -m1 enables MTF\n");
   fprintf(stderr,"   -p#   sets the profit power ratio.  0.0 is most compressive, larger values favor\n");
   fprintf(stderr,"         longer strings\n");
   fprintf(stderr,"   -r#   sets memory usage in millions of bytes\n");
-  fprintf(stderr,"   -s#   limits the suffix tree cycle size to s * n * average prefix length for\n");
-  fprintf(stderr,"         the first n symbols, where n is the number of symbols processed so far\n");
   fprintf(stderr,"   -t#   sets the decoder multithreading option. -t1 = 1 thread, -t2 = 2 threads\n");
   fprintf(stderr,"   -v1|2 -v1 causes the dictionary to be printed to stdout, most frequent first\n");
   fprintf(stderr,"         -v2 causes the dictionary to be printed to stdout, in the order of creation\n");
+  fprintf(stderr,"   -x    enables extreme compression mode\n");
   fprintf(stderr,"   -C0|1 overrides the program's decision on whether to capital transform\n");
   fprintf(stderr,"         -C0 disables, -C1 enables\n");
   fprintf(stderr,"   -D#   sets an upper limit for the number of grammar rules created\n");
@@ -70,9 +68,8 @@ int main(int argc, char* argv[])
   params.cap_encoded = 0;
   params.cap_lock_disabled = 0;
   params.delta_disabled = 0;
-  params.fast_mode = 0;
+  params.fast_mode = 1;
   params.print_dictionary = 0;
-  params.cycle_size_limit = 0.0;
   params.max_rules = 0x900000;
   params.use_mtf = 2;
   params.create_words = 1;
@@ -110,10 +107,6 @@ int main(int argc, char* argv[])
         params.delta_disabled = 1;
       arg_num++;
     }
-    else if (*(argv[arg_num] + 1) == 'f') {
-      params.fast_mode = 1;
-      arg_num++;
-    }
     else if (*(argv[arg_num] + 1) == 'l') {
       if (*(argv[arg_num] + 2) == '0')
         params.cap_lock_disabled = 1;
@@ -138,13 +131,6 @@ int main(int argc, char* argv[])
         exit(EXIT_FAILURE);
       }
     }
-    else if (*(argv[arg_num] + 1) == 's') {
-      params.cycle_size_limit = (double)atof(argv[arg_num++] + 2) - 1.0;
-      if (params.cycle_size_limit <= 0.0) {
-        fprintf(stderr,"ERROR: -s value must be > 1.0\n");
-        exit(EXIT_FAILURE);
-      }
-    }
     else if (*(argv[arg_num] + 1) == 't') {
       if (*(argv[arg_num++] + 2) != '2')
         params.two_threads = 0;
@@ -161,9 +147,13 @@ int main(int argc, char* argv[])
         params.create_words = 0;
       arg_num++;
     }
+    else if (*(argv[arg_num] + 1) == 'x') {
+      params.fast_mode = 0;
+      arg_num++;
+    }
     else {
-      fprintf(stderr,"ERROR - Invalid '-' format.  Only -c<value>, -d<value>, -m<value>, -p<value>,\n");
-      fprintf(stderr,"    -r<value>, -s<value>, -t<value>, -w<value> -C<value> and -D<value> allowed\n");
+      fprintf(stderr,"ERROR - Invalid '-' format.  Only -c<value>, -d<value>, -l0, -m<value>, -p<value>,\n");
+      fprintf(stderr,"    -r<value>, -t<value>, -v<value>, -w<value> -x -C<value> and -D<value> allowed\n");
       exit(EXIT_FAILURE);
     }
     if (argc < arg_num + 2) {
@@ -225,6 +215,6 @@ int main(int argc, char* argv[])
   fclose(fd_out);
   clock_gettime(CLOCK_MONOTONIC, &end_time);
   fprintf(stderr," in %.3lf seconds.\n", (float)(end_time.tv_sec * 1000000000L + end_time.tv_nsec
-      - (start_time.tv_sec * 1000000000L + start_time.tv_nsec)) / 1e9);
+      - (start_time.tv_sec * 1000000000L + start_time.tv_nsec)) * 1e-9);
   return(EXIT_SUCCESS);
 }

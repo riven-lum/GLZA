@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright 2014-2017 Kennon Conrad
+Copyright 2014-2018 Kennon Conrad
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,11 +29,10 @@ GLZAencode encodes the grammar using a variation of the Grammatical Ziv-Lempel f
 GLZAdecode decodes the data.
 
 Usage:
-   GLZA c|d [-c#] [-d#] [-f] [-l#] [-m#] [-p#] [-r#] [-t#] [-v#] [-w0] [-C#] [-D#] <infilename> <outfilename>
+   GLZA c|d [-c#] [-d#] [-l#] [-m#] [-p#] [-r#] [-t#] [-v#] [-w0] [-x] [-C#] [-D#] <infilename> <outfilename>
      where
        -c# sets the production cost (default is to estimate it)
        -d0 disables delta transformation
-       -f  enables faster compression
        -l0 disables capital letter lock transformation
        -m0 disables "selective" MTF dictionary coding
        -m1 forces "selective" MTF dictionary encoding
@@ -49,6 +48,7 @@ Usage:
        -v1 prints the dictionary to stdout, most frequent first
        -v2 prints the dicitonary to stdout, simple symbols followed by complex symbols in the order they were created
        -w0 disables the first cycle word only search
+       -f  enables extreme compression mode
        -C0 disables capital letter transformation
        -C1 forces text processing and capital encoding
        -D# sets an upper limit for the number of grammar rules created

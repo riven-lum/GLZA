@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright 2014-2017 Kennon Conrad
+Copyright 2014-2018 Kennon Conrad
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,43 +24,44 @@ limitations under the License.
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "GLZA.h"
 #include "GLZAmodel.h"
 
 const uint8_t MAX_BITS_IN_CODE = 25;
-const uint32_t UNIQUE_CHAR = 0xFFFFFFFF;
+const uint32_t UNIQUE_SYMBOL = 0xFFFFFFFF;
 const uint32_t READ_SIZE = 0x80000;
 
-uint8_t UTF8_compliant, cap_encoded, prior_is_cap, end_char, prior_end, use_mtf, use_mtfg;
+uint8_t UTF8_compliant, cap_encoded, prior_is_cap, end_char, prior_end, use_mtf, queue_offset;
 uint8_t max_code_length, max_regular_code_length, found_first_symbol, cap_symbol_defined, cap_lock_symbol_defined;
-uint8_t mtfg_queue_8_offset, mtfg_queue_16_offset, mtfg_queue_32_offset;
-uint8_t mtfg_queue_64_offset, mtfg_queue_128_offset, mtfg_queue_192_offset;
-uint8_t symbol_lengths[0x100], bin_code_length[0x100], sym_list_bits[0x100][26], mtf_queue_miss_code_length[16];
-uint8_t mtf_queue_size[16];
+uint8_t symbol_lengths[0x100], bin_code_length[0x100], sym_list_bits[0x100][26], queue_miss_code_length[16];
 uint16_t nbob[0x100][26], sum_nbob[0x100], fbob[0x100][26];
-uint32_t num_grammar_rules, num_codes, start_my_symbols, num_base_symbols;
-uint32_t mtfg_queue_symbol_7, mtfg_queue_symbol_15, mtfg_queue_symbol_31;
-uint32_t mtfg_queue_symbol_63, mtfg_queue_symbol_127, mtfg_queue_symbol_191;
-uint32_t mtf_queue[16][64], mtf_queue_started[16], mtf_queue_done[16], mtf_queue_peak[16], mtf_queue_hits[16];
-uint32_t mtfg_queue_0[8], mtfg_queue_8[8], mtfg_queue_16[0x10], mtfg_queue_32[0x20];
-uint32_t mtfg_queue_64[0x40], mtfg_queue_128[0x40], mtfg_queue_192[0x40];
-uint32_t nsob[0x100][26], *sym_list_ptrs[0x100][26], *symbol_array;
-int32_t prior_symbol;
+uint32_t prior_symbol, num_grammar_rules, num_codes, num_base_symbols, num_transmits, queue_size, queue_size_cap;
+uint32_t queue[0x1A0], nsob[0x100][26], *sym_list_ptrs[0x100][26], *symbol_array;
+
+struct transmit_symbols {
+  uint32_t symbol;
+  uint32_t distance;
+  uint32_t previous_index;
+  uint32_t hurts;
+  float score;
+} *transmits;
 
 
-// type:  bit 0: string ends 'C' or 'B' (cap symbol/cap lock symbol), bit1: string starts a-z, bit 2: non-ergodic, bit 3: in queue
-// bit 4: "word"ness determined, bit 5: "word", bit 6: >15 instance word, bit 7: >15 instance word likely to be followed by ' '
+// type:  bit 0: string ends 'C' or 'B' (cap symbol/cap lock symbol), bit 1: string starts a-z, bit 2: non-ergodic,
+//        bit 3: in queue, bit 4: "word" ending determined, bit 7: sent MTF
+// bits 6-5: 0: not a word, 1: word, 2: word & >= 15 repeats (ending sub)symbol,
+//           3: word & >= 15 repeats (ending sub)symbol & likely followed by ' '
 
 struct symbol_data {
   uint8_t starts, ends, code_length, type;
-  uint32_t count, inst_found, array_index, mtfg_hits, hit_score, define_symbol_start_index;
+  uint32_t count, hits, array_index, define_symbol_start_index, previous;
   int32_t space_score;
 } *sd;
 
 
 void print_string(uint32_t symbol_number) {
-  uint32_t *symbol_ptr, *next_symbol_ptr;
-  if (symbol_number < start_my_symbols) {
+  if (symbol_number < num_base_symbols) {
     if (UTF8_compliant != 0) {
       if (symbol_number < START_UTF8_2BYTE_SYMBOLS)
         printf("%c",(unsigned char)symbol_number);
@@ -84,8 +85,9 @@ void print_string(uint32_t symbol_number) {
       printf("%c",(unsigned char)symbol_number);
   }
   else {
+    uint32_t *symbol_ptr, *next_symbol_ptr;
     symbol_ptr = symbol_array + sd[symbol_number].define_symbol_start_index;
-    next_symbol_ptr = symbol_array + sd[symbol_number+1].define_symbol_start_index - 1;
+    next_symbol_ptr = symbol_array + sd[symbol_number + 1].define_symbol_start_index - 1;
     while (symbol_ptr != next_symbol_ptr)
       print_string(*symbol_ptr++);
   }
@@ -93,48 +95,40 @@ void print_string(uint32_t symbol_number) {
 }
 
 
-void print_string2(uint32_t symbol_number) {
-  uint32_t *symbol_ptr, *next_symbol_ptr;
-  if (symbol_number < start_my_symbols) {
+uint32_t get_dictionary_size(uint32_t symbol_number) {
+  uint32_t symbol_size = 0;
+  if (symbol_number < num_base_symbols) {
     if (UTF8_compliant != 0) {
       if (symbol_number < START_UTF8_2BYTE_SYMBOLS)
-        fprintf(stderr,"%c",(unsigned char)symbol_number);
-      else if (symbol_number < START_UTF8_3BYTE_SYMBOLS) {
-        fprintf(stderr,"%c",(unsigned char)(symbol_number >> 6) + 0xC0);
-        fprintf(stderr,"%c",(unsigned char)(symbol_number & 0x3F) + 0x80);
-      }
-      else if (symbol_number < START_UTF8_4BYTE_SYMBOLS) {
-        fprintf(stderr,"%c",(unsigned char)(symbol_number >> 12) + 0xE0);
-        fprintf(stderr,"%c",(unsigned char)((symbol_number >> 6) & 0x3F) + 0x80);
-        fprintf(stderr,"%c",(unsigned char)(symbol_number & 0x3F) + 0x80);
-      }
-      else {
-        fprintf(stderr,"%c",(unsigned char)(symbol_number >> 18) + 0xF0);
-        fprintf(stderr,"%c",(unsigned char)((symbol_number >> 12) & 0x3F) + 0x80);
-        fprintf(stderr,"%c",(unsigned char)((symbol_number >> 6) & 0x3F) + 0x80);
-        fprintf(stderr,"%c",(unsigned char)(symbol_number & 0x3F) + 0x80);
-      }
+        symbol_size = 1;
+      else if (symbol_number < START_UTF8_3BYTE_SYMBOLS)
+        symbol_size = 2;
+      else if (symbol_number < START_UTF8_4BYTE_SYMBOLS)
+        symbol_size = 3;
+      else
+        symbol_size = 4;
     }
     else
-      fprintf(stderr,"%c",(unsigned char)symbol_number);
+      symbol_size = 1;
   }
   else {
+    uint32_t *symbol_ptr, *next_symbol_ptr;
     symbol_ptr = symbol_array + sd[symbol_number].define_symbol_start_index;
-    next_symbol_ptr = symbol_array + sd[symbol_number+1].define_symbol_start_index - 1;
+    next_symbol_ptr = symbol_array + sd[symbol_number + 1].define_symbol_start_index - 1;
     while (symbol_ptr != next_symbol_ptr)
-      print_string2(*symbol_ptr++);
+      symbol_size += get_dictionary_size(*symbol_ptr++);
   }
-  return;
+  return(symbol_size);
 }
 
 
 void get_symbol_category(uint32_t symbol_number, uint8_t *sym_type_ptr) {
-  if (symbol_number >= start_my_symbols) {
-    if (sd[symbol_number].type & 0x20) {
+  if (symbol_number >= num_base_symbols) {
+    if ((sd[symbol_number].type & 0x20) != 0) {
       *sym_type_ptr |= 0x30;
       return;
     }
-    uint32_t * string_ptr = symbol_array + sd[symbol_number+1].define_symbol_start_index - 2;
+    uint32_t * string_ptr = symbol_array + sd[symbol_number + 1].define_symbol_start_index - 2;
     get_symbol_category(*string_ptr, sym_type_ptr);
     while (((*sym_type_ptr & 0x10) == 0) && (string_ptr != symbol_array + sd[symbol_number].define_symbol_start_index))
       get_symbol_category(*--string_ptr, sym_type_ptr);
@@ -150,7 +144,7 @@ void get_symbol_category(uint32_t symbol_number, uint8_t *sym_type_ptr) {
 uint8_t find_first(uint32_t symbol_number) {
   uint8_t first_char;
   uint32_t first_symbol = symbol_array[sd[symbol_number].define_symbol_start_index];
-  if (first_symbol >= start_my_symbols) {
+  if (first_symbol >= num_base_symbols) {
     if ((first_char = sd[first_symbol].starts) == 0) {
       first_char = find_first(first_symbol);
       sd[first_symbol].starts = first_char;
@@ -164,7 +158,7 @@ uint8_t find_first(uint32_t symbol_number) {
 uint8_t find_first_UTF8(uint32_t symbol_number) {
   uint8_t first_char;
   uint32_t first_symbol = symbol_array[sd[symbol_number].define_symbol_start_index];
-  if (first_symbol >= start_my_symbols) {
+  if (first_symbol >= num_base_symbols) {
     if ((first_char = sd[first_symbol].starts) == 0) {
       first_char = find_first_UTF8(first_symbol);
       sd[first_symbol].starts = first_char;
@@ -214,8 +208,8 @@ uint8_t find_first_UTF8(uint32_t symbol_number) {
 
 uint8_t find_last(uint32_t symbol_number) {
   uint8_t last_char;
-  uint32_t last_symbol = symbol_array[sd[symbol_number+1].define_symbol_start_index - 2];
-  if (last_symbol >= start_my_symbols) {
+  uint32_t last_symbol = symbol_array[sd[symbol_number + 1].define_symbol_start_index - 2];
+  if (last_symbol >= num_base_symbols) {
     if ((last_char = sd[last_symbol].ends) == 0) {
       last_char = find_last(last_symbol);
       sd[last_symbol].ends = last_char;
@@ -230,8 +224,8 @@ uint8_t find_last(uint32_t symbol_number) {
 
 uint8_t find_last_UTF8(uint32_t symbol_number) {
   uint8_t last_char;
-  uint32_t last_symbol = symbol_array[sd[symbol_number+1].define_symbol_start_index - 2];
-  if (last_symbol >= start_my_symbols) {
+  uint32_t last_symbol = symbol_array[sd[symbol_number + 1].define_symbol_start_index - 2];
+  if (last_symbol >= num_base_symbols) {
     if ((last_char = sd[last_symbol].ends) == 0) {
       last_char = find_last_UTF8(last_symbol);
       sd[last_symbol].ends = last_char;
@@ -287,7 +281,7 @@ uint8_t add_dictionary_symbol(uint32_t symbol, uint8_t bits) {
     sym_list_bits[first_char][bits]++;
     if (0 == (sym_list_ptrs[first_char][bits]
         = (uint32_t *)realloc(sym_list_ptrs[first_char][bits], sizeof(uint32_t) * (1 << sym_list_bits[first_char][bits])))) {
-      fprintf(stderr,"FATAL ERROR - symbol list realloc failure\n");
+      fprintf(stderr, "FATAL ERROR - symbol list realloc failure\n");
       return(0);
     }
   }
@@ -355,1089 +349,203 @@ uint8_t add_dictionary_symbol(uint32_t symbol, uint8_t bits) {
 
 void remove_dictionary_symbol(uint32_t symbol, uint8_t bits) {
   uint8_t first_char = sd[symbol].starts;
-  uint32_t * sym_list_ptr = &sym_list_ptrs[first_char][bits][--nsob[first_char][bits]];
-  sym_list_ptrs[first_char][bits][sd[symbol].array_index] = *sym_list_ptr;
-  sd[*sym_list_ptr].array_index = sd[symbol].array_index;
+  uint32_t last_symbol = sym_list_ptrs[first_char][bits][--nsob[first_char][bits]];
+  sym_list_ptrs[first_char][bits][sd[symbol].array_index] = last_symbol;
+  sd[last_symbol].array_index = sd[symbol].array_index;
   return;
 }
 
 
-void remove_mtfg_queue_symbol_16(uint8_t mtfg_queue_position) {
-  while (mtfg_queue_position != 31) {
-    *(mtfg_queue_16 + ((mtfg_queue_16_offset + mtfg_queue_position) & 0xF))
-        = *(mtfg_queue_16 + ((mtfg_queue_16_offset + mtfg_queue_position + 1) & 0xF));
-    mtfg_queue_position++;
+void add_symbol_to_queue(uint32_t symbol_number) {
+  sd[symbol_number].type |= 0x88;
+  *(queue + --queue_offset) = symbol_number;
+  if ((sd[symbol_number].type & 2) != 0)
+    queue_size_cap++;
+  queue_size++;
+  return;
+}
+
+
+void update_queue(uint32_t symbol_number, uint8_t in_definition) {
+  uint8_t queue_position = 0;
+  while (symbol_number != *(queue + (uint8_t)(queue_position + queue_offset)))
+    queue_position++;
+  EncodeMtfType(2 * in_definition);
+  EncodeMtfPos(NOT_CAP, queue_position, queue_size);
+  while (queue_position != 0) {
+    *(queue + (uint8_t)(queue_offset + queue_position))
+        = *(queue + (uint8_t)(queue_offset + queue_position - 1));
+    queue_position--;
   }
-  *(mtfg_queue_16 + ((mtfg_queue_16_offset - 1) & 0xF)) = *(mtfg_queue_32 + mtfg_queue_32_offset);
-  *(mtfg_queue_32 + mtfg_queue_32_offset) = *(mtfg_queue_64 + mtfg_queue_64_offset);
-  mtfg_queue_32_offset = (mtfg_queue_32_offset + 1) & 0x1F;
-  *(mtfg_queue_64 + mtfg_queue_64_offset) = *(mtfg_queue_128 + mtfg_queue_128_offset);
-  mtfg_queue_64_offset = (mtfg_queue_64_offset + 1) & 0x3F;
-  *(mtfg_queue_128 + mtfg_queue_128_offset) = *(mtfg_queue_192 + mtfg_queue_192_offset);
-  mtfg_queue_128_offset = (mtfg_queue_128_offset + 1) & 0x3F;
-  *(mtfg_queue_192 + mtfg_queue_192_offset) = num_codes;
-  mtfg_queue_192_offset = (mtfg_queue_192_offset + 1) & 0x3F;
-  return;
-}
-
-
-void remove_mtfg_queue_symbol_32(uint8_t mtfg_queue_position) {
-  while (mtfg_queue_position != 63) {
-    *(mtfg_queue_32 + ((mtfg_queue_32_offset + mtfg_queue_position) & 0x1F))
-        = *(mtfg_queue_32 + ((mtfg_queue_32_offset + mtfg_queue_position + 1) & 0x1F));
-    mtfg_queue_position++;
+  if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+    EncodeGoMtf(sd[symbol_number].count, 1, 1);
+    *(queue + queue_offset) = symbol_number;
   }
-  *(mtfg_queue_32 + ((mtfg_queue_32_offset - 1) & 0x1F)) = *(mtfg_queue_64 + mtfg_queue_64_offset);
-  *(mtfg_queue_64 + mtfg_queue_64_offset) = *(mtfg_queue_128 + mtfg_queue_128_offset);
-  mtfg_queue_64_offset = (mtfg_queue_64_offset + 1) & 0x3F;
-  *(mtfg_queue_128 + mtfg_queue_128_offset) = *(mtfg_queue_192 + mtfg_queue_192_offset);
-  mtfg_queue_128_offset = (mtfg_queue_128_offset + 1) & 0x3F;
-  *(mtfg_queue_192 + mtfg_queue_192_offset) = num_codes;
-  mtfg_queue_192_offset = (mtfg_queue_192_offset + 1) & 0x3F;
-  return;
-}
-
-
-void remove_mtfg_queue_symbol_64(uint8_t mtfg_queue_position) {
-  while (mtfg_queue_position != 127) {
-    *(mtfg_queue_64 + ((mtfg_queue_64_offset + mtfg_queue_position) & 0x3F))
-        = *(mtfg_queue_64 + ((mtfg_queue_64_offset + mtfg_queue_position + 1) & 0x3F));
-    mtfg_queue_position++;
-  }
-  *(mtfg_queue_64 + ((mtfg_queue_64_offset - 1) & 0x3F)) = *(mtfg_queue_128 + mtfg_queue_128_offset);
-  *(mtfg_queue_128 + mtfg_queue_128_offset) = *(mtfg_queue_192 + mtfg_queue_192_offset);
-  mtfg_queue_128_offset = (mtfg_queue_128_offset + 1) & 0x3F;
-  *(mtfg_queue_192 + mtfg_queue_192_offset) = num_codes;
-  mtfg_queue_192_offset = (mtfg_queue_192_offset + 1) & 0x3F;
-  return;
-}
-
-
-void remove_mtfg_queue_symbol_128(uint8_t mtfg_queue_position) {
-  while (mtfg_queue_position != 191) {
-    *(mtfg_queue_128 + ((mtfg_queue_128_offset + mtfg_queue_position) & 0x3F))
-        = *(mtfg_queue_128 + ((mtfg_queue_128_offset + mtfg_queue_position + 1) & 0x3F));
-    mtfg_queue_position++;
-  }
-  *(mtfg_queue_128 + ((mtfg_queue_128_offset - 1) & 0x3F)) = *(mtfg_queue_192 + mtfg_queue_192_offset);
-  *(mtfg_queue_192 + mtfg_queue_192_offset) = num_codes;
-  mtfg_queue_192_offset = (mtfg_queue_192_offset + 1) & 0x3F;
-  return;
-}
-
-
-void remove_mtfg_queue_symbol_192(uint8_t mtfg_queue_position) {
-  while (mtfg_queue_position != 255) {
-    *(mtfg_queue_192 + ((mtfg_queue_192_offset + mtfg_queue_position) & 0x3F))
-        = *(mtfg_queue_192 + ((mtfg_queue_192_offset + mtfg_queue_position + 1) & 0x3F));
-    mtfg_queue_position++;
-  }
-  *(mtfg_queue_192 + ((mtfg_queue_192_offset - 1) & 0x3F)) = num_codes;
-  return;
-}
-
-
-void increment_mtfg_queue_0(uint32_t symbol_number) {
-  mtfg_queue_symbol_7 = mtfg_queue_0[7];
-  mtfg_queue_0[7] = mtfg_queue_0[6];
-  mtfg_queue_0[6] = mtfg_queue_0[5];
-  mtfg_queue_0[5] = mtfg_queue_0[4];
-  mtfg_queue_0[4] = mtfg_queue_0[3];
-  mtfg_queue_0[3] = mtfg_queue_0[2];
-  mtfg_queue_0[2] = mtfg_queue_0[1];
-  mtfg_queue_0[1] = mtfg_queue_0[0];
-  mtfg_queue_0[0] = symbol_number;
-  return;
-}
-
-
-void increment_mtfg_queue_8() {
-  mtfg_queue_8_offset = (mtfg_queue_8_offset - 1) & 7;
-  mtfg_queue_symbol_15 = *(mtfg_queue_8 + mtfg_queue_8_offset);
-  *(mtfg_queue_8 + mtfg_queue_8_offset) = mtfg_queue_symbol_7;
-  return;
-}
-
-
-void increment_mtfg_queue_16() {
-  mtfg_queue_16_offset = (mtfg_queue_16_offset - 1) & 0xF;
-  mtfg_queue_symbol_31 = *(mtfg_queue_16 + mtfg_queue_16_offset);
-  *(mtfg_queue_16 + mtfg_queue_16_offset) = mtfg_queue_symbol_15;
-  return;
-}
-
-
-void increment_mtfg_queue_32() {
-  mtfg_queue_32_offset = (mtfg_queue_32_offset - 1) & 0x1F;
-  mtfg_queue_symbol_63 = *(mtfg_queue_32 + mtfg_queue_32_offset);
-  *(mtfg_queue_32 + mtfg_queue_32_offset) = mtfg_queue_symbol_31;
-  return;
-}
-
-
-void increment_mtfg_queue_64() {
-  mtfg_queue_64_offset = (mtfg_queue_64_offset - 1) & 0x3F;
-  mtfg_queue_symbol_127 = *(mtfg_queue_64 + mtfg_queue_64_offset);
-  *(mtfg_queue_64 + mtfg_queue_64_offset) = mtfg_queue_symbol_63;
-  return;
-}
-
-
-void increment_mtfg_queue_128() {
-  mtfg_queue_128_offset = (mtfg_queue_128_offset - 1) & 0x3F;
-  mtfg_queue_symbol_191 = *(mtfg_queue_128 + mtfg_queue_128_offset);
-  *(mtfg_queue_128 + mtfg_queue_128_offset) = mtfg_queue_symbol_127;
-  return;
-}
-
-
-void increment_mtfg_queue_192_1() {
-  mtfg_queue_192_offset = (mtfg_queue_192_offset - 1) & 0x3F;
-  sd[*(mtfg_queue_192 + mtfg_queue_192_offset)].type &= 0xF7;
-  *(mtfg_queue_192 + mtfg_queue_192_offset) = mtfg_queue_symbol_191;
-  return;
-}
-
-
-void increment_mtfg_queue_192() {
-  mtfg_queue_192_offset = (mtfg_queue_192_offset - 1) & 0x3F;
-if (*(mtfg_queue_192 + mtfg_queue_192_offset) != num_codes) {
- sd[*(mtfg_queue_192 + mtfg_queue_192_offset)].type &= 0xF7;
- add_dictionary_symbol(*(mtfg_queue_192 + mtfg_queue_192_offset),sd[*(mtfg_queue_192 + mtfg_queue_192_offset)].code_length);
-}
-  *(mtfg_queue_192 + mtfg_queue_192_offset) = mtfg_queue_symbol_191;
-  return;
-}
-
-
-void add_symbol_to_mtfg_queue1(uint32_t symbol_number) {
-  sd[symbol_number].type |= 8;
-  increment_mtfg_queue_0(symbol_number);
-  increment_mtfg_queue_8();
-  if (sd[mtfg_queue_symbol_15].code_length > 12) {
-    increment_mtfg_queue_16();
-    if (sd[mtfg_queue_symbol_31].code_length != 13) {
-      increment_mtfg_queue_32();
-      if (sd[mtfg_queue_symbol_63].code_length != 14) {
-        increment_mtfg_queue_64();
-        if (sd[mtfg_queue_symbol_127].code_length != 15) {
-          increment_mtfg_queue_128();
-          if (sd[mtfg_queue_symbol_191].code_length != 16)
-            increment_mtfg_queue_192_1();
-          else if (mtfg_queue_symbol_191 != num_codes)
-            sd[mtfg_queue_symbol_191].type &= 0xF7;
-        }
-        else if (mtfg_queue_symbol_127 != num_codes)
-          sd[mtfg_queue_symbol_127].type &= 0xF7;
-      }
-      else if (mtfg_queue_symbol_63 != num_codes)
-        sd[mtfg_queue_symbol_63].type &= 0xF7;
-    }
-    else if (mtfg_queue_symbol_31 != num_codes)
-      sd[mtfg_queue_symbol_31].type &= 0xF7;
-  } 
-  else if (mtfg_queue_symbol_15 != num_codes)
-    sd[mtfg_queue_symbol_15].type &= 0xF7;
-  return;
-}
-
-
-void add_symbol_to_mtfg_queue(uint32_t symbol_number) {
-  sd[symbol_number].type |= 8;
-  increment_mtfg_queue_0(symbol_number);
-  increment_mtfg_queue_8();
-  if (sd[mtfg_queue_symbol_15].code_length > 12) {
-    increment_mtfg_queue_16();
-    if (sd[mtfg_queue_symbol_31].code_length != 13) {
-      increment_mtfg_queue_32();
-      if (sd[mtfg_queue_symbol_63].code_length != 14) {
-        increment_mtfg_queue_64();
-        if (sd[mtfg_queue_symbol_127].code_length != 15) {
-          increment_mtfg_queue_128();
-          if (sd[mtfg_queue_symbol_191].code_length != 16)
-            increment_mtfg_queue_192();
-          else if (mtfg_queue_symbol_191 != num_codes) {
-            sd[mtfg_queue_symbol_191].type &= 0xF7;
-            add_dictionary_symbol(mtfg_queue_symbol_191,sd[mtfg_queue_symbol_191].code_length);
-          }
-        }
-        else if (mtfg_queue_symbol_127 != num_codes) {
-          sd[mtfg_queue_symbol_127].type &= 0xF7;
-          add_dictionary_symbol(mtfg_queue_symbol_127,sd[mtfg_queue_symbol_127].code_length);
-        }
-      }
-      else if (mtfg_queue_symbol_63 != num_codes) {
-        sd[mtfg_queue_symbol_63].type &= 0xF7;
-        add_dictionary_symbol(mtfg_queue_symbol_63,sd[mtfg_queue_symbol_63].code_length);
-      }
-    }
-    else if (mtfg_queue_symbol_31 != num_codes) {
-      sd[mtfg_queue_symbol_31].type &= 0xF7;
-      add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-    }
-  } 
-  else if (mtfg_queue_symbol_15 != num_codes) {
-    sd[mtfg_queue_symbol_15].type &= 0xF7;
-    add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-  }
-  return;
-}
-
-
-void manage_mtfg_queue1(uint32_t symbol_number) {
-  uint8_t mtfg_queue_position;
-  uint32_t subqueue_position;
-  mtfg_queue_position = 0;
-  do {
-    if (symbol_number == mtfg_queue_0[mtfg_queue_position]) {
-      sd[symbol_number].hit_score += 61 - 3 * mtfg_queue_position;
-      while (mtfg_queue_position) {
-        mtfg_queue_0[mtfg_queue_position] = mtfg_queue_0[mtfg_queue_position-1];
-        mtfg_queue_position--;
-      }
-      mtfg_queue_0[0] = symbol_number;
-      break;
-    }
-  } while (++mtfg_queue_position != 5);
-  if (mtfg_queue_position == 5) {
-    do {
-      if (symbol_number == mtfg_queue_0[mtfg_queue_position]) {
-        sd[symbol_number].hit_score += 56 - 2 * mtfg_queue_position;
-        while (mtfg_queue_position != 5) {
-          mtfg_queue_0[mtfg_queue_position] = mtfg_queue_0[mtfg_queue_position-1];
-          mtfg_queue_position--;
-        }
-        mtfg_queue_0[5] = mtfg_queue_0[4];
-        mtfg_queue_0[4] = mtfg_queue_0[3];
-        mtfg_queue_0[3] = mtfg_queue_0[2];
-        mtfg_queue_0[2] = mtfg_queue_0[1];
-        mtfg_queue_0[1] = mtfg_queue_0[0];
-        mtfg_queue_0[0] = symbol_number;
-        break;
-      }
-    } while (++mtfg_queue_position != 8);
-    if (mtfg_queue_position == 8) {
-      increment_mtfg_queue_0(symbol_number);
-      do {
-        if (symbol_number == *(mtfg_queue_8 + ((mtfg_queue_position + mtfg_queue_8_offset) & 7))) {
-          sd[symbol_number].hit_score += 48 - mtfg_queue_position;
-          subqueue_position = mtfg_queue_position - 8;
-          while (subqueue_position) {
-            *(mtfg_queue_8 + ((mtfg_queue_8_offset + subqueue_position) & 7))
-                = *(mtfg_queue_8 + ((mtfg_queue_8_offset + subqueue_position - 1) & 7));
-            subqueue_position--;
-          }
-          *(mtfg_queue_8 + mtfg_queue_8_offset) = mtfg_queue_symbol_7;
-          break;
-        }
-      } while (++mtfg_queue_position != 16);
-      if (mtfg_queue_position == 16) {
-        increment_mtfg_queue_8();
-        do {
-          if (symbol_number == *(mtfg_queue_16 + ((mtfg_queue_position + mtfg_queue_16_offset) & 0xF))) {
-            sd[symbol_number].hit_score += 40 - (mtfg_queue_position >> 1);
-            if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-              sd[mtfg_queue_symbol_15].type &= 0xF7;
-              remove_mtfg_queue_symbol_16(mtfg_queue_position);
-            }
-            else {
-              subqueue_position = mtfg_queue_position - 16;
-              while (subqueue_position) {
-                *(mtfg_queue_16 + ((mtfg_queue_16_offset + subqueue_position) & 0xF))
-                    = *(mtfg_queue_16 + ((mtfg_queue_16_offset + subqueue_position - 1) & 0xF));
-                subqueue_position--;
-              }
-              *(mtfg_queue_16 + mtfg_queue_16_offset) = mtfg_queue_symbol_15;
-            }
-            break;
-          }
-        } while (++mtfg_queue_position != 32);
-        if (mtfg_queue_position == 32) {
-          do {
-            if (symbol_number == *(mtfg_queue_32 + ((mtfg_queue_position + mtfg_queue_32_offset) & 0x1F))) {
-              sd[symbol_number].hit_score += 28 - (mtfg_queue_position >> 3);
-              if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                sd[mtfg_queue_symbol_15].type &= 0xF7;
-                remove_mtfg_queue_symbol_32(mtfg_queue_position);
-              }
-              else {
-                increment_mtfg_queue_16();
-                if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                  sd[mtfg_queue_symbol_31].type &= 0xF7;
-                  remove_mtfg_queue_symbol_32(mtfg_queue_position);
-                }
-                else {
-                  subqueue_position = mtfg_queue_position - 32;
-                  while (subqueue_position) {
-                    *(mtfg_queue_32 + ((mtfg_queue_32_offset + subqueue_position) & 0x1F))
-                        = *(mtfg_queue_32 + ((mtfg_queue_32_offset + subqueue_position - 1) & 0x1F));
-                    subqueue_position--;
-                  }
-                  *(mtfg_queue_32 + mtfg_queue_32_offset) = mtfg_queue_symbol_31;
-                }
-              }
-              break;
-            }
-          } while (++mtfg_queue_position != 64);
-          if (mtfg_queue_position == 64) {
-            do {
-              if (symbol_number == *(mtfg_queue_64 + ((mtfg_queue_position + mtfg_queue_64_offset) & 0x3F))) {
-                sd[symbol_number].hit_score += 22 - (mtfg_queue_position >> 5);
-                if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                  sd[mtfg_queue_symbol_15].type &= 0xF7;
-                  remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                }
-                else {
-                  increment_mtfg_queue_16();
-                  if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                    sd[mtfg_queue_symbol_31].type &= 0xF7;
-                    remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                  }
-                  else {
-                    increment_mtfg_queue_32();
-                    if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                      sd[mtfg_queue_symbol_63].type &= 0xF7;
-                      remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                    }
-                    else {
-                      subqueue_position = mtfg_queue_position - 64;
-                      while (subqueue_position) {
-                        *(mtfg_queue_64 + ((mtfg_queue_64_offset + subqueue_position) & 0x3F))
-                            = *(mtfg_queue_64 + ((mtfg_queue_64_offset + subqueue_position - 1) & 0x3F));
-                        subqueue_position--;
-                      }
-                      *(mtfg_queue_64 + mtfg_queue_64_offset) = mtfg_queue_symbol_63;
-                    }
-                  }
-                }
-                break;
-              }
-            } while (++mtfg_queue_position != 128);
-            if (mtfg_queue_position == 128) {
-              do {
-                if (symbol_number == *(mtfg_queue_128 + ((mtfg_queue_position + mtfg_queue_128_offset) & 0x3F))) {
-                  sd[symbol_number].hit_score += 20 - (mtfg_queue_position >> 6);
-                  if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                    sd[mtfg_queue_symbol_15].type &= 0xF7;
-                    remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                  }
-                  else {
-                    increment_mtfg_queue_16();
-                    if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                      sd[mtfg_queue_symbol_31].type &= 0xF7;
-                      remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                    }
-                    else {
-                      increment_mtfg_queue_32();
-                      if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                        sd[mtfg_queue_symbol_63].type &= 0xF7;
-                        remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                      }
-                      else {
-                        increment_mtfg_queue_64();
-                        if (sd[mtfg_queue_symbol_127].code_length == 15) {
-                          sd[mtfg_queue_symbol_127].type &= 0xF7;
-                          remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                        }
-                        else {
-                          subqueue_position = mtfg_queue_position - 128;
-                          while (subqueue_position) {
-                            *(mtfg_queue_128 + ((mtfg_queue_128_offset + subqueue_position) & 0x3F))
-                                = *(mtfg_queue_128 + ((mtfg_queue_128_offset + subqueue_position - 1) & 0x3F));
-                            subqueue_position--;
-                          }
-                          *(mtfg_queue_128 + mtfg_queue_128_offset) = mtfg_queue_symbol_127;
-                        }
-                      }
-                    }
-                  }
-                  break;
-                }
-              } while (++mtfg_queue_position != 192);
-              if (mtfg_queue_position == 192) {
-                while (symbol_number != *(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F)))
-                  mtfg_queue_position++;
-                sd[symbol_number].hit_score += 20 - (mtfg_queue_position >> 6);
-                if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                  sd[mtfg_queue_symbol_15].type &= 0xF7;
-                  remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                }
-                else {
-                  increment_mtfg_queue_16();
-                  if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                    sd[mtfg_queue_symbol_31].type &= 0xF7;
-                    remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                  }
-                  else {
-                    increment_mtfg_queue_32();
-                    if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                      sd[mtfg_queue_symbol_63].type &= 0xF7;
-                      remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                    }
-                    else {
-                      increment_mtfg_queue_64();
-                      if (sd[mtfg_queue_symbol_127].code_length == 15) {
-                        sd[mtfg_queue_symbol_127].type &= 0xF7;
-                        remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                      }
-                      else {
-                        increment_mtfg_queue_128();
-                        if (sd[mtfg_queue_symbol_191].code_length == 16) {
-                          sd[mtfg_queue_symbol_191].type &= 0xF7;
-                          remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                        }
-                        else {
-                          subqueue_position = mtfg_queue_position - 192;
-                          while (subqueue_position) {
-                            *(mtfg_queue_192 + ((mtfg_queue_192_offset + subqueue_position) & 0x3F))
-                                = *(mtfg_queue_192 + ((mtfg_queue_192_offset + subqueue_position - 1) & 0x3F));
-                            subqueue_position--;
-                          }
-                          *(mtfg_queue_192 + mtfg_queue_192_offset) = mtfg_queue_symbol_191;
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
+  else {
+    queue_size--;
+    if ((sd[symbol_number].type & 2) != 0)
+      queue_size_cap--;
+    queue_offset++;
+    if ((sd[symbol_number].count > MAX_INSTANCES_FOR_REMOVE)
+        || (sd[symbol_number].hits != sd[symbol_number].count)) {
+      EncodeGoMtf(sd[symbol_number].count, 1, 0);
+      sd[symbol_number].type &= 0xF7;
+      add_dictionary_symbol(symbol_number, sd[symbol_number].code_length);
     }
   }
   return;
 }
 
 
-void manage_mtfg_queue(uint32_t symbol_number, uint8_t in_definition) {
-  uint8_t mtfg_queue_position = 0;
+void update_queue_prior_cap(uint32_t symbol_number, uint8_t in_definition) {
+  uint8_t queue_position = 0;
   uint8_t cap_queue_position = 0;
-  uint8_t subqueue_position;
-  do {
-    if (symbol_number == mtfg_queue_0[mtfg_queue_position]) {
-      if (in_definition == 0)
-        EncodeMtfgType(LEVEL0);
-      else
-        EncodeMtfgType(LEVEL1);
-      EncodeMtfgQueuePos(NOT_CAP, mtfg_queue_position);
-      while (mtfg_queue_position) {
-        mtfg_queue_0[mtfg_queue_position] = mtfg_queue_0[mtfg_queue_position-1];
-        mtfg_queue_position--;
-      }
-      mtfg_queue_0[0] = symbol_number;
-      break;
-    }
-  } while (++mtfg_queue_position != 8);
-  if (mtfg_queue_position == 8) {
-    increment_mtfg_queue_0(symbol_number);
-    do {
-      if (symbol_number == *(mtfg_queue_8 + ((mtfg_queue_position + mtfg_queue_8_offset) & 7))) {
-        if (in_definition == 0)
-          EncodeMtfgType(LEVEL0);
-        else
-          EncodeMtfgType(LEVEL1);
-        EncodeMtfgQueuePos(NOT_CAP, mtfg_queue_position);
-        subqueue_position = mtfg_queue_position - 8;
-        while (subqueue_position) {
-          *(mtfg_queue_8 + ((mtfg_queue_8_offset + subqueue_position) & 7))
-              = *(mtfg_queue_8 + ((mtfg_queue_8_offset + subqueue_position - 1) & 7));
-          subqueue_position--;
-        }
-        *(mtfg_queue_8 + mtfg_queue_8_offset) = mtfg_queue_symbol_7;
-        break;
-      }
-    } while (++mtfg_queue_position != 16);
-    if (mtfg_queue_position == 16) {
-      increment_mtfg_queue_8();
-      do {
-        if (symbol_number == *(mtfg_queue_16 + ((mtfg_queue_position + mtfg_queue_16_offset) & 0xF))) {
-          if (in_definition == 0)
-            EncodeMtfgType(LEVEL0);
-          else
-            EncodeMtfgType(LEVEL1);
-          EncodeMtfgQueuePos(NOT_CAP, mtfg_queue_position);
-          if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-            remove_mtfg_queue_symbol_16(mtfg_queue_position);
-            if (mtfg_queue_symbol_15 != num_codes) {
-              sd[mtfg_queue_symbol_15].type &= 0xF7;
-              add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-            }
-          }
-          else {
-            subqueue_position = mtfg_queue_position - 16;
-            while (subqueue_position) {
-              *(mtfg_queue_16 + ((mtfg_queue_16_offset + subqueue_position) & 0xF))
-                  = *(mtfg_queue_16 + ((mtfg_queue_16_offset + subqueue_position - 1) & 0xF));
-              subqueue_position--;
-            }
-            *(mtfg_queue_16 + mtfg_queue_16_offset) = mtfg_queue_symbol_15;
-          }
-          break;
-        }
-      } while (++mtfg_queue_position != 32);
-      if (mtfg_queue_position == 32) {
-        do {
-          if (symbol_number == *(mtfg_queue_32 + ((mtfg_queue_position + mtfg_queue_32_offset) & 0x1F))) {
-            if (in_definition == 0)
-              EncodeMtfgType(LEVEL0);
-            else
-              EncodeMtfgType(LEVEL1);
-            EncodeMtfgQueuePos(NOT_CAP, mtfg_queue_position);
-            if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-              remove_mtfg_queue_symbol_32(mtfg_queue_position);
-              if (mtfg_queue_symbol_15 != num_codes) {
-                sd[mtfg_queue_symbol_15].type &= 0xF7;
-                add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-              }
-            }
-            else {
-              increment_mtfg_queue_16();
-              if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                remove_mtfg_queue_symbol_32(mtfg_queue_position);
-                if (mtfg_queue_symbol_31 != num_codes) {
-                  sd[mtfg_queue_symbol_31].type &= 0xF7;
-                  add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-                }
-              }
-              else {
-                subqueue_position = mtfg_queue_position - 32;
-                while (subqueue_position) {
-                  *(mtfg_queue_32 + ((mtfg_queue_32_offset + subqueue_position) & 0x1F))
-                      = *(mtfg_queue_32 + ((mtfg_queue_32_offset + subqueue_position - 1) & 0x1F));
-                  subqueue_position--;
-                }
-                *(mtfg_queue_32 + mtfg_queue_32_offset) = mtfg_queue_symbol_31;
-              }
-            }
-            break;
-          }
-        } while (++mtfg_queue_position != 64);
-        if (mtfg_queue_position == 64) {
-          do {
-            if (symbol_number == *(mtfg_queue_64 + ((mtfg_queue_position + mtfg_queue_64_offset) & 0x3F))) {
-              if (in_definition == 0)
-                EncodeMtfgType(LEVEL0);
-              else
-                EncodeMtfgType(LEVEL1);
-              EncodeMtfgQueuePos(NOT_CAP, mtfg_queue_position);
-              if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                if (mtfg_queue_symbol_15 != num_codes) {
-                  sd[mtfg_queue_symbol_15].type &= 0xF7;
-                  add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-                }
-              }
-              else {
-                increment_mtfg_queue_16();
-                if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                  remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                  if (mtfg_queue_symbol_31 != num_codes) {
-                    sd[mtfg_queue_symbol_31].type &= 0xF7;
-                    add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-                  }
-                }
-                else {
-                  increment_mtfg_queue_32();
-                  if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                    remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                    if (mtfg_queue_symbol_63 != num_codes) {
-                      sd[mtfg_queue_symbol_63].type &= 0xF7;
-                      add_dictionary_symbol(mtfg_queue_symbol_63,sd[mtfg_queue_symbol_63].code_length);
-                    }
-                  }
-                  else {
-                    subqueue_position = mtfg_queue_position - 64;
-                    while (subqueue_position) {
-                      *(mtfg_queue_64 + ((mtfg_queue_64_offset + subqueue_position) & 0x3F))
-                          = *(mtfg_queue_64 + ((mtfg_queue_64_offset + subqueue_position - 1) & 0x3F));
-                      subqueue_position--;
-                    }
-                    *(mtfg_queue_64 + mtfg_queue_64_offset) = mtfg_queue_symbol_63;
-                  }
-                }
-              }
-              break;
-            }
-          } while (++mtfg_queue_position != 128);
-          if (mtfg_queue_position == 128) {
-            do {
-              if (symbol_number == *(mtfg_queue_128 + ((mtfg_queue_position + mtfg_queue_128_offset) & 0x3F))) {
-                if (in_definition == 0)
-                  EncodeMtfgType(LEVEL0);
-                else
-                  EncodeMtfgType(LEVEL1);
-                EncodeMtfgQueuePos(NOT_CAP, mtfg_queue_position);
-                if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                  remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                  if (mtfg_queue_symbol_15 != num_codes) {
-                    sd[mtfg_queue_symbol_15].type &= 0xF7;
-                    add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-                  }
-                }
-                else {
-                  increment_mtfg_queue_16();
-                  if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                    remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                    if (mtfg_queue_symbol_31 != num_codes) {
-                      sd[mtfg_queue_symbol_31].type &= 0xF7;
-                      add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-                    }
-                  }
-                  else {
-                    increment_mtfg_queue_32();
-                    if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                      remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                      if (mtfg_queue_symbol_63 != num_codes) {
-                        sd[mtfg_queue_symbol_63].type &= 0xF7;
-                        add_dictionary_symbol(mtfg_queue_symbol_63,sd[mtfg_queue_symbol_63].code_length);
-                      }
-                    }
-                    else {
-                      increment_mtfg_queue_64();
-                      if (sd[mtfg_queue_symbol_127].code_length == 15) {
-                        remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                        if (mtfg_queue_symbol_127 != num_codes) {
-                          sd[mtfg_queue_symbol_127].type &= 0xF7;
-                          add_dictionary_symbol(mtfg_queue_symbol_127,sd[mtfg_queue_symbol_127].code_length);
-                        }
-                      }
-                      else {
-                        subqueue_position = mtfg_queue_position - 128;
-                        while (subqueue_position) {
-                          *(mtfg_queue_128 + ((mtfg_queue_128_offset + subqueue_position) & 0x3F))
-                              = *(mtfg_queue_128 + ((mtfg_queue_128_offset + subqueue_position - 1) & 0x3F));
-                          subqueue_position--;
-                        }
-                        *(mtfg_queue_128 + mtfg_queue_128_offset) = mtfg_queue_symbol_127;
-                      }
-                    }
-                  }
-                }
-                break;
-              }
-            } while (++mtfg_queue_position != 192);
-            if (mtfg_queue_position == 192) {
-              while (symbol_number != *(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F))) {
-                if (sd[*(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F))].type & 2)
-                  cap_queue_position++;
-                mtfg_queue_position++;
-              }
-              if (in_definition == 0)
-                EncodeMtfgType(LEVEL0);
-              else
-                EncodeMtfgType(LEVEL1);
-              EncodeMtfgQueuePos(NOT_CAP, mtfg_queue_position);
-              if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                if (mtfg_queue_symbol_15 != num_codes) {
-                  sd[mtfg_queue_symbol_15].type &= 0xF7;
-                  add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-                }
-              }
-              else {
-                increment_mtfg_queue_16();
-                if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                  remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                  if (mtfg_queue_symbol_31 != num_codes) {
-                    sd[mtfg_queue_symbol_31].type &= 0xF7;
-                    add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-                  }
-                }
-                else {
-                  increment_mtfg_queue_32();
-                  if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                    remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                    if (mtfg_queue_symbol_63 != num_codes) {
-                      sd[mtfg_queue_symbol_63].type &= 0xF7;
-                      add_dictionary_symbol(mtfg_queue_symbol_63,sd[mtfg_queue_symbol_63].code_length);
-                    }
-                  }
-                  else {
-                    increment_mtfg_queue_64();
-                    if (sd[mtfg_queue_symbol_127].code_length == 15) {
-                      remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                      if (mtfg_queue_symbol_127 != num_codes) {
-                        sd[mtfg_queue_symbol_127].type &= 0xF7;
-                        add_dictionary_symbol(mtfg_queue_symbol_127,sd[mtfg_queue_symbol_127].code_length);
-                      }
-                    }
-                    else {
-                      increment_mtfg_queue_128();
-                      if (sd[mtfg_queue_symbol_191].code_length == 16) {
-                        remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                        if (mtfg_queue_symbol_191 != num_codes) {
-                          sd[mtfg_queue_symbol_191].type &= 0xF7;
-                          add_dictionary_symbol(mtfg_queue_symbol_191,sd[mtfg_queue_symbol_191].code_length);
-                        }
-                      }
-                      else {
-                        subqueue_position = mtfg_queue_position - 192;
-                        while (subqueue_position) {
-                          *(mtfg_queue_192 + ((mtfg_queue_192_offset + subqueue_position) & 0x3F))
-                              = *(mtfg_queue_192 + ((mtfg_queue_192_offset + subqueue_position - 1) & 0x3F));
-                          subqueue_position--;
-                        }
-                        *(mtfg_queue_192 + mtfg_queue_192_offset) = mtfg_queue_symbol_191;
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  return;
-}
-
-
-void manage_mtfg_queue_prior_cap(uint32_t symbol_number, uint8_t in_definition) {
-  uint8_t mtfg_queue_position = 0;
-  uint8_t cap_queue_position = 0;
-  uint8_t subqueue_position;
-  do {
-    if (symbol_number == mtfg_queue_0[mtfg_queue_position]) {
-      if (in_definition == 0)
-        EncodeMtfgType(LEVEL0_CAP);
-      else
-        EncodeMtfgType(LEVEL1_CAP);
-      uint8_t saved_qp = mtfg_queue_position;
-      mtfg_queue_position = cap_queue_position;
-      EncodeMtfgQueuePos(CAP, mtfg_queue_position);
-      mtfg_queue_position = saved_qp;
-      while (mtfg_queue_position) {
-        mtfg_queue_0[mtfg_queue_position] = mtfg_queue_0[mtfg_queue_position-1];
-        mtfg_queue_position--;
-      }
-      mtfg_queue_0[0] = symbol_number;
-      break;
-    }
-    else if (sd[mtfg_queue_0[mtfg_queue_position]].type & 2)
+  while (symbol_number != *(queue + (uint8_t)(queue_position + queue_offset)))
+    if ((sd[*(queue + (uint8_t)(queue_position++ + queue_offset))].type & 2) != 0)
       cap_queue_position++;
-  } while (++mtfg_queue_position != 8);
-  if (mtfg_queue_position == 8) {
-    increment_mtfg_queue_0(symbol_number);
-    do {
-      if (symbol_number == *(mtfg_queue_8 + ((mtfg_queue_position + mtfg_queue_8_offset) & 7))) {
-        if (in_definition == 0)
-          EncodeMtfgType(LEVEL0_CAP);
-        else
-          EncodeMtfgType(LEVEL1_CAP);
-        uint8_t saved_qp = mtfg_queue_position;
-        mtfg_queue_position = cap_queue_position;
-        EncodeMtfgQueuePos(CAP, mtfg_queue_position);
-        mtfg_queue_position = saved_qp;
-        subqueue_position = mtfg_queue_position - 8;
-        while (subqueue_position) {
-          *(mtfg_queue_8 + ((mtfg_queue_8_offset + subqueue_position) & 7))
-              = *(mtfg_queue_8 + ((mtfg_queue_8_offset + subqueue_position - 1) & 7));
-          subqueue_position--;
-        }
-        *(mtfg_queue_8 + mtfg_queue_8_offset) = mtfg_queue_symbol_7;
-        break;
-      }
-      else if (sd[*(mtfg_queue_8 + ((mtfg_queue_position + mtfg_queue_8_offset) & 7))].type & 2)
-        cap_queue_position++;
-    } while (++mtfg_queue_position != 16);
-    if (mtfg_queue_position == 16) {
-      increment_mtfg_queue_8();
-      do {
-        if (symbol_number == *(mtfg_queue_16 + ((mtfg_queue_position + mtfg_queue_16_offset) & 0xF))) {
-          if (in_definition == 0)
-            EncodeMtfgType(LEVEL0_CAP);
-          else
-            EncodeMtfgType(LEVEL1_CAP);
-          uint8_t saved_qp = mtfg_queue_position;
-          mtfg_queue_position = cap_queue_position;
-          EncodeMtfgQueuePos(CAP, mtfg_queue_position);
-          mtfg_queue_position = saved_qp;
-          if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-            remove_mtfg_queue_symbol_16(mtfg_queue_position);
-            if (mtfg_queue_symbol_15 != num_codes) {
-              sd[mtfg_queue_symbol_15].type &= 0xF7;
-              add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-            }
-          }
-          else {
-            subqueue_position = mtfg_queue_position - 16;
-            while (subqueue_position) {
-              *(mtfg_queue_16 + ((mtfg_queue_16_offset + subqueue_position) & 0xF))
-                  = *(mtfg_queue_16 + ((mtfg_queue_16_offset + subqueue_position - 1) & 0xF));
-              subqueue_position--;
-            }
-            *(mtfg_queue_16 + mtfg_queue_16_offset) = mtfg_queue_symbol_15;
-          }
-          break;
-        }
-        else if (sd[*(mtfg_queue_16 + ((mtfg_queue_position + mtfg_queue_16_offset) & 0xF))].type & 2)
-          cap_queue_position++;
-      } while (++mtfg_queue_position != 32);
-      if (mtfg_queue_position == 32) {
-        do {
-          if (symbol_number == *(mtfg_queue_32 + ((mtfg_queue_position + mtfg_queue_32_offset) & 0x1F))) {
-            if (in_definition == 0)
-              EncodeMtfgType(LEVEL0_CAP);
-            else
-              EncodeMtfgType(LEVEL1_CAP);
-            uint8_t saved_qp = mtfg_queue_position;
-            mtfg_queue_position = cap_queue_position;
-            EncodeMtfgQueuePos(CAP, mtfg_queue_position);
-            mtfg_queue_position = saved_qp;
-            if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-              remove_mtfg_queue_symbol_32(mtfg_queue_position);
-              if (mtfg_queue_symbol_15 != num_codes) {
-                sd[mtfg_queue_symbol_15].type &= 0xF7;
-                add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-              }
-            }
-            else {
-              increment_mtfg_queue_16();
-              if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                remove_mtfg_queue_symbol_32(mtfg_queue_position);
-                if (mtfg_queue_symbol_31 != num_codes) {
-                  sd[mtfg_queue_symbol_31].type &= 0xF7;
-                  add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-                }
-              }
-              else {
-                subqueue_position = mtfg_queue_position - 32;
-                while (subqueue_position) {
-                  *(mtfg_queue_32 + ((mtfg_queue_32_offset + subqueue_position) & 0x1F))
-                      = *(mtfg_queue_32 + ((mtfg_queue_32_offset + subqueue_position - 1) & 0x1F));
-                  subqueue_position--;
-                }
-                *(mtfg_queue_32 + mtfg_queue_32_offset) = mtfg_queue_symbol_31;
-              }
-            }
-            break;
-          }
-          else if (sd[*(mtfg_queue_32 + ((mtfg_queue_position + mtfg_queue_32_offset) & 0x1F))].type & 2)
-            cap_queue_position++;
-        } while (++mtfg_queue_position != 64);
-        if (mtfg_queue_position == 64) {
-          do {
-            if (symbol_number == *(mtfg_queue_64 + ((mtfg_queue_position + mtfg_queue_64_offset) & 0x3F))) {
-              if (in_definition == 0)
-                EncodeMtfgType(LEVEL0_CAP);
-              else
-                EncodeMtfgType(LEVEL1_CAP);
-              uint8_t saved_qp = mtfg_queue_position;
-              mtfg_queue_position = cap_queue_position;
-              EncodeMtfgQueuePos(CAP, mtfg_queue_position);
-              mtfg_queue_position = saved_qp;
-              if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                if (mtfg_queue_symbol_15 != num_codes) {
-                  sd[mtfg_queue_symbol_15].type &= 0xF7;
-                  add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-                }
-              }
-              else {
-                increment_mtfg_queue_16();
-                if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                  remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                  if (mtfg_queue_symbol_31 != num_codes) {
-                    sd[mtfg_queue_symbol_31].type &= 0xF7;
-                    add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-                  }
-                }
-                else {
-                  increment_mtfg_queue_32();
-                  if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                    remove_mtfg_queue_symbol_64(mtfg_queue_position);
-                    if (mtfg_queue_symbol_63 != num_codes) {
-                      sd[mtfg_queue_symbol_63].type &= 0xF7;
-                      add_dictionary_symbol(mtfg_queue_symbol_63,sd[mtfg_queue_symbol_63].code_length);
-                    }
-                  }
-                  else {
-                    subqueue_position = mtfg_queue_position - 64;
-                    while (subqueue_position) {
-                      *(mtfg_queue_64 + ((mtfg_queue_64_offset + subqueue_position) & 0x3F))
-                          = *(mtfg_queue_64 + ((mtfg_queue_64_offset + subqueue_position - 1) & 0x3F));
-                      subqueue_position--;
-                    }
-                    *(mtfg_queue_64 + mtfg_queue_64_offset) = mtfg_queue_symbol_63;
-                  }
-                }
-              }
-              break;
-            }
-            else if (sd[*(mtfg_queue_64 + ((mtfg_queue_position + mtfg_queue_64_offset) & 0x3F))].type & 2)
-              cap_queue_position++;
-          } while (++mtfg_queue_position != 128);
-          if (mtfg_queue_position == 128) {
-            do {
-              if (symbol_number == *(mtfg_queue_128 + ((mtfg_queue_position + mtfg_queue_128_offset) & 0x3F))) {
-                if (in_definition == 0)
-                  EncodeMtfgType(LEVEL0_CAP);
-                else
-                  EncodeMtfgType(LEVEL1_CAP);
-                uint8_t saved_qp = mtfg_queue_position;
-                mtfg_queue_position = cap_queue_position;
-                EncodeMtfgQueuePos(CAP, mtfg_queue_position);
-                mtfg_queue_position = saved_qp;
-                if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                  remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                  if (mtfg_queue_symbol_15 != num_codes) {
-                    sd[mtfg_queue_symbol_15].type &= 0xF7;
-                    add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-                  }
-                }
-                else {
-                  increment_mtfg_queue_16();
-                  if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                    remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                    if (mtfg_queue_symbol_31 != num_codes) {
-                      sd[mtfg_queue_symbol_31].type &= 0xF7;
-                      add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-                    }
-                  }
-                  else {
-                    increment_mtfg_queue_32();
-                    if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                      remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                      if (mtfg_queue_symbol_63 != num_codes) {
-                        sd[mtfg_queue_symbol_63].type &= 0xF7;
-                        add_dictionary_symbol(mtfg_queue_symbol_63,sd[mtfg_queue_symbol_63].code_length);
-                      }
-                    }
-                    else {
-                      increment_mtfg_queue_64();
-                      if (sd[mtfg_queue_symbol_127].code_length == 15) {
-                        remove_mtfg_queue_symbol_128(mtfg_queue_position);
-                        if (mtfg_queue_symbol_127 != num_codes) {
-                          sd[mtfg_queue_symbol_127].type &= 0xF7;
-                          add_dictionary_symbol(mtfg_queue_symbol_127,sd[mtfg_queue_symbol_127].code_length);
-                        }
-                      }
-                      else {
-                        subqueue_position = mtfg_queue_position - 128;
-                        while (subqueue_position) {
-                          *(mtfg_queue_128 + ((mtfg_queue_128_offset + subqueue_position) & 0x3F))
-                              = *(mtfg_queue_128 + ((mtfg_queue_128_offset + subqueue_position - 1) & 0x3F));
-                          subqueue_position--;
-                        }
-                        *(mtfg_queue_128 + mtfg_queue_128_offset) = mtfg_queue_symbol_127;
-                      }
-                    }
-                  }
-                }
-                break;
-              }
-              else if (sd[*(mtfg_queue_128 + ((mtfg_queue_position + mtfg_queue_128_offset) & 0x3F))].type & 2)
-                cap_queue_position++;
-            } while (++mtfg_queue_position != 192);
-            if (mtfg_queue_position == 192) {
-              while (symbol_number != *(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F))) {
-                if (sd[*(mtfg_queue_192 + ((mtfg_queue_position + mtfg_queue_192_offset) & 0x3F))].type & 2)
-                  cap_queue_position++;
-                mtfg_queue_position++;
-              }
-              if (in_definition == 0)
-                EncodeMtfgType(LEVEL0_CAP);
-              else
-                EncodeMtfgType(LEVEL1_CAP);
-              uint8_t saved_qp = mtfg_queue_position;
-              mtfg_queue_position = cap_queue_position;
-              EncodeMtfgQueuePos(CAP, mtfg_queue_position);
-              mtfg_queue_position = saved_qp;
-              if (sd[mtfg_queue_symbol_15].code_length <= 12) {
-                remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                if (mtfg_queue_symbol_15 != num_codes) {
-                  sd[mtfg_queue_symbol_15].type &= 0xF7;
-                  add_dictionary_symbol(mtfg_queue_symbol_15,sd[mtfg_queue_symbol_15].code_length);
-                }
-              }
-              else {
-                increment_mtfg_queue_16();
-                if (sd[mtfg_queue_symbol_31].code_length == 13) {
-                  remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                  if (mtfg_queue_symbol_31 != num_codes) {
-                    sd[mtfg_queue_symbol_31].type &= 0xF7;
-                    add_dictionary_symbol(mtfg_queue_symbol_31,sd[mtfg_queue_symbol_31].code_length);
-                  }
-                }
-                else {
-                  increment_mtfg_queue_32();
-                  if (sd[mtfg_queue_symbol_63].code_length == 14) {
-                    remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                    if (mtfg_queue_symbol_63 != num_codes) {
-                      sd[mtfg_queue_symbol_63].type &= 0xF7;
-                      add_dictionary_symbol(mtfg_queue_symbol_63,sd[mtfg_queue_symbol_63].code_length);
-                    }
-                  }
-                  else {
-                    increment_mtfg_queue_64();
-                    if (sd[mtfg_queue_symbol_127].code_length == 15) {
-                      remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                      if (mtfg_queue_symbol_127 != num_codes) {
-                        sd[mtfg_queue_symbol_127].type &= 0xF7;
-                        add_dictionary_symbol(mtfg_queue_symbol_127,sd[mtfg_queue_symbol_127].code_length);
-                      }
-                    }
-                    else {
-                      increment_mtfg_queue_128();
-                      if (sd[mtfg_queue_symbol_191].code_length == 16) {
-                        remove_mtfg_queue_symbol_192(mtfg_queue_position);
-                        if (mtfg_queue_symbol_191 != num_codes) {
-                          sd[mtfg_queue_symbol_191].type &= 0xF7;
-                          add_dictionary_symbol(mtfg_queue_symbol_191,sd[mtfg_queue_symbol_191].code_length);
-                        }
-                      }
-                      else {
-                        subqueue_position = mtfg_queue_position - 192;
-                        while (subqueue_position) {
-                          *(mtfg_queue_192 + ((mtfg_queue_192_offset + subqueue_position) & 0x3F))
-                              = *(mtfg_queue_192 + ((mtfg_queue_192_offset + subqueue_position - 1) & 0x3F));
-                          subqueue_position--;
-                        }
-                        *(mtfg_queue_192 + mtfg_queue_192_offset) = mtfg_queue_symbol_191;
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
+  while (queue_position != 0) {
+    *(queue + (uint8_t)(queue_offset + queue_position))
+        = *(queue + (uint8_t)(queue_offset + queue_position - 1));
+    queue_position--;
+  }
+  EncodeMtfType(2 * in_definition + 1);
+  EncodeMtfPos(CAP, cap_queue_position, queue_size_cap);
+  if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+    EncodeGoMtf(sd[symbol_number].count, 1, 1);
+    *(queue + queue_offset) = symbol_number;
+  }
+  else {
+    queue_size--;
+    queue_size_cap--;
+    queue_offset++;
+    if ((sd[symbol_number].count > MAX_INSTANCES_FOR_REMOVE)
+        || (sd[symbol_number].hits != sd[symbol_number].count)) {
+      EncodeGoMtf(sd[symbol_number].count, 1, 0);
+      sd[symbol_number].type &= 0xF7;
+      add_dictionary_symbol(symbol_number, sd[symbol_number].code_length);
     }
   }
   return;
+}
+
+
+uint16_t get_mtf_overflow_position(struct symbol_data * sd, uint32_t * queue, uint16_t queue_position,
+    uint32_t num_transmits_over_sqrt2) {
+  uint16_t limit_position = 0;
+  if ((queue_position > 0x1C) && ((sd[queue[0x1C]].count <= (num_transmits_over_sqrt2 >> 10))
+      && (sd[queue[0x1C]].count > (num_transmits_over_sqrt2 >> 11))))
+    limit_position = 0x1C;
+  else if ((queue_position > 0x30) && ((sd[queue[0x30]].count <= (num_transmits_over_sqrt2 >> 11))
+      && (sd[queue[0x30]].count > (num_transmits_over_sqrt2 >> 12))))
+    limit_position = 0x30;
+  else if ((queue_position > 0x44) && ((sd[queue[0x44]].count <= (num_transmits_over_sqrt2 >> 12))
+      && (sd[queue[0x44]].count > (num_transmits_over_sqrt2 >> 13))))
+    limit_position = 0x44;
+  else if ((queue_position > 0x48) && ((sd[queue[0x48]].count <= (num_transmits_over_sqrt2 >> 13))
+      && (sd[queue[0x48]].count > (num_transmits_over_sqrt2 >> 14))))
+    limit_position = 0x48;
+  else if ((queue_position > 0x88) && ((sd[queue[0x88]].count <= (num_transmits_over_sqrt2 >> 14))
+      && (sd[queue[0x88]].count > (num_transmits_over_sqrt2 >> 15))))
+    limit_position = 0x88;
+  else if ((queue_position > 0xB0) && ((sd[queue[0xB0]].count <= (num_transmits_over_sqrt2 >> 15))
+      && (sd[queue[0xB0]].count > (num_transmits_over_sqrt2 >> 16))))
+    limit_position = 0xB0;
+  else if ((queue_position > 0xD8) && ((sd[queue[0xD8]].count <= (num_transmits_over_sqrt2 >> 16))
+      && (sd[queue[0xD8]].count > (num_transmits_over_sqrt2 >> 17))))
+    limit_position = 0xD8;
+  else if ((queue_position > 0xF0) && ((sd[queue[0xF0]].count <= (num_transmits_over_sqrt2 >> 17))
+      && (sd[queue[0xF0]].count > (num_transmits_over_sqrt2 >> 18))))
+    limit_position = 0xF0;
+  else if ((queue_position > 0x108) && ((sd[queue[0x108]].count <= (num_transmits_over_sqrt2 >> 18))
+      && (sd[queue[0x108]].count > (num_transmits_over_sqrt2 >> 19))))
+    limit_position = 0x108;
+  else if ((queue_position > 0x120) && ((sd[queue[0x120]].count <= (num_transmits_over_sqrt2 >> 19))
+      && (sd[queue[0x120]].count > (num_transmits_over_sqrt2 >> 20))))
+    limit_position = 0x120;
+  else if ((queue_position > 0x138) && ((sd[queue[0x138]].count <= (num_transmits_over_sqrt2 >> 20))
+      && (sd[queue[0x138]].count > (num_transmits_over_sqrt2 >> 21))))
+    limit_position = 0x138;
+  return(limit_position);
+}
+
+
+float get_mtf_score_limit(uint32_t count, uint32_t num_transmits_over_sqrt2) {
+  float score_limit;
+  if (count > (num_transmits_over_sqrt2 >> 11))
+    score_limit = 16.0;
+  else if (count > (num_transmits_over_sqrt2 >> 12))
+    score_limit = 9.5;
+  else if (count > (num_transmits_over_sqrt2 >> 13))
+    score_limit = 8.0;
+  else if (count > (num_transmits_over_sqrt2 >> 14))
+    score_limit = 6.4;
+  else if (count > (num_transmits_over_sqrt2 >> 15))
+    score_limit = 4.8;
+  else if (count > (num_transmits_over_sqrt2 >> 16))
+    score_limit = 3.7;
+  else if (count > (num_transmits_over_sqrt2 >> 17))
+    score_limit = 2.9;
+  else if (count > (num_transmits_over_sqrt2 >> 18))
+    score_limit = 2.5;
+  else if (count > (num_transmits_over_sqrt2 >> 19))
+    score_limit = 2.3;
+  else if (count > (num_transmits_over_sqrt2 >> 20))
+    score_limit = 2.2;
+  else if (count > (num_transmits_over_sqrt2 >> 21))
+    score_limit = 2.1;
+  else if (count > (num_transmits_over_sqrt2 >> 22))
+    score_limit = 2.0;
+  else if (count > (num_transmits_over_sqrt2 >> 23))
+    score_limit = 1.9;
+  else
+    score_limit = 1.8;
+  return(score_limit);
+}
+
+
+void add_mtf_hit_scores(struct symbol_data * sd, uint16_t queue_position, uint32_t num_transmits_over_sqrt2) {
+  if (queue_position <= 4)
+    sd->hits += 61 - 3 * queue_position;
+  else if (queue_position <= 7)
+    sd->hits += 56 - 2 * queue_position;
+  else if (queue_position <= 0xF)
+    sd->hits += 48 - queue_position;
+  else if (queue_position <= 0x1F) {
+    if (sd->count <= (num_transmits_over_sqrt2 >> 12))
+      sd->hits += 40 - (queue_position >> 1);
+  }
+  else if (queue_position <= 0x3F) {
+    if (sd->count <= (num_transmits_over_sqrt2 >> 13))
+      sd->hits += 28 - (queue_position >> 3);
+  }
+  else if (queue_position <= 0x7F) {
+    if (sd->count <= (num_transmits_over_sqrt2 >> 14))
+      sd->hits += 22 - (queue_position >> 5);
+  }
+  else if (queue_position <= 0xFF) {
+    if (sd->count <= (num_transmits_over_sqrt2 >> 15))
+      sd->hits += 20 - (queue_position >> 6);
+  }
 }
 
 
 void encode_dictionary_symbol(uint32_t symbol) {
-  uint32_t bin_code;
+  uint32_t symbol_index, bin_code;
   uint16_t bin_num;
-  uint8_t bin_shift;
+  uint8_t first_char, code_length, bin_shift;
 
-  uint8_t first_char = sd[symbol].starts;
-  uint32_t symbol_index = sd[symbol].array_index;
+  first_char = sd[symbol].starts;
+  symbol_index = sd[symbol].array_index;
+  code_length = sd[symbol].code_length;
   if (cap_encoded != 0) {
-    if (prior_end != 0xA) {
-      if (sd[prior_symbol].type & 0x20) {
-        if (sd[prior_symbol].type & 0x80)
-          EncodeFirstChar(first_char, 2, prior_end);
-        else if (sd[prior_symbol].type & 0x40)
-          EncodeFirstChar(first_char, 3, prior_end);
-        else
-          EncodeFirstChar(first_char, 1, prior_end);
-      }
-      else
-        EncodeFirstChar(first_char, 0, prior_end);
-    }
+    if (prior_end != 0xA)
+      EncodeFirstChar(first_char, (sd[prior_symbol].type & 0x60) >> 5, prior_end);
   }
   else if (UTF8_compliant != 0)
     EncodeFirstChar(first_char, 0, prior_end);
   else 
     EncodeFirstCharBinary(first_char, prior_end);
 
-  uint8_t code_length = sd[symbol].code_length;
   if (code_length > bin_code_length[first_char]) {
     uint32_t max_codes_in_bins, mcib;
     uint8_t reduce_bits = 0;
@@ -1448,27 +556,25 @@ void encode_dictionary_symbol(uint32_t symbol) {
       reduce_bits++;
       mcib = mcib >> 1;
     }
-    if (code_length - reduce_bits > bin_code_length[first_char]) {
+    if (bin_shift > reduce_bits) {
       bin_num = fbob[first_char][code_length];
       uint32_t min_extra_reduce_index = 2 * nsob[first_char][code_length] - (max_codes_in_bins >> reduce_bits);
+      uint16_t symbol_bins, code_bin;
+      code_length = bin_shift - reduce_bits;
       if (symbol_index >= min_extra_reduce_index) {
-        uint16_t symbol_bins = 2;
         bin_code = 2 * symbol_index - min_extra_reduce_index;
-        uint16_t code_bin = (uint16_t)(bin_code >> (bin_shift - reduce_bits));
-        bin_num += code_bin;
-        bin_code -= (uint32_t)code_bin << (bin_shift - reduce_bits);
-        code_length -= reduce_bits + bin_code_length[first_char];
-        EncodeLongDictionarySymbol(bin_code, bin_num, sum_nbob[first_char], code_length, symbol_bins);
+        code_bin = (uint16_t)(bin_code >> code_length);
+        bin_code -= (uint32_t)code_bin << code_length;
+        symbol_bins = 2;
       }
       else {
         bin_code = symbol_index;
-        uint16_t symbol_bins = 1;
-        code_length -= reduce_bits + bin_code_length[first_char];
-        uint16_t code_bin = (uint16_t)(symbol_index >> code_length);
-        bin_num += code_bin;
+        code_bin = (uint16_t)(symbol_index >> code_length);
         bin_code -= (uint32_t)code_bin << code_length;
-        EncodeLongDictionarySymbol(bin_code, bin_num, sum_nbob[first_char], code_length, symbol_bins);
+        symbol_bins = 1;
       }
+      bin_num += code_bin;
+      EncodeLongDictionarySymbol(bin_code, bin_num, sum_nbob[first_char], code_length, symbol_bins);
       return;
     }
   }
@@ -1486,213 +592,15 @@ void encode_dictionary_symbol(uint32_t symbol) {
 }
 
 
-void update_mtf_queue(uint32_t symbol, uint32_t symbol_inst, uint32_t symbol_count) {
-  uint8_t i;
-  if (symbol_inst != symbol_count - 1) { // not the last instance
-    if ((sd[symbol].type & 8) != 0) { // symbol in queue
-      i = mtf_queue_size[symbol_count] - 1;
-      while (mtf_queue[symbol_count][i] != symbol)
-        i--;
-      mtf_queue_hits[symbol_count]++;
-      while (i < mtf_queue_size[symbol_count] - 1) {
-        mtf_queue[symbol_count][i] = mtf_queue[symbol_count][i+1];
-        i++;
-      }
-      mtf_queue[symbol_count][i] = symbol;
-    }
-    else { // symbol not in mtf queue, move it back into the queue
-      sd[symbol].type |= 8;
-      if (mtf_queue_size[symbol_count] < MTF_QUEUE_SIZE)
-        mtf_queue[symbol_count][mtf_queue_size[symbol_count]++] = symbol;
-      else { // move the queue elements down
-        sd[mtf_queue[symbol_count][0]].type &= 0xF7;
-        i = 0;
-        while (i < mtf_queue_size[symbol_count] - 1) {
-          mtf_queue[symbol_count][i] = mtf_queue[symbol_count][i+1];
-          i++;
-        }
-        mtf_queue[symbol_count][i] = symbol;
-      }
-    }
-  }
-  else { // last instance
-    mtf_queue_done[symbol_count]++;
-    if ((sd[symbol].type & 8) != 0) {
-      i = --mtf_queue_size[symbol_count];
-      while (mtf_queue[symbol_count][i] != symbol)
-        i--;
-      mtf_queue_hits[symbol_count]++;
-      while (i < mtf_queue_size[symbol_count]) {
-        mtf_queue[symbol_count][i] = mtf_queue[symbol_count][i+1];
-        i++;
-      }
-    }
-  }
-  return;
-}
-
-
-uint8_t manage_mtf_queue(uint32_t symbol, uint32_t symbol_inst, uint32_t symbol_count, uint8_t in_definition) {
-  uint8_t i, mtf_queue_position;
-  uint8_t mtf_queue_number = (uint8_t)symbol_count - 2;
-
-  if ((sd[symbol].type & 8) != 0) { // symbol already in queue
-    i = mtf_queue_size[symbol_count];
-    while (mtf_queue[symbol_count][--i] != symbol); // do nothing
-    mtf_queue_position = mtf_queue_size[symbol_count] - i - 1;
-    if (symbol_inst != symbol_count - 1) { // not the last instance
-      if (prior_is_cap == 0) {
-        if (in_definition == 0)
-          EncodeMtfType(LEVEL0);
-        else
-          EncodeMtfType(LEVEL1);
-        EncodeMtfQueueNum(NOT_CAP, mtf_queue_number);
-        EncodeMtfQueuePos(NOT_CAP, mtf_queue_number, mtf_queue_size, mtf_queue_position);
-      }
-      else {
-        if (in_definition == 0)
-          EncodeMtfType(LEVEL0_CAP);
-        else
-          EncodeMtfType(LEVEL1_CAP);
-        EncodeMtfQueueNum(CAP, mtf_queue_number);
-        if (mtf_queue_position != 0) {
-          uint32_t * end_mtf_queue_ptr = &mtf_queue[symbol_count][mtf_queue_size[symbol_count] - 1];
-          uint32_t * mtf_queue_ptr = end_mtf_queue_ptr - mtf_queue_position + 1;
-          do {
-            if ((sd[*mtf_queue_ptr].type & 2) == 0)
-              mtf_queue_position--; // don't count symbols that don't start a-z
-          } while (mtf_queue_ptr++ != end_mtf_queue_ptr);
-        }
-        EncodeMtfQueuePos(CAP, mtf_queue_number, mtf_queue_size, mtf_queue_position);
-      }
-      while (i < mtf_queue_size[symbol_count] - 1) {
-        mtf_queue[symbol_count][i] = mtf_queue[symbol_count][i+1];
-        i++;
-      }
-      mtf_queue[symbol_count][i] = symbol;
-    }
-    else {
-      if (prior_is_cap == 0) {
-        if (in_definition == 0)
-          EncodeMtfType(LEVEL0);
-        else
-          EncodeMtfType(LEVEL1);
-        EncodeMtfQueueNumLastSymbol(NOT_CAP, mtf_queue_number);
-        EncodeMtfQueuePos(NOT_CAP, mtf_queue_number, mtf_queue_size, mtf_queue_position);
-      }
-      else {
-        if (in_definition == 0)
-          EncodeMtfType(LEVEL0_CAP);
-        else
-          EncodeMtfType(LEVEL1_CAP);
-        EncodeMtfQueueNumLastSymbol(CAP, mtf_queue_number);
-        if (mtf_queue_position != 0) {
-          uint32_t * end_mtf_queue_ptr = &mtf_queue[symbol_count][mtf_queue_size[symbol_count] - 1];
-          uint32_t * mtf_queue_ptr = end_mtf_queue_ptr - mtf_queue_position + 1;
-          do {
-            if ((sd[*mtf_queue_ptr].type & 2) == 0)
-              mtf_queue_position--;
-          } while (mtf_queue_ptr++ != end_mtf_queue_ptr);
-        }
-        EncodeMtfQueuePos(CAP, mtf_queue_number, mtf_queue_size, mtf_queue_position);
-      }
-      mtf_queue_size[symbol_count]--;
-      uint32_t * end_mtf_queue_ptr = &mtf_queue[symbol_count][mtf_queue_size[symbol_count]];
-      uint32_t * mtf_queue_ptr = &mtf_queue[symbol_count][i];
-      while (mtf_queue_ptr != end_mtf_queue_ptr) {
-        *mtf_queue_ptr = *(mtf_queue_ptr+1);
-        mtf_queue_ptr++;
-      }
-    }
-  }
-  else { // symbol not in mtf queue
-    if (symbol_inst != symbol_count - 1) { // not the last instance
-      sd[symbol].type |= 8;
-      UpFreqMtfQueueNum(prior_is_cap, mtf_queue_number);
-      if (prior_is_cap == 0) {
-        if (in_definition == 0)
-          EncodeDictType(LEVEL0);
-        else
-          EncodeDictType(LEVEL1);
-      }
-      else {
-        if (in_definition == 0)
-          EncodeDictType(LEVEL0_CAP);
-        else
-          EncodeDictType(LEVEL1_CAP);
-      }
-      encode_dictionary_symbol(symbol);
-      // move the symbol back into the mtf queue
-      remove_dictionary_symbol(symbol, mtf_queue_miss_code_length[symbol_count]);
-      if (mtf_queue_size[symbol_count] < MTF_QUEUE_SIZE)
-        mtf_queue[symbol_count][mtf_queue_size[symbol_count]++] = symbol;
-      else {
-        sd[mtf_queue[symbol_count][0]].type &= 0xF7;
-        uint32_t symbol_to_move = mtf_queue[symbol_count][0];
-        if (add_dictionary_symbol(symbol_to_move, mtf_queue_miss_code_length[symbol_count]) == 0)
-          return(0);
-        // move the queue elements down
-        i = 0;
-        while (i < MTF_QUEUE_SIZE - 1) {
-          mtf_queue[symbol_count][i] = mtf_queue[symbol_count][i+1];
-          i++;
-        }
-        mtf_queue[symbol_count][i] = symbol;
-      }
-    }
-    else { // last instance
-      if (prior_is_cap == 0) {
-        if (in_definition == 0)
-          EncodeDictType(LEVEL0);
-        else
-          EncodeDictType(LEVEL1);
-      }
-      else {
-        if (in_definition == 0)
-          EncodeDictType(LEVEL0_CAP);
-        else
-          EncodeDictType(LEVEL1_CAP);
-      }
-      encode_dictionary_symbol(symbol);
-      remove_dictionary_symbol(symbol, mtf_queue_miss_code_length[symbol_count]);
-    }
-  }
-  prior_is_cap = sd[symbol].type & 1;
-  return(1);
-}
-
-
-void manage_mtf_symbol(uint32_t symbol, uint32_t symbol_inst, uint32_t symbol_count, uint8_t in_definition) {
-  if (prior_is_cap == 0) {
-    if (in_definition == 0)
-      EncodeDictType(LEVEL0);
-    else
-      EncodeDictType(LEVEL1);
-  }
-  else {
-    if (in_definition == 0)
-      EncodeDictType(LEVEL0_CAP);
-    else
-      EncodeDictType(LEVEL1_CAP);
-  }
-  encode_dictionary_symbol(symbol);
-  if (symbol_inst == symbol_count - 1)  // last instance
-    remove_dictionary_symbol(symbol, mtf_queue_miss_code_length[symbol_count]);
-  prior_is_cap = sd[symbol].type & 1;
-  return;
-}
-
-
 uint32_t count_symbols(uint32_t symbol) {
   uint32_t string_symbols, *symbol_string_ptr, *end_symbol_string_ptr;
-  if (symbol < start_my_symbols)
+  if (symbol < num_base_symbols)
     return(1);
   symbol_string_ptr = symbol_array + sd[symbol].define_symbol_start_index;
-  end_symbol_string_ptr = symbol_array + sd[symbol+1].define_symbol_start_index - 1;
-
+  end_symbol_string_ptr = symbol_array + sd[symbol + 1].define_symbol_start_index - 1;
   string_symbols = 0;
   while (symbol_string_ptr != end_symbol_string_ptr) {
-    if ((sd[*symbol_string_ptr].count == 1) && (*symbol_string_ptr >= start_my_symbols))
+    if ((sd[*symbol_string_ptr].count == 1) && (*symbol_string_ptr >= num_base_symbols))
       string_symbols += count_symbols(*symbol_string_ptr);
     else
       string_symbols++;
@@ -1702,76 +610,56 @@ uint32_t count_symbols(uint32_t symbol) {
 }
 
 
-void count_embedded_definition_symbols(uint32_t define_symbol) {
+void get_embedded_symbols(uint32_t define_symbol) {
+  uint32_t symbol;
   uint32_t *define_string_ptr, *define_string_end_ptr;
-  uint32_t symbol, symbol_inst, symbol_count;
 
-  if ((sd[define_symbol].count == 1) && (define_symbol >= start_my_symbols)) {
-    // count the symbols in the string instead of creating a single instance symbol (artifacts of TreeCompress)
+  if (define_symbol >= num_base_symbols) {
     define_string_ptr = symbol_array + sd[define_symbol].define_symbol_start_index;
-    define_string_end_ptr = symbol_array + sd[define_symbol+1].define_symbol_start_index - 1;
+    define_string_end_ptr = symbol_array + sd[define_symbol + 1].define_symbol_start_index - 1;
     do {
       symbol = *define_string_ptr++;
-      symbol_inst = sd[symbol].inst_found++;
-      if (symbol_inst == 0)
-        count_embedded_definition_symbols(symbol);
+      sd[symbol].hits++;
+      if (sd[symbol].previous == 0xFFFFFFFF)
+        get_embedded_symbols(symbol);
       else {
-        if (sd[prior_symbol].type & 0x20) {
-          if (sd[symbol].starts == 0x20)
-            sd[prior_symbol].space_score += 1;
-          else
-            sd[prior_symbol].space_score -= 4;
-        }
-        if (sd[symbol].count <= MAX_INSTANCES_FOR_MTF_QUEUE)
-          update_mtf_queue(symbol, symbol_inst, sd[symbol].count);
-        else {
-          if (sd[symbol].code_length >= 11) {
-            if ((sd[symbol].type & 8) != 0) {
-              manage_mtfg_queue1(symbol);
-              sd[symbol].mtfg_hits++;
-            }
-            else
-              add_symbol_to_mtfg_queue1(symbol);
-          }
-        }
-        prior_symbol = symbol;
+        transmits[sd[symbol].previous].distance = num_transmits - sd[symbol].previous;
+        transmits[num_transmits].previous_index = sd[symbol].previous;
+        transmits[num_transmits].distance = 0xFFFFFFFF;
+        sd[symbol].previous = num_transmits++;
       }
     } while (define_string_ptr != define_string_end_ptr);
-    define_string_ptr--;
-    sd[define_symbol].type |= sd[symbol].type & 0x30;
-    while (((sd[define_symbol].type & 0x10) == 0)
-        && (define_string_ptr-- != symbol_array + sd[define_symbol].define_symbol_start_index))
-      get_symbol_category(*define_string_ptr, &sd[define_symbol].type);
-    return;
   }
+  if (sd[define_symbol].count != 1) {
+    sd[define_symbol].previous = num_transmits;
+    transmits[num_transmits++].previous_index = 0xFFFFFFFF;
+  }
+  return;
+}
 
-  // count the symbols in the definition
-  if (define_symbol >= start_my_symbols) {
+
+void get_embedded_symbols2(uint32_t define_symbol) {
+  uint32_t symbol;
+  uint32_t *define_string_ptr, *define_string_end_ptr;
+
+  if (define_symbol >= num_base_symbols) {
     define_string_ptr = symbol_array + sd[define_symbol].define_symbol_start_index;
-    define_string_end_ptr = symbol_array + sd[define_symbol+1].define_symbol_start_index - 1;
+    define_string_end_ptr = symbol_array + sd[define_symbol + 1].define_symbol_start_index - 1;
     do {
       symbol = *define_string_ptr++;
-      symbol_inst = sd[symbol].inst_found++;
-      if (symbol_inst == 0)
-        count_embedded_definition_symbols(symbol);
+      if (sd[symbol].previous == 0xFFFFFFFF)
+        get_embedded_symbols2(symbol);
       else {
-        if (sd[prior_symbol].type & 0x20) {
+        transmits[sd[symbol].previous].distance = num_transmits - sd[symbol].previous;
+        transmits[num_transmits].previous_index = sd[symbol].previous;
+        transmits[num_transmits].symbol = symbol;
+        transmits[num_transmits].distance = 0xFFFFFFFF;
+        sd[symbol].previous = num_transmits++;
+        if ((sd[prior_symbol].type & 0x20) != 0) {
           if (sd[symbol].starts == 0x20)
-            sd[prior_symbol].space_score += 1;
+            sd[prior_symbol].space_score++;
           else
             sd[prior_symbol].space_score -= 4;
-        }
-        if (sd[symbol].count <= MAX_INSTANCES_FOR_MTF_QUEUE)
-          update_mtf_queue(symbol, symbol_inst, sd[symbol].count);
-        else {
-          if (sd[symbol].code_length >= 11) {
-            if ((sd[symbol].type & 8) != 0) {
-              manage_mtfg_queue1(symbol);
-              sd[symbol].mtfg_hits++;
-            }
-            else
-              add_symbol_to_mtfg_queue1(symbol);
-          }
         }
         prior_symbol = symbol;
       }
@@ -1782,33 +670,11 @@ void count_embedded_definition_symbols(uint32_t define_symbol) {
         && (define_string_ptr-- != symbol_array + sd[define_symbol].define_symbol_start_index))
       get_symbol_category(*define_string_ptr, &sd[define_symbol].type);
   }
-  else if ((define_symbol == (uint32_t)' ') || (define_symbol == (uint32_t)'C') || (define_symbol == (uint32_t)'B'))
-    sd[define_symbol].type |= 0x10;
   prior_symbol = define_symbol;
-
-  symbol_count = sd[define_symbol].count;
-  if (symbol_count != 1) { // assign symbol code
-    if (symbol_count <= MAX_INSTANCES_FOR_MTF_QUEUE) { // Handle initial mtf instance
-      sd[define_symbol].type |= 8;
-      mtf_queue_started[symbol_count]++;
-      if (mtf_queue_started[symbol_count] - mtf_queue_done[symbol_count] > mtf_queue_peak[symbol_count])
-        mtf_queue_peak[symbol_count]++;
-      if (mtf_queue_size[symbol_count] < MTF_QUEUE_SIZE)
-        mtf_queue[symbol_count][mtf_queue_size[symbol_count]++] = define_symbol;
-      else {
-        sd[mtf_queue[symbol_count][0]].type &= 0xF7;
-        uint8_t i;
-        for (i = 0 ; i < 63 ; i++)
-          mtf_queue[symbol_count][i] = mtf_queue[symbol_count][i+1];
-        mtf_queue[symbol_count][63] = define_symbol;
-      }
-    }
-    else {
-      sd[define_symbol].mtfg_hits = 0;
-      sd[define_symbol].hit_score = 0;
-      if (sd[define_symbol].code_length >= 11)
-        add_symbol_to_mtfg_queue1(define_symbol);
-    }
+  if (sd[define_symbol].count != 1) {
+    sd[define_symbol].previous = num_transmits;
+    transmits[num_transmits].symbol = define_symbol;
+    transmits[num_transmits++].previous_index = 0xFFFFFFFF;
   }
   return;
 }
@@ -1816,59 +682,10 @@ void count_embedded_definition_symbols(uint32_t define_symbol) {
 
 uint8_t embed_define_binary(uint32_t define_symbol, uint8_t in_definition) {
   uint32_t *define_string_ptr, *define_symbol_start_ptr, *define_string_end_ptr;
-  uint32_t define_symbol_instances, symbols_in_definition, symbol, symbol_inst, symbol_count;
+  uint32_t define_symbol_instances, symbols_in_definition, symbol, symbol_inst;
   uint8_t new_symbol_code_length, SID_symbol;
 
-  if ((sd[define_symbol].count == 1) && (define_symbol >= start_my_symbols)) {
-    // write the symbol string instead of creating a single instance symbol (artifacts of TreeCompress)
-    define_string_ptr = symbol_array + sd[define_symbol].define_symbol_start_index;
-    define_string_end_ptr = symbol_array + sd[define_symbol+1].define_symbol_start_index - 1;
-    while (define_string_ptr != define_string_end_ptr) {
-      symbol = *define_string_ptr++;
-      symbol_inst = sd[symbol].inst_found++;
-      define_symbol_instances = sd[symbol].count;
-      if (symbol_inst == 0) {
-        if (embed_define_binary(symbol, in_definition) == 0)
-          return(0);
-      }
-      else if (define_symbol_instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        if (use_mtf != 0) {
-          if (manage_mtf_queue(symbol, symbol_inst, define_symbol_instances, in_definition) == 0)
-            return(0);
-        }
-        else
-          manage_mtf_symbol(symbol, symbol_inst, define_symbol_instances, in_definition);
-      }
-      else {
-        if ((sd[symbol].type & 8) != 0) {
-          if (prior_is_cap == 0)
-            manage_mtfg_queue(symbol, in_definition);
-          else
-            manage_mtfg_queue_prior_cap(symbol, in_definition);
-        }
-        else {
-          if (in_definition == 0)
-            EncodeDictType(LEVEL0);
-          else
-            EncodeDictType(LEVEL1);
-          encode_dictionary_symbol(symbol);
-          if (sd[symbol].type & 4) {
-            remove_dictionary_symbol(symbol, sd[symbol].code_length);
-            add_symbol_to_mtfg_queue(symbol);
-          }
-        }
-      }
-      prior_end = sd[symbol].ends;
-    }
-    return(1);
-  }
-
-  // write the define code
-  if (in_definition == 0)
-    EncodeNewType(LEVEL0);
-  else
-    EncodeNewType(LEVEL1);
-
+  EncodeNewType(2 * in_definition);
   define_symbol_instances = sd[define_symbol].count;
   if (define_symbol_instances != 1)
     new_symbol_code_length = sd[define_symbol].code_length;
@@ -1876,21 +693,19 @@ uint8_t embed_define_binary(uint32_t define_symbol, uint8_t in_definition) {
     new_symbol_code_length = 0x20;
 
   // send symbol length, instances and ergodicity bit
-  if (define_symbol < start_my_symbols) {
+  if (define_symbol < num_base_symbols) {
     symbol_lengths[define_symbol] = new_symbol_code_length;
-    SID_symbol = 0;
-    EncodeSID(NOT_CAP, SID_symbol);
+    EncodeSID(NOT_CAP, 0);
     if (define_symbol_instances == 1)
-      EncodeINST(NOT_CAP, SID_symbol, MAX_INSTANCES_FOR_MTF_QUEUE - 1);
-    else if (define_symbol_instances <= MAX_INSTANCES_FOR_MTF_QUEUE)
-      EncodeINST(NOT_CAP, SID_symbol, define_symbol_instances - 2);
+      EncodeINST(NOT_CAP, 0, MAX_INSTANCES_FOR_REMOVE - 1);
+    else if (define_symbol_instances <= MAX_INSTANCES_FOR_REMOVE)
+      EncodeINST(NOT_CAP, 0, define_symbol_instances - 2);
     else
-      EncodeINST(NOT_CAP, SID_symbol, MAX_INSTANCES_FOR_MTF_QUEUE + max_regular_code_length - new_symbol_code_length);
+      EncodeINST(NOT_CAP, 0, MAX_INSTANCES_FOR_REMOVE + max_regular_code_length - new_symbol_code_length);
     EncodeBaseSymbol(define_symbol, 0x100, 0x100);
     if ((define_symbol & 1) != 0) {
-      if (symbol_lengths[define_symbol - 1] != 0) {
+      if (symbol_lengths[define_symbol - 1] != 0)
         DoubleRangeDown();
-      }
     }
     else if (symbol_lengths[define_symbol + 1] != 0)
       DoubleRange();
@@ -1905,22 +720,22 @@ uint8_t embed_define_binary(uint32_t define_symbol, uint8_t in_definition) {
     if (found_first_symbol == 0) {
       found_first_symbol = 1;
       end_char = prior_end;
-      sym_list_ptrs[end_char][max_code_length][0] = num_codes;
-      nsob[end_char][max_code_length] = 1;
       nbob[end_char][max_code_length] = 1;
       sum_nbob[end_char] = 1;
     }
+    if (define_symbol_instances == 1)
+      return(1);
   }
   else {
     num_grammar_rules++;
     define_symbol_start_ptr = symbol_array + sd[define_symbol].define_symbol_start_index;
     define_string_ptr = define_symbol_start_ptr;
-    define_string_end_ptr = symbol_array + sd[define_symbol+1].define_symbol_start_index - 1;
+    define_string_end_ptr = symbol_array + sd[define_symbol + 1].define_symbol_start_index - 1;
 
     // count the symbols in the definition
     symbols_in_definition = 0;
     while (define_string_ptr != define_string_end_ptr) {
-      if ((sd[*define_string_ptr].count != 1) || (*define_string_ptr < start_my_symbols))
+      if ((sd[*define_string_ptr].count != 1) || (*define_string_ptr < num_base_symbols))
         symbols_in_definition++;
       else
         symbols_in_definition += count_symbols(*define_string_ptr);
@@ -1948,81 +763,82 @@ uint8_t embed_define_binary(uint32_t define_symbol, uint8_t in_definition) {
         EncodeExtraLength(2);
       else
         data_bits++;
-      while (data_bits) {
+      while (data_bits != 0) {
         data_bits -= 2;
         EncodeExtraLength((extra_symbols >> data_bits) & 3);
       }
     }
 
-    if (define_symbol_instances <= MAX_INSTANCES_FOR_MTF_QUEUE)
-      EncodeINST(NOT_CAP, SID_symbol, define_symbol_instances - 2);
-    else
-      EncodeINST(NOT_CAP, SID_symbol, MAX_INSTANCES_FOR_MTF_QUEUE + max_regular_code_length - new_symbol_code_length);
-
     // write the symbol string
     define_string_ptr = define_symbol_start_ptr;
     while (define_string_ptr != define_string_end_ptr) {
       symbol = *define_string_ptr++;
-      symbol_inst = sd[symbol].inst_found++;
-      symbol_count = sd[symbol].count;
+      symbol_inst = sd[symbol].hits++;
       if (symbol_inst == 0) {
         if (embed_define_binary(symbol, 1) == 0)
           return(0);
       }
-      else if (symbol_count <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        if (use_mtf != 0) {
-          if (manage_mtf_queue(symbol, symbol_inst, symbol_count, 1) == 0)
-            return(0);
-        }
-        else
-          manage_mtf_symbol(symbol, symbol_inst, symbol_count, 1);
-      }
       else {
         if ((sd[symbol].type & 8) != 0) {
           if (prior_is_cap == 0)
-            manage_mtfg_queue(symbol, 1);
+            update_queue(symbol, 1);
           else
-            manage_mtfg_queue_prior_cap(symbol, 1);
+            update_queue_prior_cap(symbol, 1);
         }
         else {
-          EncodeDictType(LEVEL1);
+          EncodeDictType(2);
           encode_dictionary_symbol(symbol);
-          if (sd[symbol].type & 4) {
-            remove_dictionary_symbol(symbol, sd[symbol].code_length);
-            add_symbol_to_mtfg_queue(symbol);
+          if (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE) {
+            if (sd[symbol].count == sd[symbol].hits)
+              remove_dictionary_symbol(symbol, sd[symbol].code_length);
+            else if (use_mtf != 0) {
+              if ((sd[symbol].type & 4) != 0) {
+                if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0))
+                    EncodeGoMtf(sd[symbol].count, 0, 1);
+                  remove_dictionary_symbol(symbol, sd[symbol].code_length);
+                  add_symbol_to_queue(symbol);
+                }
+                else
+                  EncodeGoMtf(sd[symbol].count, 0, 0);
+              }
+            }
+          }
+          else if ((sd[symbol].type & 4) != 0) {
+            if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 1);
+              remove_dictionary_symbol(symbol, sd[symbol].code_length);
+              add_symbol_to_queue(symbol);
+            }
+            else
+              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 0);
           }
         }
+        num_transmits++;
       }
       prior_end = sd[symbol].ends;
     }
+
+    if (define_symbol_instances <= MAX_INSTANCES_FOR_REMOVE)
+      EncodeINST(NOT_CAP, SID_symbol, define_symbol_instances - 2);
+    else
+      EncodeINST(NOT_CAP, SID_symbol,
+          MAX_INSTANCES_FOR_REMOVE - 1 + max_regular_code_length - new_symbol_code_length);
   }
 
-  if (define_symbol_instances != 1) { // assign symbol code
-    if (define_symbol_instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-      if (use_mtf != 0) {
-        UpFreqMtfQueueNum(NOT_CAP, define_symbol_instances - 2);
-        // Handle initial mtf symbol instance
-        sd[define_symbol].type |= 8;
-        if (mtf_queue_size[define_symbol_instances] < MTF_QUEUE_SIZE)
-          mtf_queue[define_symbol_instances][mtf_queue_size[define_symbol_instances]++] = define_symbol;
-        else {
-          uint32_t symbol_to_move = mtf_queue[define_symbol_instances][0];
-          sd[symbol_to_move].type &= 0xF7;
-          if (add_dictionary_symbol(symbol_to_move, new_symbol_code_length) == 0)
-            return(0);
-          uint8_t i;
-          for (i = 0 ; i < 63 ; i++)
-            mtf_queue[define_symbol_instances][i] = mtf_queue[define_symbol_instances][i+1];
-          mtf_queue[define_symbol_instances][63] = define_symbol;
-        }
-      }
-      else if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
-        return(0);
-    }
-    else if (use_mtfg && (new_symbol_code_length >= 11)) {
-      if (sd[define_symbol].type & 4) {
+  if ((use_mtf != 0) && ((new_symbol_code_length >= 11) || (define_symbol_instances <= MAX_INSTANCES_FOR_REMOVE))) {
+    if (define_symbol_instances > MAX_INSTANCES_FOR_REMOVE) {
+      if ((sd[define_symbol].type & 4) != 0) {
         EncodeERG(0, 1);
-        add_symbol_to_mtfg_queue(define_symbol);
+        if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+          EncodeGoMtf(new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE, 2, 1);
+          add_symbol_to_queue(define_symbol);
+        }
+        else {
+          EncodeGoMtf(new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE, 2, 0);
+          if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+            return(0);
+        }
       }
       else {
         EncodeERG(0, 0);
@@ -2030,89 +846,40 @@ uint8_t embed_define_binary(uint32_t define_symbol, uint8_t in_definition) {
           return(0);
       }
     }
-    else if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
-      return(0);
+    else if ((sd[define_symbol].type & 4) != 0) {
+      EncodeERG(define_symbol_instances + 1, 1);
+      if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+        if (define_symbol_instances > 2)
+          EncodeGoMtf(define_symbol_instances, 2, 1);
+        add_symbol_to_queue(define_symbol);
+      }
+      else {
+        if (define_symbol_instances > 2)
+          EncodeGoMtf(define_symbol_instances, 2, 0);
+        if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+          return(0);
+      }
+    }
+    else {
+      EncodeERG(define_symbol_instances + 1, 0);
+      if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+        return(0);
+    }
   }
+  else if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+    return(0);
+  num_transmits++;
   return (1);
 }
 
 
 uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
   uint32_t *define_string_ptr, *define_symbol_start_ptr, *define_string_end_ptr;
-  uint32_t define_symbol_instances, symbols_in_definition, symbol, symbol_inst, symbol_count;
-  uint8_t new_symbol_code_length, SID_symbol, char_before_define_is_cap;
+  uint32_t define_symbol_instances, symbols_in_definition, symbol, symbol_inst;
+  uint8_t new_symbol_code_length, SID_symbol;
+  uint8_t tag_type = 0;
 
-  if ((sd[define_symbol].count == 1) && (define_symbol >= start_my_symbols)) {
-    // write the symbol string instead of creating a single instance symbol (artifacts of TreeCompress)
-    define_string_ptr = symbol_array + sd[define_symbol].define_symbol_start_index;
-    define_string_end_ptr = symbol_array + sd[define_symbol+1].define_symbol_start_index - 1;
-    while (define_string_ptr != define_string_end_ptr) {
-      symbol = *define_string_ptr++;
-      symbol_inst = sd[symbol].inst_found++;
-      define_symbol_instances = sd[symbol].count;
-      if (symbol_inst == 0) {
-        if (embed_define(symbol, in_definition) == 0)
-          return(0);
-      }
-      else if (define_symbol_instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        if (use_mtf != 0) {
-          if (manage_mtf_queue(symbol, symbol_inst, define_symbol_instances, in_definition) == 0)
-            return(0);
-        }
-        else
-          manage_mtf_symbol(symbol, symbol_inst, define_symbol_instances, in_definition);
-        prior_symbol = symbol;
-      }
-      else {
-        if ((sd[symbol].type & 8) != 0) {
-          if (prior_is_cap == 0)
-            manage_mtfg_queue(symbol, in_definition);
-          else
-            manage_mtfg_queue_prior_cap(symbol, in_definition);
-        }
-        else {
-          if (prior_is_cap == 0) {
-            if (in_definition == 0)
-              EncodeDictType(LEVEL0);
-            else
-              EncodeDictType(LEVEL1);
-          }
-          else {
-            if (in_definition == 0)
-              EncodeDictType(LEVEL0_CAP);
-            else
-              EncodeDictType(LEVEL1_CAP);
-          }
-          encode_dictionary_symbol(symbol);
-          if (sd[symbol].type & 4) {
-            remove_dictionary_symbol(symbol, sd[symbol].code_length);
-            add_symbol_to_mtfg_queue(symbol);
-          }
-        }
-        prior_is_cap = sd[symbol].type & 1;
-        prior_symbol = symbol;
-      }
-      prior_end = sd[symbol].ends;
-    }
-    if ((sd[define_symbol].type & 0x40) == 0)
-      sd[define_symbol].type |= sd[symbol_array[sd[define_symbol+1].define_symbol_start_index - 2]].type & 0xC0;
-    return(1);
-  }
-
-  // write the define code
-  if (prior_is_cap == 0) {
-    if (in_definition == 0)
-      EncodeNewType(LEVEL0);
-    else
-      EncodeNewType(LEVEL1);
-  }
-  else {
-    if (in_definition == 0)
-      EncodeNewType(LEVEL0_CAP);
-    else
-      EncodeNewType(LEVEL1_CAP);
-  }
-
+  EncodeNewType(2 * in_definition + prior_is_cap);
   define_symbol_instances = sd[define_symbol].count;
   if (define_symbol_instances != 1)
     new_symbol_code_length = sd[define_symbol].code_length;
@@ -2120,15 +887,14 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
     new_symbol_code_length = 0x20;
 
   // send symbol length, instances and ergodicity bit
-  if (define_symbol < start_my_symbols) {
-    SID_symbol = 0;
+  if (define_symbol < num_base_symbols) {
     EncodeSID(prior_is_cap, 0);
     if (define_symbol_instances == 1)
-      EncodeINST(prior_is_cap, 0, MAX_INSTANCES_FOR_MTF_QUEUE - 1);
-    else if (define_symbol_instances <= MAX_INSTANCES_FOR_MTF_QUEUE)
+      EncodeINST(prior_is_cap, 0, MAX_INSTANCES_FOR_REMOVE - 1);
+    else if (define_symbol_instances <= MAX_INSTANCES_FOR_REMOVE)
       EncodeINST(prior_is_cap, 0, define_symbol_instances - 2);
     else
-      EncodeINST(prior_is_cap, 0, MAX_INSTANCES_FOR_MTF_QUEUE + max_regular_code_length - new_symbol_code_length);
+      EncodeINST(prior_is_cap, 0, MAX_INSTANCES_FOR_REMOVE + max_regular_code_length - new_symbol_code_length);
     uint32_t new_symbol = define_symbol;
     if (cap_encoded != 0) {
       if (new_symbol > 'Z')
@@ -2153,7 +919,7 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
         if (define_symbol < START_UTF8_2BYTE_SYMBOLS) {
           prior_end = (uint8_t)define_symbol;
           symbol_lengths[prior_end] = new_symbol_code_length;
-          InitBaseSymbolCap(prior_end, 0x90, new_symbol_code_length, &cap_symbol_defined, &cap_lock_symbol_defined,
+          InitBaseSymbolCap(prior_end, new_symbol_code_length, &cap_symbol_defined, &cap_lock_symbol_defined,
               symbol_lengths);
           if (prior_end == 'B')
             prior_end = 'C';
@@ -2207,12 +973,11 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
             } while (j1-- != 0);
             j1 = 0x90;
             do {
-              InitSymbolFirstChar(prior_end, j1);
-              if (symbol_lengths[j1])
+              if (symbol_lengths[j1] != 0)
                 InitTrailingCharBin(prior_end, j1, symbol_lengths[j1]);
-              else if ((j1 == 'C') && cap_symbol_defined)
+              else if ((j1 == 'C') && (cap_symbol_defined != 0))
                 InitTrailingCharBin(prior_end, 'C', symbol_lengths[j1]);
-              else if ((j1 == 'B') && cap_lock_symbol_defined)
+              else if ((j1 == 'B') && (cap_lock_symbol_defined != 0))
                 InitTrailingCharBin(prior_end, 'B', symbol_lengths[j1]);
             } while (j1-- != 0);
           }
@@ -2221,7 +986,7 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
       else {
         prior_end = (uint8_t)define_symbol;
         symbol_lengths[prior_end] = new_symbol_code_length;
-        InitBaseSymbolCap(prior_end, 0xFF, new_symbol_code_length, &cap_symbol_defined, &cap_lock_symbol_defined,
+        InitBaseSymbolCap(prior_end, new_symbol_code_length, &cap_symbol_defined, &cap_lock_symbol_defined,
             symbol_lengths);
       }
     }
@@ -2236,8 +1001,7 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
           } while (j1-- != 0);
           j1 = 0x90;
           do {
-            InitSymbolFirstChar(prior_end, j1);
-            if (symbol_lengths[j1])
+            if (symbol_lengths[j1] != 0)
               InitTrailingCharBin(prior_end, j1, symbol_lengths[j1]);
           } while (j1-- != 0);
         }
@@ -2286,8 +1050,7 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
             } while (j1-- != 0);
             j1 = 0x90;
             do {
-              InitSymbolFirstChar(prior_end, j1);
-              if (symbol_lengths[j1])
+              if (symbol_lengths[j1] != 0)
                 InitTrailingCharBin(prior_end, j1, symbol_lengths[j1]);
             } while (j1-- != 0);
             InitFreqFirstChar(prior_end, prior_end);
@@ -2303,38 +1066,32 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
         } while (j1-- != 0);
         j1 = 0xFF;
         do {
-          InitSymbolFirstChar(prior_end, j1);
-          if (symbol_lengths[j1])
+          if (symbol_lengths[j1] != 0)
             InitTrailingCharBin(prior_end, j1, symbol_lengths[j1]);
         } while (j1-- != 0);
       }
     }
     prior_symbol = define_symbol;
-
-    char_before_define_is_cap = prior_is_cap;
     prior_is_cap = sd[define_symbol].type & 1;
     if (found_first_symbol == 0) {
       found_first_symbol = 1;
-      if (prior_end != 0x43)
-        end_char = prior_end;
-      else
-        end_char = (uint8_t)define_symbol;
-      sym_list_ptrs[end_char][max_code_length][0] = num_codes;
-      nsob[end_char][max_code_length] = 1;
+      end_char = prior_end;
       nbob[end_char][max_code_length] = 1;
       sum_nbob[end_char] = 1;
     }
+    if (define_symbol_instances == 1)
+      return(1);
   }
   else {
     num_grammar_rules++;
     define_symbol_start_ptr = symbol_array + sd[define_symbol].define_symbol_start_index;
     define_string_ptr = define_symbol_start_ptr;
-    define_string_end_ptr = symbol_array + sd[define_symbol+1].define_symbol_start_index - 1;
+    define_string_end_ptr = symbol_array + sd[define_symbol + 1].define_symbol_start_index - 1;
 
     // count the symbols in the definition
     symbols_in_definition = 0;
     while (define_string_ptr != define_string_end_ptr) {
-      if ((sd[*define_string_ptr].count != 1) || (*define_string_ptr < start_my_symbols))
+      if ((sd[*define_string_ptr].count != 1) || (*define_string_ptr < num_base_symbols))
         symbols_in_definition++;
       else
         symbols_in_definition += count_symbols(*define_string_ptr);
@@ -2368,100 +1125,93 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
         EncodeExtraLength((extra_symbols >> data_bits) & 3);
       }
     }
-
-    if (define_symbol_instances <= MAX_INSTANCES_FOR_MTF_QUEUE)
-      EncodeINST(prior_is_cap, SID_symbol, define_symbol_instances - 2);
-    else
-      EncodeINST(prior_is_cap, SID_symbol, MAX_INSTANCES_FOR_MTF_QUEUE + max_regular_code_length - new_symbol_code_length);
-
-    char_before_define_is_cap = prior_is_cap;
+    uint8_t saved_prior_is_cap = prior_is_cap;
 
     // write the symbol string
     define_string_ptr = define_symbol_start_ptr;
     while (define_string_ptr != define_string_end_ptr) {
       symbol = *define_string_ptr++;
-      symbol_inst = sd[symbol].inst_found++;
-      symbol_count = sd[symbol].count;
+      symbol_inst = sd[symbol].hits++;
       if (symbol_inst == 0) {
         if (embed_define(symbol, 1) == 0)
           return(0);
       }
-      else if (symbol_count <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        if (use_mtf != 0) {
-          if (manage_mtf_queue(symbol, symbol_inst, symbol_count, 1) == 0)
-            return(0);
-        }
-        else
-          manage_mtf_symbol(symbol, symbol_inst, symbol_count, 1);
-        prior_symbol = symbol;
-      }
       else {
         if ((sd[symbol].type & 8) != 0) {
           if (prior_is_cap == 0)
-            manage_mtfg_queue(symbol, 1);
+            update_queue(symbol, 1);
           else
-            manage_mtfg_queue_prior_cap(symbol, 1);
+            update_queue_prior_cap(symbol, 1);
         }
         else {
-          if (prior_is_cap == 0)
-            EncodeDictType(LEVEL1);
-          else
-            EncodeDictType(LEVEL1_CAP);
+          EncodeDictType(2 + prior_is_cap);
           encode_dictionary_symbol(symbol);
-          if (sd[symbol].type & 4) {
-            remove_dictionary_symbol(symbol, sd[symbol].code_length);
-            add_symbol_to_mtfg_queue(symbol);
+          if (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE) {
+            if (sd[symbol].count == sd[symbol].hits)
+              remove_dictionary_symbol(symbol, sd[symbol].code_length);
+            else if (use_mtf != 0) {
+              if ((sd[symbol].type & 4) != 0) {
+                if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0))
+                    EncodeGoMtf(sd[symbol].count, 0, 1);
+                  remove_dictionary_symbol(symbol, sd[symbol].code_length);
+                  add_symbol_to_queue(symbol);
+                }
+                else
+                  EncodeGoMtf(sd[symbol].count, 0, 0);
+              }
+            }
+          }
+          else if ((sd[symbol].type & 4) != 0) {
+            if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 1);
+              remove_dictionary_symbol(symbol, sd[symbol].code_length);
+              add_symbol_to_queue(symbol);
+            }
+            else
+              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 0);
           }
         }
         prior_is_cap = sd[symbol].type & 1;
         prior_symbol = symbol;
+        num_transmits++;
       }
       prior_end = sd[symbol].ends;
     }
     prior_symbol = define_symbol;
+
+    if (define_symbol_instances <= MAX_INSTANCES_FOR_REMOVE)
+      EncodeINST(saved_prior_is_cap, SID_symbol, define_symbol_instances - 2);
+    else
+      EncodeINST(saved_prior_is_cap, SID_symbol,
+          MAX_INSTANCES_FOR_REMOVE - 1 + max_regular_code_length - new_symbol_code_length);
+
+    if (cap_encoded != 0) {
+      if ((sd[define_symbol].type & 0x40) != 0) {
+        if ((sd[define_symbol].type & 0x20) != 0)
+          tag_type++;
+        EncodeWordTag(tag_type++);
+      }
+      else if ((sd[symbol_array[sd[define_symbol + 1].define_symbol_start_index - 2]].type & 0x60)
+            > (sd[define_symbol].type & 0x60))
+        sd[define_symbol].type
+            += (sd[symbol_array[sd[define_symbol + 1].define_symbol_start_index - 2]].type & 0x60) - 0x20;
+    }
   }
 
-  if (define_symbol_instances != 1) { // assign symbol code
-    uint8_t tag_type = 0;
-    if (cap_encoded != 0) {
-      if (sd[define_symbol].type & 0x40) {
-        if (sd[define_symbol].type & 0x80) {
-          tag_type = 2;
-          EncodeWordTag(1);
-        }
-        else {
-          tag_type = 1;
-          EncodeWordTag(0);
-        }
-      }
-      else if (define_symbol >= start_my_symbols)
-        sd[define_symbol].type |= sd[symbol_array[sd[define_symbol+1].define_symbol_start_index - 2]].type & 0xC0;
-    }
-    if (define_symbol_instances <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-      if (use_mtf != 0) {
-        UpFreqMtfQueueNum(char_before_define_is_cap, define_symbol_instances - 2);
-        // Handle initial mtf symbol instance
-        sd[define_symbol].type |= 8;
-        if (mtf_queue_size[define_symbol_instances] < MTF_QUEUE_SIZE)
-          mtf_queue[define_symbol_instances][mtf_queue_size[define_symbol_instances]++] = define_symbol;
-        else {
-          uint32_t symbol_to_move = mtf_queue[define_symbol_instances][0];
-          sd[symbol_to_move].type &= 0xF7;
-          if (add_dictionary_symbol(symbol_to_move, new_symbol_code_length) == 0)
-            return(0);
-          uint8_t i;
-          for (i = 0 ; i < 63 ; i++)
-            mtf_queue[define_symbol_instances][i] = mtf_queue[define_symbol_instances][i+1];
-          mtf_queue[define_symbol_instances][63] = define_symbol;
-        }
-      }
-      else if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
-        return(0);
-    }
-    else if (use_mtfg && (new_symbol_code_length >= 11)) {
-      if (sd[define_symbol].type & 4) {
+  if ((use_mtf != 0) && ((new_symbol_code_length >= 11) || (define_symbol_instances <= MAX_INSTANCES_FOR_REMOVE))) {
+    if (define_symbol_instances > MAX_INSTANCES_FOR_REMOVE) {
+      if ((sd[define_symbol].type & 4) != 0) {
         EncodeERG(tag_type, 1);
-        add_symbol_to_mtfg_queue(define_symbol);
+        if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+          EncodeGoMtf(new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE, 2, 1);
+          add_symbol_to_queue(define_symbol);
+        }
+        else {
+          EncodeGoMtf(new_symbol_code_length + MAX_INSTANCES_FOR_REMOVE, 2, 0);
+          if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+            return(0);
+        }
       }
       else {
         EncodeERG(tag_type, 0);
@@ -2469,10 +1219,48 @@ uint8_t embed_define(uint32_t define_symbol, uint8_t in_definition) {
           return(0);
       }
     }
-    else if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
-      return(0);
+    else if ((sd[define_symbol].type & 4) != 0) {
+      EncodeERG(define_symbol_instances + 1, 1);
+      if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+        if (define_symbol_instances > 2)
+          EncodeGoMtf(define_symbol_instances, 2, 1);
+        add_symbol_to_queue(define_symbol);
+      }
+      else {
+        if (define_symbol_instances > 2)
+          EncodeGoMtf(define_symbol_instances, 2, 0);
+        if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+          return(0);
+      }
+    }
+    else {
+      EncodeERG(define_symbol_instances + 1, 0);
+      if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+        return(0);
+    }
   }
+  else if (add_dictionary_symbol(define_symbol, new_symbol_code_length) == 0)
+    return(0);
+  num_transmits++;
   return(1);
+}
+
+
+void replace_symbol(uint32_t * symbol_array, uint32_t symbol, uint32_t ** symbol2_ptr_ptr,
+    uint32_t * num_more_than_15_inst_definitions_ptr) {
+  uint32_t * define_string_ptr = symbol_array + sd[symbol].define_symbol_start_index;
+  uint32_t * define_string_end_ptr = symbol_array + sd[symbol + 1].define_symbol_start_index - 1;
+  while (define_string_ptr != define_string_end_ptr) {
+    uint32_t symbol2 = *define_string_ptr++;
+    if ((symbol2 >= num_base_symbols) && (sd[symbol2].code_length != 0))
+      replace_symbol(symbol_array, symbol2, symbol2_ptr_ptr, num_more_than_15_inst_definitions_ptr);
+    else {
+      *((*symbol2_ptr_ptr)++) = symbol2;
+      if ((sd[symbol2].code_length != 2) && (sd[symbol2].count++ == MAX_INSTANCES_FOR_REMOVE))
+        (*num_more_than_15_inst_definitions_ptr)++;
+    }
+  }
+  return;
 }
 
 
@@ -2481,42 +1269,33 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   const uint8_t INSERT_SYMBOL_CHAR = 0xFE;
   const uint8_t DEFINE_SYMBOL_CHAR = 0xFF;
   const size_t WRITE_SIZE = 0x40000;
-  uint8_t temp_char, base_bits, format, verbose, code_length;
+  uint8_t temp_char, base_bits, format, verbose, code_length, increase_length, decrease_length;
   uint8_t *in_char_ptr, *end_char_ptr;
-  uint32_t i, j, num_symbols_defined, num_definitions_to_code, grammar_size, num_mtf_symbol_definitions;
-  uint32_t UTF8_value, max_UTF8_value, symbol, symbol_count, symbol_inst, prior_repeats, next_symbol, code_length_limit;
-  uint32_t min_ranked_symbols, ranked_symbols_save, num_new_symbols, num_regular_definitions, num_symbols_to_code;
-  uint32_t mtf_queue_miss_code_space, min_code_space, mtf_symbols, mtfg_symbols_reduced, rules_reduced;
-  uint32_t *symbol_ptr, *end_symbol_ptr, *ranked_symbols, *first_define_ptr;
-  uint32_t *ranked_symbols_ptr, *end_ranked_symbols_ptr, *min_ranked_symbols_ptr, *max_ranked_symbols_ptr;
-  uint32_t *min_one_instance_ranked_symbols_ptr, *next_sorted_symbol_ptr;
-  int32_t remaining_symbols_to_code, remaining_code_space, index_last_length[26];
-  double d_remaining_symbols_to_code, symbol_inst_factor;
+  uint16_t queue_position;
+  uint32_t i, j, num_symbols_defined, num_definitions_to_code, grammar_size, dictionary_size;
+  uint32_t num_more_than_15_inst_definitions, num_greater_500, num_transmits_over_sqrt2, num_mtfs;
+  uint32_t UTF8_value, max_UTF8_value, symbol, symbol_inst, prior_repeats, next_symbol;
+  uint32_t min_ranked_symbols, ranked_symbols_save, num_new_symbols, num_symbols_to_code, num_rules_reversed;
+  uint32_t code_length_limit, mtf_miss_code_space, min_code_space, rules_reduced;
+  uint32_t mtf_started[MAX_INSTANCES_FOR_REMOVE + 1], mtf_hits[MAX_INSTANCES_FOR_REMOVE + 1];
+  uint32_t mtf_peak[MAX_INSTANCES_FOR_REMOVE + 1], mtf_peak_mtf[MAX_INSTANCES_FOR_REMOVE + 1];
+  uint32_t mtf_in_dictionary[MAX_INSTANCES_FOR_REMOVE + 1], mtf_active[MAX_INSTANCES_FOR_REMOVE + 1];
+  uint32_t *symbol_ptr, *symbol2_ptr, *symbol_array2, *end_symbol_ptr, *first_define_ptr, *max_ptr;
+  uint32_t *ranked_symbols, *ranked_symbols2, *ranked_symbols_ptr, *ranked_symbols2_ptr, *end_ranked_symbols_ptr;
+  uint32_t *min_ranked_symbols_ptr, *max_ranked_symbols_ptr, *min_one_instance_ranked_symbols_ptr, *peak_array;
+  int32_t remaining_symbols_to_code, remaining_code_space, max_len_adj_profit;
+  int32_t index_last_length[26], index_first_length[26];
+  double symbol_inst_factor, codes_per_code_space;
 
 
-  for (i = 2 ; i <= MAX_INSTANCES_FOR_MTF_QUEUE ; i++) {
-    mtf_queue_started[i] = 0;
-    mtf_queue_done[i] = 0;
-    mtf_queue_peak[i] = 0;
-    mtf_queue_size[i] = 0;
-    mtf_queue_hits[i] = 0;
-  }
-  mtfg_queue_8_offset = 0;
-  mtfg_queue_16_offset = 0;
-  mtfg_queue_32_offset = 0;
-  mtfg_queue_64_offset = 0;
-  mtfg_queue_128_offset = 0;
-  mtfg_queue_192_offset = 0;
-
-  verbose = 0;
-  use_mtfg = 0;
+  verbose = cap_encoded = UTF8_compliant = num_symbols_defined = 0;
+  first_define_ptr = 0;
+  base_bits = 8;
   use_mtf = 2;
   if (params != 0) {
     verbose = params->print_dictionary;
     use_mtf = params->use_mtf;
   }
-  base_bits = 8;
-
   in_char_ptr = inbuf;
   end_char_ptr = inbuf + in_size;
   format = *in_char_ptr++;
@@ -2529,28 +1308,18 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       max_UTF8_value = 0x7F;
     }
   }
-  else {
-    cap_encoded = 0;
-    UTF8_compliant = 0;
-  }
-
-  symbol_array = (uint32_t *)malloc(sizeof(uint32_t) * in_size);
-  if (symbol_array == 0) {
-    fprintf(stderr,"Symbol memory allocation failed\n");
+  if ((symbol_array = (uint32_t *)malloc(sizeof(uint32_t) * in_size)) == 0) {
+    fprintf(stderr, "Symbol memory allocation failed\n");
     return(0);
   }
   symbol_ptr = symbol_array;
 
-  num_symbols_defined = 0;
-  first_define_ptr = 0;
-
   if (UTF8_compliant != 0) {
-    start_my_symbols = 1 << base_bits;
-    num_base_symbols = start_my_symbols;
+    num_base_symbols = 1 << base_bits;
     while (in_char_ptr < end_char_ptr) {
       temp_char = *in_char_ptr++;
       if (temp_char == INSERT_SYMBOL_CHAR) {
-        symbol = start_my_symbols;
+        symbol = num_base_symbols;
         symbol += 0x10000 * (uint32_t)*in_char_ptr++;
         symbol += 0x100 * (uint32_t)*in_char_ptr++;
         symbol += (uint32_t)*in_char_ptr++;
@@ -2560,16 +1329,12 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
         if (first_define_ptr == 0)
           first_define_ptr = symbol_ptr;
         in_char_ptr += 3;
-        *symbol_ptr++ = ((uint32_t)DEFINE_SYMBOL_CHAR << 24) + num_symbols_defined++;
+        *symbol_ptr++ = 0x80000000 + num_symbols_defined++;
       }
       else if (temp_char < START_UTF8_2BYTE_SYMBOLS)
         *symbol_ptr++ = (uint32_t)temp_char;
       else {
-        if (temp_char >= 0xF8) { // not a UTF-8 character
-          fprintf(stderr,"ERROR - non UTF-8 character %x\n",(unsigned char)temp_char);
-          return(0);
-        }
-        else if (temp_char >= 0xF0) { // 4 byte UTF-8 character
+        if (temp_char >= 0xF0) { // 4 byte UTF-8 character
           UTF8_value = 0x40000 * (temp_char & 7);
           UTF8_value += 0x1000 * (*in_char_ptr++ & 0x3F);
           UTF8_value += 0x40 * (*in_char_ptr++ & 0x3F);
@@ -2588,7 +1353,6 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     }
   }
   else {
-    start_my_symbols = 0x100;
     num_base_symbols = 0x100;
     while (in_char_ptr < end_char_ptr) {
       temp_char = *in_char_ptr++;
@@ -2599,7 +1363,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
         in_char_ptr++;
       }
       else if (temp_char == INSERT_SYMBOL_CHAR) {
-        symbol = start_my_symbols;
+        symbol = num_base_symbols;
         symbol += 0x10000 * (uint32_t)*in_char_ptr++;
         symbol += 0x100 * (uint32_t)*in_char_ptr++;
         symbol += (uint32_t)*in_char_ptr++;
@@ -2609,67 +1373,62 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
         if (first_define_ptr == 0)
           first_define_ptr = symbol_ptr;
         in_char_ptr += 3;
-        *symbol_ptr++ = ((uint32_t)DEFINE_SYMBOL_CHAR << 24) + num_symbols_defined++;
+        *symbol_ptr++ = 0x80000000 + num_symbols_defined++;
       }
     }
   }
 
+  end_symbol_ptr = symbol_ptr;
+  *end_symbol_ptr = UNIQUE_SYMBOL;
+  num_codes = num_base_symbols + num_symbols_defined;
   grammar_size = symbol_ptr - symbol_array;
   if (first_define_ptr == 0)
     first_define_ptr = symbol_ptr;
 
-  end_symbol_ptr = symbol_ptr;
-  *end_symbol_ptr = UNIQUE_CHAR;
-  num_codes = start_my_symbols + num_symbols_defined;
-
-  if (0 == (sd = (struct symbol_data *)malloc(sizeof(struct symbol_data) * (num_codes + 1)))) {
-    fprintf(stderr,"Symbol data memory allocation failed\n");
-    return(0);
-  }
-
-  if (0 == (ranked_symbols = (uint32_t *)malloc(sizeof(uint32_t) * num_codes))) {
-    fprintf(stderr,"Ranked symbol array memory allocation failed\n");
+  if ((0 == (symbol_array2 = (uint32_t *)malloc(sizeof(uint32_t) * (end_symbol_ptr - symbol_array))))
+      || (0 == (sd = (struct symbol_data *)malloc(sizeof(struct symbol_data) * (num_codes + 1))))
+      || (0 == (ranked_symbols = (uint32_t *)malloc(sizeof(uint32_t) * num_codes)))
+      || (0 == (ranked_symbols2 = (uint32_t *)malloc(sizeof(uint32_t) * num_codes)))
+      || (0 == (transmits = (struct transmit_symbols *)malloc(sizeof(struct transmit_symbols) * grammar_size)))) {
+    fprintf(stderr, "Memory allocation failed\n");
     return(0);
   }
 
   // count the number of instances of each symbol
-  for (i = 0 ; i < num_codes ; i++) {
+  for (i = 0 ; i < num_codes ; i++)
     sd[i].count = 0;
-    sd[i].inst_found = 0;
-  }
   symbol_ptr = symbol_array;
-  num_symbols_defined = 0;
-  while (1) {
-    if (*symbol_ptr < (uint32_t)DEFINE_SYMBOL_CHAR << 24)
-      sd[*symbol_ptr++].count++;
-    else if (*symbol_ptr++ != UNIQUE_CHAR)
-      sd[start_my_symbols + num_symbols_defined++].define_symbol_start_index = symbol_ptr - symbol_array;
+  while (symbol_ptr != end_symbol_ptr) {
+    symbol = *symbol_ptr++;
+    if ((int32_t)symbol >= 0)
+      sd[symbol].count++;
     else
-      break;
+      sd[symbol - 0x80000000 + num_base_symbols].define_symbol_start_index = symbol_ptr - symbol_array;
   }
-  sd[start_my_symbols + num_symbols_defined].define_symbol_start_index = symbol_ptr - symbol_array;
+  sd[num_codes].define_symbol_start_index = symbol_ptr - symbol_array + 1;
 
   if (cap_encoded != 0) {
     i = 0;
     do {
-      sd[i].type = 0;
-    } while (++i != 0x61);
+      sd[i++].type = 0;
+    } while (i != 0x61);
     do {
-      sd[i].type = 2;
-    } while (++i != 0x7B);
+      sd[i++].type = 2;
+    } while (i != 0x7B);
     do {
-      sd[i].type = 0;
-    } while (++i != start_my_symbols);
-    sd['B'].type = 1;
-    sd['C'].type = 1;
+      sd[i++].type = 0;
+    } while (i != num_base_symbols);
+    sd[' '].type = 0x10;
+    sd['B'].type = 0x11;
+    sd['C'].type = 0x11;
     while (i < num_codes) {
       next_symbol = symbol_array[sd[i].define_symbol_start_index];
       while (next_symbol > i)
         next_symbol = symbol_array[sd[next_symbol].define_symbol_start_index];
       sd[i].type = sd[next_symbol].type & 2;
-      next_symbol = symbol_array[sd[i+1].define_symbol_start_index-2];
+      next_symbol = symbol_array[sd[i + 1].define_symbol_start_index - 2];
       while (next_symbol > i)
-        next_symbol = symbol_array[sd[next_symbol+1].define_symbol_start_index-2];
+        next_symbol = symbol_array[sd[next_symbol + 1].define_symbol_start_index - 2];
       sd[i++].type |= sd[next_symbol].type & 1;
     }
   }
@@ -2701,7 +1460,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
 
   rules_reduced = 0;
   if (num_symbols_defined != 0) {
-    for (i = start_my_symbols ; i < start_my_symbols + num_symbols_defined; i++)
+    for (i = num_base_symbols ; i < num_codes; i++)
       if (sd[i].count == 1)
         rules_reduced++;
   }
@@ -2715,16 +1474,16 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       double d_symbol_count = (double)sd[i].count;
       order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
     }
-  } while (++i < start_my_symbols);
+  } while (++i < num_base_symbols);
   if (num_symbols_defined != 0) {
-    while (i < start_my_symbols + num_symbols_defined) {
+    while (i < num_codes) {
       double d_symbol_count = (double)sd[i++].count;
       order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
     }
     double d_symbol_count = (double)num_symbols_defined;
     order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
   }
-  fprintf(stderr,"%u syms, dict. size %u, %.4f bits/sym, o0e %.2lf bytes\n",
+  fprintf(stderr, "%u syms, dict. size %u, %.4f bits/sym, o0e %.2lf bytes\n",
       (unsigned int)grammar_size, (unsigned int)num_symbols_defined,
       (float)(order_0_entropy / (double)grammar_size), 0.125 * order_0_entropy);
 #endif
@@ -2741,9 +1500,9 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
         double d_symbol_count = (double)sd[i].count;
         order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
       }
-    } while (++i < start_my_symbols);
+    } while (++i < num_base_symbols);
     if (num_symbols_defined != 0) {
-      while (i < start_my_symbols + num_symbols_defined) {
+      while (i < num_codes) {
         if (sd[i].count > 1) {
           double d_symbol_count = (double)sd[i].count;
           order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
@@ -2753,21 +1512,21 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       double d_symbol_count = (double)(num_symbols_defined - rules_reduced);
       order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
     }
-    fprintf(stderr,"Eliminated %u single appearance grammar rules\n",rules_reduced);
-    fprintf(stderr,"%u syms, dict. size %u, %.4f bits/sym, o0e %.2lf bytes\n",
-        (unsigned int)grammar_size,(unsigned int)(num_symbols_defined - rules_reduced),
-        (float)(order_0_entropy/(double)grammar_size),0.125*order_0_entropy);
+    fprintf(stderr, "Eliminated %u single appearance grammar rules\n", rules_reduced);
+    fprintf(stderr, "%u syms, dict. size %u, %.4f bits/sym, o0e %.2lf bytes\n",
+        (unsigned int)grammar_size, (unsigned int)(num_symbols_defined - rules_reduced),
+        (float)(order_0_entropy/(double)grammar_size), 0.125 * order_0_entropy);
   }
 
   uint32_t len_counts[16];
   uint32_t extra_len_bits = 0;
   for (i = 0 ; i < 16 ; i++)
     len_counts[i] = 0;
-  for (i = start_my_symbols ; i < start_my_symbols + num_symbols_defined ; i++) {
+  for (i = num_base_symbols ; i < num_codes ; i++) {
     if (sd[i].count > 1) {
       uint32_t dl = sd[i + 1].define_symbol_start_index - sd[i].define_symbol_start_index - 1;
       if (dl < 16)
-        len_counts[dl-1]++;
+        len_counts[dl - 1]++;
       else {
         len_counts[15]++;
         uint32_t extra_len = dl - 14;
@@ -2791,9 +1550,9 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       double d_symbol_count = (double)sd[i].count;
       order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
     }
-  } while (++i < start_my_symbols);
+  } while (++i < num_base_symbols);
   if (num_symbols_defined != 0) {
-    while (i < start_my_symbols + num_symbols_defined) {
+    while (i < num_codes) {
       if (sd[i].count > 1) {
         double d_symbol_count = (double)(sd[i].count - 1);
         order_0_entropy += d_symbol_count * (log_file_symbols - log2(d_symbol_count));
@@ -2815,18 +1574,33 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       }
     }
     code_entropy += (double)extra_len_bits;
-    fprintf(stderr,"Finished embedding grammar rules\n");
-    fprintf(stderr,"Final grammar size: %u (%u terminals + %u rule symbols + %u repeats)\n",
+    fprintf(stderr, "Finished embedding grammar rules\n");
+    fprintf(stderr, "Reduced grammar size: %u (%u terminals + %u rule symbols + %u repeats)\n",
       grammar_size, num_new_symbols + rules_reduced - num_symbols_defined, num_symbols_defined - rules_reduced,
       grammar_size - num_new_symbols);
-    fprintf(stderr,"%.4f bits/symbol, plus %u length codes %.4f bits/code, o0e %.2lf bytes\n",
+    fprintf(stderr, "%.4f bits/symbol, plus %u length codes %.4f bits/code, o0e %.2lf bytes\n",
         (float)(order_0_entropy/(double)grammar_size), (unsigned int)(num_symbols_defined - rules_reduced),
         (float)(code_entropy/(double)len_codes), 0.125 * (order_0_entropy + code_entropy));
   }
 #endif
 
   // sort symbols with 800 or fewer instances by putting them at the end of the sorted symbols array
-  for (i = 2 ; i < 801 ; i++) {
+  for (i = 2 ; i <= MAX_INSTANCES_FOR_REMOVE ; i++) {
+    ranked_symbols_ptr = ranked_symbols;
+    while (ranked_symbols_ptr < min_ranked_symbols_ptr) {
+      if (sd[*ranked_symbols_ptr].count == i) {
+        ranked_symbols_save = *ranked_symbols_ptr;
+        *ranked_symbols_ptr = *--min_ranked_symbols_ptr;
+        *min_ranked_symbols_ptr = ranked_symbols_save;
+      }
+      else
+        ranked_symbols_ptr++;
+    }
+  }
+
+  num_more_than_15_inst_definitions = min_ranked_symbols_ptr - ranked_symbols;
+
+  for (i = MAX_INSTANCES_FOR_REMOVE ; i < 801 ; i++) {
     ranked_symbols_ptr = ranked_symbols;
     while (ranked_symbols_ptr < min_ranked_symbols_ptr) {
       if (sd[*ranked_symbols_ptr].count == i) {
@@ -2859,69 +1633,11 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   }
 
   num_definitions_to_code = min_one_instance_ranked_symbols_ptr - ranked_symbols;
-
-  remaining_symbols_to_code = grammar_size - num_new_symbols - rules_reduced;
-  remaining_code_space = (1 << 30) - (1 << (30 - MAX_BITS_IN_CODE)); // reserve space for EOF
-
-  for (i = 2 ; i < 5 ; i++)
-    mtf_queue_miss_code_length[i] = 25;
-  for (i = 5 ; i < 10 ; i++)
-    mtf_queue_miss_code_length[i] = 24;
-  for (i = 10 ; i <= MAX_INSTANCES_FOR_MTF_QUEUE ; i++)
-    mtf_queue_miss_code_length[i] = 23;
-
   max_regular_code_length = 2;
-  num_regular_definitions = 0;
+  if (sd[ranked_symbols[0]].count > MAX_INSTANCES_FOR_REMOVE)
+    max_regular_code_length = (uint8_t)log2((double)(grammar_size - num_new_symbols) * 0.094821); // sqrt(2) / 15
 
-  prior_repeats = 0;
-  i = 0;
-  while (i < num_definitions_to_code) {
-    symbol_inst = sd[ranked_symbols[i]].count - 1;
-    if (symbol_inst != prior_repeats) {
-      if (symbol_inst < MAX_INSTANCES_FOR_MTF_QUEUE)
-        break;
-      prior_repeats = symbol_inst;
-      symbol_inst_factor = (double)0x5A827999 / (double)symbol_inst; /* 0x40000000 * sqrt(2.0) */
-    }
-    d_remaining_symbols_to_code = (double)remaining_symbols_to_code;
-    code_length = (uint8_t)(log2(d_remaining_symbols_to_code * symbol_inst_factor / (double)remaining_code_space));
-    if (code_length < 2) // limit so files with less than 2 bit symbols (ideally) work
-      code_length = 2;
-    num_regular_definitions++;
-    if (code_length > 24)
-      code_length = 24;
-    if (code_length > max_regular_code_length)
-      max_regular_code_length = code_length;
-    sd[ranked_symbols[i]].code_length = code_length;
-    remaining_code_space -= (1 << (30 - code_length));
-    remaining_symbols_to_code -= symbol_inst;
-    i++;
-  }
-
-  mtfg_queue_8_offset = 0;
-  mtfg_queue_16_offset = 0;
-  mtfg_queue_32_offset = 0;
-  mtfg_queue_64_offset = 0;
-  mtfg_queue_128_offset = 0;
-  mtfg_queue_192_offset = 0;
-  for (i = 0 ; i < 8 ; i++)
-    mtfg_queue_0[i] = num_codes;
-  for (i = 0 ; i < 8 ; i++)
-    mtfg_queue_8[i] = num_codes;
-  for (i = 0 ; i < 16 ; i++)
-    mtfg_queue_16[i] = num_codes;
-  for (i = 0 ; i < 32 ; i++)
-    mtfg_queue_32[i] = num_codes;
-  for (i = 0 ; i < 64 ; i++)
-    mtfg_queue_64[i] = num_codes;
-  for (i = 0 ; i < 64 ; i++)
-    mtfg_queue_128[i] = num_codes;
-  for (i = 0 ; i < 64 ; i++)
-    mtfg_queue_192[i] = num_codes;
-
-  symbol_ptr = symbol_array;
-
-  for (i = start_my_symbols ; i < num_codes ; i++) {
+  for (i = num_base_symbols ; i < num_codes ; i++) {
     sd[i].starts = 0;
     sd[i].ends = 0;
   }
@@ -3076,7 +1792,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     }
     if (cap_encoded != 0)
       sd['B'].ends = 'C';
-    i = start_my_symbols;
+    i = num_base_symbols;
     while (i < num_codes) {
       if (sd[i].starts == 0)
         sd[i].starts = find_first_UTF8(i);
@@ -3094,7 +1810,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     }
     if (cap_encoded != 0)
       sd['B'].ends = 'C';
-    i = start_my_symbols;
+    i = num_base_symbols;
     while (i < num_codes) {
       if (sd[i].starts == 0)
         sd[i].starts = find_first(i);
@@ -3104,264 +1820,630 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     }
   }
 
-  for (i = 0 ; i < num_codes; i++)
-    sd[i].space_score = 0;
-  prior_symbol = (uint32_t)-1;
+  num_transmits = 0;
+  dictionary_size = 0;
+  for (i = 0 ; i < num_codes ; i++) {
+    sd[i].hits = 0;
+    sd[i].previous = 0xFFFFFFFF;
+  }
+  symbol_ptr = symbol_array;
 
   while (symbol_ptr < first_define_ptr) {
-#ifdef PRINTON
-    if (((symbol_ptr - symbol_array) & 0x3FFFFF) == 0)
-      fprintf(stderr,"Parsed %u of %u level 0 symbols\r",
-          (unsigned int)(symbol_ptr - symbol_array),(unsigned int)(first_define_ptr - symbol_array));
-#endif
     symbol = *symbol_ptr++;
-    symbol_inst = sd[symbol].inst_found++;
-    if (symbol_inst == 0)
-      count_embedded_definition_symbols(symbol);
+    if (sd[symbol].previous == 0xFFFFFFFF) {
+      get_embedded_symbols(symbol);
+      dictionary_size += get_dictionary_size(symbol);
+    }
     else {
-      if (prior_symbol >= 0) {
-        if (sd[prior_symbol].type & 0x20) {
-          if (sd[symbol].starts == 0x20)
-            sd[prior_symbol].space_score += 1;
-          else
-            sd[prior_symbol].space_score -= 4;
+      transmits[sd[symbol].previous].distance = num_transmits - sd[symbol].previous;
+      transmits[num_transmits].previous_index = sd[symbol].previous;
+      transmits[num_transmits].distance = 0xFFFFFFFF;
+      sd[symbol].previous = num_transmits++;
+    }
+  }
+#ifdef PRINTON
+  fprintf(stderr, "Parsed %u level 0 symbols\n", (unsigned int)(first_define_ptr - symbol_array));
+#endif
+
+  num_transmits_over_sqrt2 = (uint32_t)((float)num_transmits * 0.7071);
+  if (((num_transmits_over_sqrt2 >> 10) < MAX_INSTANCES_FOR_REMOVE) && (use_mtf == 2))
+    use_mtf = 0;
+
+  for (i = 0 ; i < num_base_symbols ; i++) {
+    if (sd[i].count == 1)
+      sd[i].code_length = 2;
+    else
+      sd[i].code_length = 0;
+  }
+  for (i = num_base_symbols ; i < num_codes ; i++) {
+    if (sd[i].count == 1)
+      sd[i].code_length = 1;
+    else
+      sd[i].code_length = 0;
+  }
+
+  i = num_more_than_15_inst_definitions;
+  while ((i < num_definitions_to_code) && (sd[ranked_symbols[i]].count > 2))
+    i++;
+  uint32_t num_2_inst_definitions = num_definitions_to_code - i;
+  num_rules_reversed = 0;
+  while (i < num_definitions_to_code) {
+    uint32_t * define_string_ptr = symbol_array + sd[ranked_symbols[i]].define_symbol_start_index;
+    uint32_t * define_string_end_ptr = symbol_array + sd[ranked_symbols[i] + 1].define_symbol_start_index - 1;
+    if (define_string_end_ptr - define_string_ptr == 2) {
+      uint32_t last_transmit = sd[ranked_symbols[i]].previous;
+      uint32_t distance = last_transmit - transmits[last_transmit].previous_index;
+      float score = 0.0;
+      if ((distance <= num_transmits / 20))
+        score = (float)log2((double)num_transmits / (2.0 * (double)distance)) - 1.5 * log2((double)distance) + 10.5;
+      if (score <= 0.0) {
+        float cost = 1.0 + (float)log2(((double)(sd[*define_string_ptr].count - 1)
+            * (double)(sd[*(define_string_ptr + 1)].count - 1)) / (double)num_2_inst_definitions);
+        if (sd[ranked_symbols[i]].hits != 0)
+          cost -= (float)sd[ranked_symbols[i]].hits;
+        if (cost >= 0.0) {
+          sd[ranked_symbols[i]].code_length = 1;
+          num_rules_reversed++;
         }
       }
-      if (sd[symbol].count <= MAX_INSTANCES_FOR_MTF_QUEUE)
-        update_mtf_queue(symbol, symbol_inst, sd[symbol].count);
-      else {
-        if (sd[symbol].code_length >= 11) {
-          if ((sd[symbol].type & 8) != 0) {
-            manage_mtfg_queue1(symbol);
-            sd[symbol].mtfg_hits++;
-          }
-          else
-            add_symbol_to_mtfg_queue1(symbol);
+    }
+    i++;
+  }
+
+  // unmark rules that contain reversed rules
+  i = num_definitions_to_code - num_2_inst_definitions;
+  while (i < num_definitions_to_code) {
+    if (sd[ranked_symbols[i]].code_length != 0) {
+      uint32_t * define_string_ptr = symbol_array + sd[ranked_symbols[i]].define_symbol_start_index;
+      if ((sd[*define_string_ptr].code_length != 0) || (sd[*(define_string_ptr + 1)].code_length != 0)) {
+        sd[ranked_symbols[i]].code_length = 0;
+        num_rules_reversed--;
+      }
+    }
+    i++;
+  }
+
+  symbol2_ptr = symbol_array2;
+  symbol_ptr = symbol_array;
+  while (symbol_ptr < end_symbol_ptr) {
+    symbol = *symbol_ptr++;
+    if ((symbol & 0x80000000) == 0) {
+      if ((symbol >= num_base_symbols) && (sd[symbol].code_length != 0))
+        replace_symbol(symbol_array, symbol, &symbol2_ptr, &num_more_than_15_inst_definitions);
+      else
+        *symbol2_ptr++ = symbol;
+    }
+    else if (sd[symbol - 0x80000000 + num_base_symbols].code_length != 0) {
+      do {
+        if ((sd[*symbol_ptr].code_length != 2) && (--sd[*symbol_ptr].count == MAX_INSTANCES_FOR_REMOVE))
+          num_more_than_15_inst_definitions--;
+      } while (*++symbol_ptr < 0x80000000);
+    }
+    else
+      *symbol2_ptr++ = symbol;
+  }
+  memcpy(symbol_array, symbol_array2, sizeof(uint32_t) * (symbol2_ptr - symbol_array2));
+  end_symbol_ptr = symbol_array + (symbol2_ptr - symbol_array2);
+  *end_symbol_ptr = UNIQUE_SYMBOL;
+
+#ifdef PRINTON
+  fprintf(stderr, "Eliminated %u two instance rules\n", num_rules_reversed);
+#endif
+
+  prior_symbol = num_base_symbols - 1;
+  symbol_ptr = first_define_ptr;
+  while (symbol_ptr < end_symbol_ptr) {
+    symbol = *symbol_ptr++;
+    if ((symbol & 0x80000000) != 0) {
+      symbol += num_base_symbols - 0x80000000;
+      sd[symbol].define_symbol_start_index = symbol_ptr - symbol_array;
+      if (++prior_symbol == num_base_symbols)
+        first_define_ptr = symbol_ptr - 1;
+      if (prior_symbol != symbol) {
+        sd[prior_symbol].define_symbol_start_index = symbol_ptr - symbol_array;
+        prior_symbol = symbol;
+      }
+    }
+  }
+  if (++prior_symbol != num_codes)
+    sd[prior_symbol].define_symbol_start_index = symbol2_ptr - symbol_array2 + 1;
+  sd[num_codes].define_symbol_start_index = symbol2_ptr - symbol_array2 + 1;
+
+  i = 0;
+  while (i < num_definitions_to_code) {
+    if (sd[ranked_symbols[i]].code_length != 0) {
+      num_definitions_to_code--;
+      num_new_symbols--;
+      uint32_t bad_symbol = ranked_symbols[i];
+      ranked_symbols[i] = ranked_symbols[num_definitions_to_code];
+      ranked_symbols[num_definitions_to_code] = bad_symbol;
+    }
+    else {
+      if ((i != 0) && (sd[ranked_symbols[i]].count > sd[ranked_symbols[i - 1]].count)) {
+        uint32_t temp_symbol = ranked_symbols[i];
+        uint32_t temp_count = sd[temp_symbol].count;
+        uint32_t new_rank = i - 1;
+        while ((new_rank != 0) && (temp_count > sd[ranked_symbols[new_rank - 1]].count)) {
+          ranked_symbols[new_rank + 1] = ranked_symbols[new_rank];
+          new_rank--;
         }
+        ranked_symbols[new_rank + 1] = ranked_symbols[new_rank];
+        ranked_symbols[new_rank] = temp_symbol;
+      }
+      i++;
+    }
+  }
+
+  num_transmits = 0;
+  for (i = 0 ; i < num_codes ; i++) {
+    sd[i].space_score = 0;
+    sd[i].previous = 0xFFFFFFFF;
+  }
+  prior_symbol = (uint32_t)-1;
+  symbol_ptr = symbol_array;
+
+  while (symbol_ptr < first_define_ptr) {
+    symbol = *symbol_ptr++;
+    if (sd[symbol].previous == 0xFFFFFFFF)
+      get_embedded_symbols2(symbol);
+    else {
+      transmits[sd[symbol].previous].distance = num_transmits - sd[symbol].previous;
+      transmits[num_transmits].previous_index = sd[symbol].previous;
+      transmits[num_transmits].symbol = symbol;
+      transmits[num_transmits].distance = 0xFFFFFFFF;
+      sd[symbol].previous = num_transmits++;
+      if (sd[prior_symbol].type >= 0x20) {
+        if (sd[symbol].starts == 0x20)
+          sd[prior_symbol].space_score++;
+        else
+          sd[prior_symbol].space_score -= 4;
       }
       prior_symbol = symbol;
     }
   }
-#ifdef PRINTON
-  fprintf(stderr,"Parsed %u level 0 symbols              \r",(unsigned int)(first_define_ptr - symbol_array));
-#endif
 
   num_symbols_to_code = grammar_size - num_new_symbols - rules_reduced;
-  mtfg_symbols_reduced = 0;
+  num_transmits_over_sqrt2 = (uint32_t)((float)num_transmits * 0.7071);
+  num_mtfs = 0;
+
+  if (use_mtf != 0) {
+    for (i = 0 ; i < num_codes ; i++) {
+      if ((sd[i].count <= (num_transmits_over_sqrt2 >> 10)) || (sd[i].count <= MAX_INSTANCES_FOR_REMOVE))
+        sd[i].type |= 4;
+    }
+    for (i = 0 ; i < num_codes ; i++)
+      sd[i].hits = 0;
+
+    for (i = 0 ; i < num_transmits ; i++) {
+      uint32_t distance = transmits[i].distance;
+      if (distance != 0xFFFFFFFF) {
+        uint32_t symbol = transmits[i].symbol;
+        if (((sd[symbol].type & 4) != 0) && (distance <= num_transmits / (10 * sd[symbol].count))) {
+          transmits[i].score = (float)log2((double)num_transmits / ((double)sd[symbol].count * (double)distance))
+              - 1.5 * log2((double)distance) + 10.5;
+          if (transmits[i].score < 0.0) {
+            transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
+            transmits[i].distance = 0xFFFFFFFF;
+          }
+          else
+            num_mtfs++;
+        }
+        else {
+          transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
+          transmits[i].distance = 0xFFFFFFFF;
+        }
+      }
+    }
+#ifdef PRINTON
+  fprintf(stderr, "Found %u MTF candidates, ", (unsigned int)num_mtfs);
+#endif
+
+    queue_size = 0;
+    for (i = 0 ; i < num_transmits ; i++) {
+      uint16_t limit_position;
+      uint32_t symbol = transmits[i].symbol;
+      sd[symbol].previous = i;
+
+      if ((sd[symbol].type & 8) != 0) {
+        queue_position = 0;
+        while (queue[queue_position] != symbol)
+          queue_position++;
+        add_mtf_hit_scores(&sd[symbol], queue_position, num_transmits_over_sqrt2);
+        if (transmits[i].distance != 0xFFFFFFFF) {
+          limit_position = get_mtf_overflow_position(sd, queue, queue_position, num_transmits_over_sqrt2);
+          if (limit_position != 0) {
+            sd[queue[limit_position]].type &= 0xF7;
+            queue_size--;
+            while (queue_position != queue_size) {
+              queue[queue_position] = queue[queue_position + 1];
+              queue_position++;
+            }
+            queue_position = limit_position;
+          }
+          while (queue_position-- != 0)
+            queue[queue_position + 1] = queue[queue_position];
+          queue[0] = symbol;
+        }
+        else {
+          sd[symbol].type &= 0xF7;
+          queue_size--;
+          while (queue_position != queue_size) {
+            queue[queue_position] = queue[queue_position + 1];
+            queue_position++;
+          }
+        }
+      }
+      else if (transmits[i].distance != 0xFFFFFFFF) {
+        sd[symbol].type |= 8;
+        limit_position = get_mtf_overflow_position(sd, queue, queue_size, num_transmits_over_sqrt2);
+        if (limit_position != 0) {
+          sd[queue[limit_position]].type &= 0xF7;
+          queue_position = limit_position;
+        }
+        else {
+          if (queue_size == 0x1A0) {
+            float low_score = transmits[sd[queue[0x19F]].previous].score;
+            uint16_t low_score_pos = 0x19F;
+            for (j = 0 ; j < 0x19F ; j++) {
+              if (transmits[sd[queue[j]].previous].score < low_score) {
+                low_score = transmits[sd[queue[j]].previous].score;
+                low_score_pos = j;
+              }
+            }
+            sd[queue[low_score_pos]].type &= 0xF7;
+            queue_position = low_score_pos;
+          }
+          else {
+            queue_position = queue_size++;
+          }
+        }
+        while (queue_position-- != 0)
+          queue[queue_position + 1] = queue[queue_position];
+        queue[0] = symbol;
+      }
+    }
+    for (i = 0 ; i < num_codes ; i++) {
+      if (((sd[i].type & 4) != 0) && (sd[i].count > MAX_INSTANCES_FOR_REMOVE)
+          && ((float)sd[i].hits < get_mtf_score_limit(sd[i].count, num_transmits_over_sqrt2) * (float)(sd[i].count - 1)))
+        sd[i].type &= 0xFB;
+      sd[i].hits = 0;
+    }
+
+    queue_size = 0;
+    for (i = 0 ; i < num_transmits ; i++) {
+      uint32_t symbol = transmits[i].symbol;
+      sd[symbol].previous = i;
+      if ((sd[symbol].type & 8) != 0) {
+        queue_position = 0;
+        while (queue[queue_position] != symbol)
+          queue_position++;
+        add_mtf_hit_scores(&sd[symbol], queue_position, num_transmits_over_sqrt2);
+        if (transmits[i].distance != 0xFFFFFFFF) {
+          while (queue_position-- != 0)
+            queue[queue_position + 1] = queue[queue_position];
+          queue[0] = symbol;
+        }
+        else {
+          sd[symbol].type &= 0xF7;
+          queue_size--;
+          while (queue_position != queue_size) {
+            queue[queue_position] = queue[queue_position + 1];
+            queue_position++;
+          }
+        }
+      }
+      else if (transmits[i].distance != 0xFFFFFFFF) {
+        if ((sd[symbol].type & 4) != 0) {
+          sd[symbol].type |= 8;
+          if (queue_size == 0x100) {
+            float low_score = transmits[sd[queue[0xFF]].previous].score;
+            uint16_t low_score_pos = 0xFF;
+            for (j = 0 ; j < 0xFF ; j++) {
+              if (transmits[sd[queue[j]].previous].score < low_score) {
+                low_score = transmits[sd[queue[j]].previous].score;
+                low_score_pos = j;
+              }
+            }
+            sd[queue[low_score_pos]].type &= 0xF7;
+            j = sd[queue[low_score_pos]].previous;
+            transmits[j + transmits[j].distance].previous_index = 0xFFFFFFFF;
+            transmits[j].distance = 0xFFFFFFFF;
+            queue_position = low_score_pos;
+          }
+          else
+            queue_position = queue_size++;
+          while (queue_position-- != 0)
+            queue[queue_position + 1] = queue[queue_position];
+          queue[0] = symbol;
+        }
+        else {
+          transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
+          transmits[i].distance = 0xFFFFFFFF;
+        }
+      }
+    }
+    for (i = 0 ; i < num_codes ; i++) {
+      if ((sd[i].count > MAX_INSTANCES_FOR_REMOVE) && (sd[i].count <= (num_transmits_over_sqrt2 >> 10))
+          && ((sd[i].type & 4) != 0)
+          && ((float)sd[i].hits < get_mtf_score_limit(sd[i].count, num_transmits_over_sqrt2) * (float)(sd[i].count - 1)))
+        sd[i].type &= 0xFB;
+      sd[i].hits = 0;
+    }
+
+    num_mtfs = 0;
+    queue_size = 0;
+    for (i = 0 ; i < num_transmits ; i++) {
+      transmits[i].hurts = 0;
+      uint32_t symbol = transmits[i].symbol;
+      sd[symbol].previous = i;
+      if ((sd[symbol].type & 8) != 0) {
+        queue_position = 0;
+        while (queue[queue_position] != symbol)
+          queue_position++;
+        if (queue_position + transmits[transmits[i].previous_index].hurts
+            >= 10 + (uint32_t)(30.0 * (log2((double)num_transmits / (double)sd[transmits[i].symbol].count) - 9.0))) {
+          transmits[transmits[i].previous_index].distance = 0xFFFFFFFF;
+          transmits[i].previous_index = 0xFFFFFFFF;
+        }
+        else {
+          if (queue_position > 0x10)
+            for (j = 0 ; j < queue_position ; j++)
+              transmits[sd[queue[j]].previous].hurts += 1;
+          else if (queue_position > 5)
+            for (j = 0 ; j < queue_position ; j++)
+              transmits[sd[queue[j]].previous].hurts += 2;
+          else if (queue_position > 1)
+            for (j = 0 ; j < queue_position ; j++)
+              transmits[sd[queue[j]].previous].hurts += 3;
+          sd[symbol].hits++;
+          num_mtfs++;
+        }
+        if (transmits[i].distance != 0xFFFFFFFF) {
+          while (queue_position-- != 0)
+            queue[queue_position + 1] = queue[queue_position];
+          queue[0] = symbol;
+        }
+        else {
+          sd[symbol].type &= 0xF7;
+          queue_size--;
+          while (queue_position != queue_size) {
+            queue[queue_position] = queue[queue_position + 1];
+            queue_position++;
+          }
+        }
+      }
+      else if (transmits[i].distance != 0xFFFFFFFF) {
+        if ((sd[symbol].type & 4) != 0) {
+          sd[symbol].type |= 8;
+          queue_position = queue_size++;
+          while (queue_position-- != 0)
+            queue[queue_position + 1] = queue[queue_position];
+          queue[0] = symbol;
+        }
+        else {
+          transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
+          transmits[i].distance = 0xFFFFFFFF;
+        }
+      }
+    }
+    for (i = 0 ; i < num_codes ; i++)
+      if (sd[i].hits == 0)
+        sd[i].type &= 0xFB;
+  }
+
+#ifdef PRINTON
+  fprintf(stderr, "%u MTF symbols\n", (unsigned int)num_mtfs);
+#endif
+
+  for (i = 2 ; i <= MAX_INSTANCES_FOR_REMOVE ; i++) {
+    mtf_started[i] = 0;
+    mtf_peak[i] = 0;
+    mtf_peak_mtf[i] = 0;
+    mtf_active[i] = 0;
+    mtf_hits[i] = 0;
+    mtf_in_dictionary[i] = 0;
+  }
+
+  for (i = 0 ; i < num_codes ; i++)
+    sd[i].previous = 0;
+
+  for (i = 0 ; i < num_transmits ; i++) {
+    uint32_t symbol = transmits[i].symbol;
+    sd[symbol].previous++;
+    uint32_t count = sd[symbol].count;
+    if (count <= MAX_INSTANCES_FOR_REMOVE) {
+      if (mtf_in_dictionary[count] > mtf_peak_mtf[count])
+        mtf_peak_mtf[count] = mtf_in_dictionary[count];
+      if (mtf_active[count] > mtf_peak[count])
+        mtf_peak[count] = mtf_active[count];
+      if (sd[symbol].previous == 1) {
+        mtf_started[count]++;
+        mtf_active[count]++;
+        if (transmits[i].distance != 0xFFFFFFFF)
+          sd[symbol].type |= 8;
+        else
+          mtf_in_dictionary[count]++;
+      }
+      else if (sd[symbol].previous == count) {
+        mtf_active[count]--;
+        if ((sd[symbol].type & 8) != 0) {
+          sd[symbol].type &= 0xF7;
+          mtf_hits[count]++;
+        }
+        else
+          mtf_in_dictionary[count]--;
+      }
+      else {
+        if ((sd[symbol].type & 8) != 0) {
+          mtf_hits[count]++;
+          if (transmits[i].distance == 0xFFFFFFFF) {
+            sd[symbol].type &= 0xF7;
+            mtf_in_dictionary[count]++;
+          }
+        }
+        else if (transmits[i].distance != 0xFFFFFFFF) {
+          sd[symbol].type |= 8;
+          mtf_in_dictionary[count]--;
+        }
+      }
+    }
+    else if ((transmits[i].distance != 0xFFFFFFFF) && ((sd[symbol].type & 4) == 0)) {
+      transmits[i + transmits[i].distance].previous_index = 0xFFFFFFFF;
+      transmits[i].distance = 0xFFFFFFFF;
+    }
+  }
+
   if (use_mtf == 2) {
     use_mtf = 0;
     double sum_expected_peak = 0.0;
     double sum_actual_peak = 0.0;
     for (i = 2 ; i <= 15 ; i++) {
-      sum_expected_peak += (double)(i - 1) * (double)mtf_queue_started[i] * (1.0 - (1.0 / (double)(1 << (i - 1))));
-      sum_actual_peak += (double)(i - 1) * (double)mtf_queue_peak[i];
+      sum_expected_peak += (double)(i - 1) * (double)mtf_started[i] * (1.0 - (1.0 / (double)(1 << (i - 1))));
+      sum_actual_peak += (double)(i - 1) * (double)mtf_peak_mtf[i];
     }
     double score1, score2;
-    score1 = 5.75 * (double)mtf_queue_started[2] / ((double)mtf_queue_peak[2] * (32.8 - log2((double)num_symbols_to_code)));
+    score1 = 5.75 * (double)mtf_started[2] / ((double)mtf_peak_mtf[2] * (32.8 - log2((double)num_symbols_to_code)));
     score2 = sum_expected_peak / sum_actual_peak;
     if (score1 + score2 > 2.08)
       use_mtf = 1;
   }
 
-  if ((use_mtf != 0) && (max_regular_code_length >= 11)) {
-    use_mtfg = 1;
-    for (i = 0 ; i < num_codes ; i++) {
-      if ((sd[i].count > MAX_INSTANCES_FOR_MTF_QUEUE) && (sd[i].code_length >= 11)
-          && (sd[i].hit_score > sd[i].count * (165 - 3 * max_regular_code_length) / 50)) {
-        sd[i].type |= 4;
-        if (sd[i].count - sd[i].mtfg_hits <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-          mtfg_symbols_reduced += sd[i].count - MAX_INSTANCES_FOR_MTF_QUEUE - 1;
-          sd[i].count = MAX_INSTANCES_FOR_MTF_QUEUE + 1;
-        }
-        else {
-          mtfg_symbols_reduced += sd[i].mtfg_hits;
-          sd[i].count -= sd[i].mtfg_hits;
-        }
-      }
-    }
-  }
-
-  // sort symbols with 800 or fewer instances by putting them at the end of the sorted symbols array
-  next_sorted_symbol_ptr = ranked_symbols + num_regular_definitions - 1;
-  for (i = MAX_INSTANCES_FOR_MTF_QUEUE + 1 ; i < 801 ; i++) {
-    while ((next_sorted_symbol_ptr > ranked_symbols) && (sd[*next_sorted_symbol_ptr].count == i))
-      next_sorted_symbol_ptr--;
-    ranked_symbols_ptr = next_sorted_symbol_ptr - 1;
-    while (ranked_symbols_ptr >= ranked_symbols) {
-      if (sd[*ranked_symbols_ptr].count == i) {
-        ranked_symbols_save = *ranked_symbols_ptr;
-        *ranked_symbols_ptr-- = *next_sorted_symbol_ptr;
-        *next_sorted_symbol_ptr-- = ranked_symbols_save;
-      }
-      else
-        ranked_symbols_ptr--;
-    }
-  }
-
-  for (i = 1 ; i < num_regular_definitions ; i++) {
-    uint32_t temp_symbol = ranked_symbols[i];
-    uint32_t temp_symbol_count = sd[temp_symbol].count;
-    if (temp_symbol_count > sd[ranked_symbols[i-1]].count) {
-      j = i - 1;
-      ranked_symbols[i] = ranked_symbols[j];
-      while ((j != 0) && (temp_symbol_count > sd[ranked_symbols[j-1]].count)) {
-        ranked_symbols[j] = ranked_symbols[j-1];
-        j--;
-      }
-      ranked_symbols[j] = temp_symbol;
-    }
-  }
-
-  mtfg_queue_8_offset = 0;
-  mtfg_queue_16_offset = 0;
-  mtfg_queue_32_offset = 0;
-  mtfg_queue_64_offset = 0;
-  mtfg_queue_128_offset = 0;
-  mtfg_queue_192_offset = 0;
-  for (i = 0 ; i < 8 ; i++)
-    mtfg_queue_0[i] = num_codes;
-  for (i = 0 ; i < 8 ; i++)
-    mtfg_queue_8[i] = num_codes;
-  for (i = 0 ; i < 16 ; i++)
-    mtfg_queue_16[i] = num_codes;
-  for (i = 0 ; i < 32 ; i++)
-    mtfg_queue_32[i] = num_codes;
-  for (i = 0 ; i < 64 ; i++)
-    mtfg_queue_64[i] = num_codes;
-  for (i = 0 ; i < 64 ; i++)
-    mtfg_queue_128[i] = num_codes;
-  for (i = 0 ; i < 64 ; i++)
-    mtfg_queue_192[i] = num_codes;
-
-  num_symbols_to_code -= mtfg_symbols_reduced;
-  if (use_mtf != 0)
-    for (i = 2 ; i <= MAX_INSTANCES_FOR_MTF_QUEUE ; i++)
-      num_symbols_to_code -= mtf_queue_hits[i];
-
-  if (mtf_queue_peak[2] > MTF_QUEUE_SIZE) {
-    if (use_mtf != 0)
-      mtf_queue_miss_code_length[2] = (uint32_t)(0.5 + log2((double)num_symbols_to_code
-          * (double)(mtf_queue_peak[2] - MTF_QUEUE_SIZE) / (double)(mtf_queue_started[2] - mtf_queue_hits[2])));
-    else
-      mtf_queue_miss_code_length[2] = (uint32_t)(0.5 + log2((double)num_symbols_to_code
-          * (double)mtf_queue_peak[2] / (double)mtf_queue_started[2]));
-    if (mtf_queue_miss_code_length[2] > 25)
-      mtf_queue_miss_code_length[2] = 25;
-  }
-  else if (mtf_queue_peak[2] != 0) {
-    if (use_mtf != 0)
-      mtf_queue_miss_code_length[2] = (uint32_t)(0.5 + log2((double)num_symbols_to_code));
-    else
-      mtf_queue_miss_code_length[2] = (uint32_t)(0.5 + log2((double)num_symbols_to_code
-          * (double)mtf_queue_peak[2] / (double)mtf_queue_started[2]));
-    if (mtf_queue_miss_code_length[2] > 25)
-      mtf_queue_miss_code_length[2] = 25;
-  }
-  else
-    mtf_queue_miss_code_length[2] = 25;
-
-  for (i = 3 ; i <= MAX_INSTANCES_FOR_MTF_QUEUE ; i++) {
-    if (use_mtf != 0) {
-      if (mtf_queue_peak[i] > MTF_QUEUE_SIZE) {
-        mtf_queue_miss_code_length[i] = (uint32_t)(0.5 + log2((double)num_symbols_to_code
-            * (double)(mtf_queue_peak[i] - MTF_QUEUE_SIZE)
-            / (double)(mtf_queue_started[i] * (i - 1) - mtf_queue_hits[i])));
-        if (mtf_queue_miss_code_length[i] > mtf_queue_miss_code_length[i - 1])
-          mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i - 1];
-        else if (mtf_queue_miss_code_length[i] < mtf_queue_miss_code_length[i - 1] - 1)
-          mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i - 1] - 1;
-      }
-      else
-        mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i - 1];
-    }
-    else {
-      if (mtf_queue_peak[i] != 0) {
-        mtf_queue_miss_code_length[i] = (uint32_t)(0.5 + log2((double)num_symbols_to_code
-            * (double)mtf_queue_peak[i] / (double)(mtf_queue_started[i] * (i - 1))));
-        if (mtf_queue_miss_code_length[i] > mtf_queue_miss_code_length[i - 1])
-          mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i - 1];
-        else if (mtf_queue_miss_code_length[i] < mtf_queue_miss_code_length[i - 1] - 1)
-          mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i - 1] - 1;
-      }
-      else
-        mtf_queue_miss_code_length[i] = mtf_queue_miss_code_length[i - 1];
-    }
-  }
-
-  if ((use_mtf != 0) && (mtf_queue_miss_code_length[10] == max_regular_code_length))
-    max_regular_code_length--;
-  for (i = 2 ; i < 16 ; i++)
-    if (mtf_queue_miss_code_length[i] <= max_regular_code_length)
-      mtf_queue_miss_code_length[i] = max_regular_code_length + 1;
-  if (mtf_queue_miss_code_length[10] == max_regular_code_length)
-    max_regular_code_length--;
-
-  num_mtf_symbol_definitions = 0;
-  mtf_symbols = 0;
-  for (i = 2 ; i <= MAX_INSTANCES_FOR_MTF_QUEUE  ; i++) {
-    num_mtf_symbol_definitions += mtf_queue_started[i];
-    mtf_symbols += (i-1) * mtf_queue_started[i];
-    if (mtf_queue_miss_code_length[i] <= max_regular_code_length)
-      mtf_queue_miss_code_length[i] = max_regular_code_length + 1;
-  }
-  max_code_length = mtf_queue_miss_code_length[2];
-  mtf_queue_miss_code_space = 0;
   if (use_mtf != 0) {
-    for (i = 2 ; i <= MAX_INSTANCES_FOR_MTF_QUEUE ; i++) {
-      mtf_queue_size[i] = 0;
-      if (mtf_queue_peak[i] > MTF_QUEUE_SIZE)
-        mtf_queue_miss_code_space += (1 << (30 - mtf_queue_miss_code_length[i])) * (mtf_queue_peak[i] - MTF_QUEUE_SIZE);
+    for (i = 0 ; i < num_codes ; i++) {
+      if (sd[i].count > MAX_INSTANCES_FOR_REMOVE) {
+        if ((sd[i].type & 4) != 0) {
+          if (sd[i].count - sd[i].hits <= MAX_INSTANCES_FOR_REMOVE) {
+            num_symbols_to_code -= sd[i].count - (MAX_INSTANCES_FOR_REMOVE + 1);
+            sd[i].count = MAX_INSTANCES_FOR_REMOVE + 1;
+          }
+          else {
+            num_symbols_to_code -= sd[i].hits;
+            sd[i].count -= sd[i].hits;
+          }
+        }
+      }
+      else
+        num_symbols_to_code -= sd[i].hits;
     }
+#ifdef PRINTON
+    fprintf(stderr, "Updating symbol ranks\r");
+#endif
+
+    // update the symbol ranks
+    max_ptr = ranked_symbols + num_more_than_15_inst_definitions;
+    ranked_symbols2_ptr = ranked_symbols2 + num_more_than_15_inst_definitions;
+    for (i = MAX_INSTANCES_FOR_REMOVE + 1 ; i < 501 ; i++) {
+      ranked_symbols_ptr = max_ptr;
+      while ((--ranked_symbols_ptr >= ranked_symbols) && (sd[*ranked_symbols_ptr].count == i))
+        *--ranked_symbols2_ptr = *ranked_symbols_ptr;
+      max_ptr = ranked_symbols_ptr + 1;
+      while (--ranked_symbols_ptr >= ranked_symbols) {
+        if (sd[*ranked_symbols_ptr].count == i)
+          *--ranked_symbols2_ptr = *ranked_symbols_ptr;
+      }
+    }
+    num_greater_500 = ranked_symbols2_ptr - ranked_symbols2;
+    ranked_symbols_ptr = max_ptr;
+    while (--ranked_symbols_ptr >= ranked_symbols) {
+      if (sd[*ranked_symbols_ptr].count >= 501)
+        *--ranked_symbols2_ptr = *ranked_symbols_ptr;
+    }
+    for (i = 1 ; i < num_greater_500 ; i++) {
+      uint32_t temp_symbol = ranked_symbols2[i];
+      uint32_t temp_count = sd[temp_symbol].count;
+      if (temp_count > sd[ranked_symbols2[i - 1]].count) {
+        ranked_symbols2[i] = ranked_symbols2[i - 1];
+        j = i - 1;
+        while ((j != 0) && (temp_count > sd[ranked_symbols2[j - 1]].count)) {
+          ranked_symbols2[j] = ranked_symbols2[j - 1];
+          j--;
+        }
+        ranked_symbols2[j] = temp_symbol;
+      }
+    }
+    for (i = 0 ; i < num_more_than_15_inst_definitions ; i++)
+      ranked_symbols[i] = ranked_symbols2[i];
+    peak_array = mtf_peak_mtf;
   }
   else {
-    for (i = 2 ; i <= MAX_INSTANCES_FOR_MTF_QUEUE ; i++)
-      mtf_queue_miss_code_space += (1 << (30 - mtf_queue_miss_code_length[i])) * mtf_queue_peak[i];
+    for (i = 0 ; i < num_codes ; i++)
+      sd[i].type &= 0xFB;
+    for (i = 2 ; i <= MAX_INSTANCES_FOR_REMOVE ; i++)
+      mtf_hits[i] = 0;
+    peak_array = mtf_peak;
   }
 
-  // Recalculate code lengths knowing how many symbols are needed for 2 - 15 instance symbols that fall out of mtf queues
-  remaining_symbols_to_code = grammar_size - num_new_symbols - mtf_symbols - mtfg_symbols_reduced;
-  remaining_code_space = (1 << 30) - (1 << (30 - max_code_length)) - mtf_queue_miss_code_space;
-  double codes_per_code_space = (double)remaining_symbols_to_code / (double)remaining_code_space;
+  // Calculate dictionary code lengths
+  if (peak_array[2] != 0) {
+    queue_miss_code_length[2] = (uint32_t)(0.5 + log2((double)num_symbols_to_code
+        * (double)peak_array[2] / (double)(mtf_started[2] - mtf_hits[2])));
+    if (queue_miss_code_length[2] > 25)
+      queue_miss_code_length[2] = 25;
+  }
+  else
+    queue_miss_code_length[2] = 25;
+  for (i = 3 ; i <= MAX_INSTANCES_FOR_REMOVE ; i++) {
+    if (peak_array[i] != 0) {
+      queue_miss_code_length[i] = (uint32_t)(0.5 + log2((double)num_symbols_to_code
+          * (double)peak_array[i] / (double)(mtf_started[i] * (i - 1) - mtf_hits[i])));
+      if (queue_miss_code_length[i] > queue_miss_code_length[i - 1])
+        queue_miss_code_length[i] = queue_miss_code_length[i - 1];
+      else if (queue_miss_code_length[i] < queue_miss_code_length[i - 1] - 1)
+        queue_miss_code_length[i] = queue_miss_code_length[i - 1] - 1;
+    }
+    else
+      queue_miss_code_length[i] = queue_miss_code_length[i - 1];
+  }
+  if ((use_mtf != 0) && (queue_miss_code_length[12] <= max_regular_code_length))
+    max_regular_code_length--;
+
+  remaining_symbols_to_code = 0;
+  for (i = 0 ; i < num_more_than_15_inst_definitions ; i++)
+    remaining_symbols_to_code += sd[ranked_symbols[i]].count - 1;
+  mtf_miss_code_space = 0;
+  for (i = 2 ; i <= MAX_INSTANCES_FOR_REMOVE; i++) {
+    if (queue_miss_code_length[i] <= max_regular_code_length)
+      queue_miss_code_length[i] = max_regular_code_length + 1;
+    mtf_miss_code_space += (1 << (30 - queue_miss_code_length[i])) * peak_array[i];
+  }
+  max_code_length = queue_miss_code_length[2];
+  remaining_code_space = (1 << 30) - (1 << (30 - max_code_length)) - mtf_miss_code_space;
+  min_code_space = 1 << (30 - (queue_miss_code_length[MAX_INSTANCES_FOR_REMOVE] - 1));
+  codes_per_code_space = (double)remaining_symbols_to_code / (double)remaining_code_space;
   max_regular_code_length = 1;
-  min_code_space = 0x40000000 >> (mtf_queue_miss_code_length[MAX_INSTANCES_FOR_MTF_QUEUE] - 1);
   prior_repeats = 0;
   for (i = 0 ; i <= 25 ; i++)
     index_last_length[i] = -1;
 
-  for (i = 0 ; i < num_definitions_to_code - num_mtf_symbol_definitions ; i++) {
-    sd[ranked_symbols[i]].type &= 0xF7;
+  // optimize code lengths
+  for (i = 0 ; i < num_more_than_15_inst_definitions ; i++) {
     symbol_inst = sd[ranked_symbols[i]].count;
-    num_regular_definitions--;
-    d_remaining_symbols_to_code = (double)remaining_symbols_to_code;
     if (--symbol_inst != prior_repeats) {
       prior_repeats = symbol_inst;
-      symbol_inst_factor = (double)0x5A827999 / (double)symbol_inst; /* 0x40000000 * sqrt(2.0) */
+      symbol_inst_factor = (double)0x5A827999 / (double)symbol_inst; // 0x40000000 * sqrt(2.0)
       code_length_limit = (uint32_t)log2(symbol_inst_factor * codes_per_code_space);
       if (code_length_limit < 2)
         code_length_limit = 2;
     }
-    code_length = (uint8_t)(0.5 + log2(d_remaining_symbols_to_code * symbol_inst_factor / (double)remaining_code_space));
+    code_length = (uint8_t)log2(symbol_inst_factor
+        * (1.0 + (double)(remaining_symbols_to_code - 15 * (num_more_than_15_inst_definitions - i - 1)))
+        / (double)(remaining_code_space - min_code_space * (num_more_than_15_inst_definitions - i - 1)));
     if (code_length < code_length_limit)
       code_length = code_length_limit;
     if (code_length > max_code_length)
       code_length = max_code_length;
-    while (remaining_code_space
-        < (int32_t)((num_definitions_to_code - i - 1 - num_mtf_symbol_definitions) * min_code_space))
-      code_length++;
     if (code_length > max_regular_code_length) {
-      if (code_length >= mtf_queue_miss_code_length[MAX_INSTANCES_FOR_MTF_QUEUE])
-        code_length = mtf_queue_miss_code_length[MAX_INSTANCES_FOR_MTF_QUEUE] - 1;
+      if (code_length >= queue_miss_code_length[MAX_INSTANCES_FOR_REMOVE])
+        code_length = queue_miss_code_length[MAX_INSTANCES_FOR_REMOVE] - 1;
       max_regular_code_length = code_length;
     }
-    if (code_length < 11)
-      sd[ranked_symbols[i]].type &= 0xFB;
     sd[ranked_symbols[i]].code_length = code_length;
     remaining_code_space -= 1 << (30 - code_length);
     remaining_symbols_to_code -= symbol_inst;
 
     if ((i != 0) && (sd[ranked_symbols[i - 1]].code_length > code_length)) {
       sd[ranked_symbols[++index_last_length[code_length]]].code_length = code_length;
-      while (index_last_length[++code_length] == -1) ;
+      while (index_last_length[++code_length] == -1); // do nothing
       index_last_length[code_length]++;
       sd[ranked_symbols[i]].code_length = code_length;
     }
@@ -3369,65 +2451,114 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       index_last_length[code_length] = i;
   }
 
-  for (i = num_definitions_to_code - num_mtf_symbol_definitions ; i < num_definitions_to_code ; i++) {
-    sd[ranked_symbols[i]].type &= 0xF7;
-    sd[ranked_symbols[i]].code_length = mtf_queue_miss_code_length[sd[ranked_symbols[i]].count];
-  }
-
-  if (verbose != 0) {
-    if (verbose == 1) {
-      for (i = 0 ; i < num_definitions_to_code ; i++) {
-        if ((sd[ranked_symbols[i]].code_length >= 11)
-            && (sd[ranked_symbols[i]].inst_found > MAX_INSTANCES_FOR_MTF_QUEUE))
-          printf("%u: #%u %u L%u D%02x: \"",(unsigned int)i,(unsigned int)sd[ranked_symbols[i]].inst_found,
-              (unsigned int)sd[ranked_symbols[i]].count,(unsigned int)sd[ranked_symbols[i]].code_length,
-              (unsigned int)sd[ranked_symbols[i]].type & 0xF4);
-        else
-          printf("%u: #%u L%u: \"",(unsigned int)i,(unsigned int)sd[ranked_symbols[i]].inst_found,
-              (unsigned int)sd[ranked_symbols[i]].code_length);
-        print_string(ranked_symbols[i]);
-        printf("\"\n");
-      }
-    }
-    else {
-      for (i = 0 ; i < start_my_symbols + num_symbols_defined ; i++) {
-        if (sd[i].inst_found != 0) {
-          if ((sd[i].code_length >= 11) && (sd[i].inst_found > MAX_INSTANCES_FOR_MTF_QUEUE))
-            printf("%u: #%u %u L%u D%02x: \"",(unsigned int)i,(unsigned int)sd[i].inst_found,
-                (unsigned int)sd[i].count,(unsigned int)sd[i].code_length,(unsigned int)sd[i].type & 0xF4);
-          else
-            printf("%u: #%u L%u: \"",(unsigned int)i,(unsigned int)sd[i].inst_found,(unsigned int)sd[i].code_length);
-          print_string(i);
-          printf("\"\n");
+  do {
+    uint8_t min_code_length = sd[ranked_symbols[0]].code_length;
+    for (i = min_code_length ; i < max_regular_code_length ; i++)
+      if (index_last_length[i] == -1)
+        min_code_length = i + 1;
+    max_len_adj_profit = 0;  
+    for (i = min_code_length ; i < max_regular_code_length ; i++) {
+      int32_t len_adj_profit = -(sd[ranked_symbols[index_last_length[i]]].count - 1);
+      for (j = i + 2 ; j <= max_regular_code_length ; j++) {
+        len_adj_profit += sd[ranked_symbols[index_last_length[j - 1] + 1]].count - 1;
+        if (index_last_length[j] != index_last_length[j - 1] + 1) {
+          int32_t next_symbol_profit = sd[ranked_symbols[index_last_length[j - 1] + 2]].count - 1;
+          if (len_adj_profit + next_symbol_profit > max_len_adj_profit) {
+            max_len_adj_profit = len_adj_profit + next_symbol_profit;
+            increase_length = i;
+            decrease_length = j;
+          }
         }
       }
     }
+    if (max_len_adj_profit != 0) {
+      sd[ranked_symbols[index_last_length[increase_length]--]].code_length++;
+      for (j = increase_length + 2 ; j <= decrease_length ; j++)
+        sd[ranked_symbols[++index_last_length[j - 1]]].code_length--;
+      sd[ranked_symbols[++index_last_length[decrease_length - 1]]].code_length--;
+      if (index_last_length[decrease_length - 1] == index_last_length[decrease_length])
+        index_last_length[decrease_length] = -1;
+    }
+  } while (max_len_adj_profit != 0);
+
+  j = 0;
+  for (i = sd[ranked_symbols[0]].code_length ; i < max_regular_code_length ; i++) {
+    if (index_last_length[i] >= 0) {
+      index_first_length[i] = j;
+      j = index_last_length[i] + 1;
+    }
+    else
+      index_first_length[i] = -1;
   }
+
+  do {
+    max_len_adj_profit = 0;  
+    for (i = sd[ranked_symbols[0]].code_length ; i < max_regular_code_length ; i++) {
+      if (index_last_length[i] - index_first_length[i] >= 2) {
+        int32_t len_adj_profit = sd[ranked_symbols[index_first_length[i]]].count - 1;
+        len_adj_profit -= sd[ranked_symbols[index_last_length[i]]].count - 1;
+        len_adj_profit -= sd[ranked_symbols[index_last_length[i] - 1]].count - 1;
+        if (len_adj_profit > max_len_adj_profit) {
+          max_len_adj_profit = len_adj_profit;
+          decrease_length = i;
+        }
+      }
+    }
+    if (max_len_adj_profit != 0) {
+      sd[ranked_symbols[index_first_length[decrease_length]]].code_length--;
+      sd[ranked_symbols[index_last_length[decrease_length] - 1]].code_length++;
+      sd[ranked_symbols[index_last_length[decrease_length]]].code_length++;
+      if (index_first_length[decrease_length - 1] < 0)
+        index_first_length[decrease_length - 1] = index_first_length[decrease_length];
+      index_last_length[decrease_length - 1] = index_first_length[decrease_length];
+      if (index_first_length[decrease_length + 1] < 0)
+        index_last_length[decrease_length + 1] = index_last_length[decrease_length];
+      index_first_length[decrease_length + 1] = index_last_length[decrease_length] - 1;
+      if (index_last_length[i] - index_first_length[i] == 2) {
+        index_first_length[decrease_length] = -1;
+        index_last_length[decrease_length] = -1;
+      }
+      else {
+        index_first_length[decrease_length] += 1;
+        index_last_length[decrease_length] -= 2;
+      }
+    }
+  } while (max_len_adj_profit != 0);
+
+  for (i = 0 ; i < num_more_than_15_inst_definitions ; i++)
+    if (sd[ranked_symbols[i]].code_length < 11)
+      sd[ranked_symbols[i]].type &= 0xFB;
+
+  for (i = num_more_than_15_inst_definitions ; i < num_definitions_to_code ; i++) {
+    sd[ranked_symbols[i]].type &= 0xF7;
+    sd[ranked_symbols[i]].code_length = queue_miss_code_length[sd[ranked_symbols[i]].count];
+  }
+
   if (num_definitions_to_code == 0) {
     max_regular_code_length = 24;
     sd[ranked_symbols[0]].code_length = 25;
   }
-  else if (sd[ranked_symbols[0]].count <= MAX_INSTANCES_FOR_MTF_QUEUE)
+  else if (sd[ranked_symbols[0]].count <= MAX_INSTANCES_FOR_REMOVE)
     max_regular_code_length = sd[ranked_symbols[0]].code_length - 1;
 
   sd[num_codes].type = 0;
   if (max_code_length >= 14) {
     i = 0;
-    while ((i < num_definitions_to_code) && (sd[ranked_symbols[i]].count > MAX_INSTANCES_FOR_MTF_QUEUE)) {
-      if (sd[ranked_symbols[i]].type & 0x20) {
+    while (i < num_more_than_15_inst_definitions) {
+     if ((sd[ranked_symbols[i]].type & 0x20) != 0) {
         if (sd[ranked_symbols[i]].space_score > 0)
-          sd[ranked_symbols[i]].type |= 0xC0;
+          sd[ranked_symbols[i]].type += 0x40;
         else
-          sd[ranked_symbols[i]].type |= 0x40;
+          sd[ranked_symbols[i]].type += 0x20;
       }
       i++;
     }
-    for (i = start_my_symbols ; i < num_codes; i++) {
-      if (sd[i].type & 0x40) {
+    for (i = num_base_symbols ; i < num_codes; i++) {
+      if ((sd[i].type & 0x40) != 0) {
         uint32_t last_symbol = symbol_array[sd[i + 1].define_symbol_start_index - 2];
-        while (last_symbol >= start_my_symbols) {
-          if (sd[last_symbol].type & 0x80) {
-            sd[i].type &= 0x3F;
+        while (last_symbol >= num_base_symbols) {
+          if ((sd[last_symbol].type & 0x60) == 0x60) {
+            sd[i].type = (sd[i].type & 0x3F) | 0x20;
             break;
           }
           last_symbol = symbol_array[sd[last_symbol + 1].define_symbol_start_index - 2];
@@ -3440,34 +2571,67 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       sd[ranked_symbols[i]].type &= 0xF;
   }
 
-  if (use_mtfg != 0) {
-    if (max_regular_code_length >= 11) {
-      for (i = 0 ; i < num_codes ; i++) {
-        if ((sd[i].count > MAX_INSTANCES_FOR_MTF_QUEUE) && (sd[i].code_length >= 11)
-            && (sd[i].hit_score > sd[i].count * (165 - 3 * max_regular_code_length) / 50))
-          sd[i].type |= 4;
+#ifdef PRINTON
+  if (verbose != 0) {
+    if (verbose == 1) {
+      for (i = 0 ; i < num_definitions_to_code ; i++) {
+        if (sd[ranked_symbols[i]].code_length >= 11) {
+          if (use_mtf != 0)
+            printf("%u: #%u %u L%u D%02x: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].previous,
+                (unsigned int)sd[ranked_symbols[i]].count, (unsigned int)sd[ranked_symbols[i]].code_length,
+                (unsigned int)sd[ranked_symbols[i]].type & 0xF4);
+          else
+            printf("%u: #%u L%u D%02x: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].count,
+                (unsigned int)sd[ranked_symbols[i]].code_length, (unsigned int)sd[ranked_symbols[i]].type & 0xF4);
+        }
         else
-          sd[i].type &= 0xFB;
+          printf("%u: #%u L%u: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].count,
+              (unsigned int)sd[ranked_symbols[i]].code_length);
+        print_string(ranked_symbols[i]);
+        printf("\"\n");
+      }
+      uint32_t temp_rank = num_definitions_to_code;
+      for (i = 0 ; i < num_base_symbols ; i++) {
+        if (sd[i].count == 1) {
+          printf("%u: #1: \"", ++temp_rank);
+          print_string(i);
+          printf("\"\n");
+        }
       }
     }
     else {
-      use_mtfg = 0;
-      for (i = 0 ; i < num_codes ; i++)
-        sd[i].type &= 0xFB;
+      for (i = 0 ; i < num_codes ; i++) {
+        if (sd[i].hits != 0) {
+          if (sd[i].code_length >= 11) {
+            if (use_mtf != 0)
+              printf("%u: #%u %u L%u D%02x: \"", (unsigned int)i + 1, (unsigned int)sd[ranked_symbols[i]].previous,
+                  (unsigned int)sd[i].count, (unsigned int)sd[i].code_length, (unsigned int)sd[i].type & 0xF4);
+            else
+              printf("%u: #%u L%u D%02x: \"",(unsigned int)i + 1, (unsigned int)sd[i].count,
+                  (unsigned int)sd[i].code_length, (unsigned int)sd[i].type & 0xF4);
+          }
+          else
+            printf("%u: #%u L%u: \"", (unsigned int)i + 1, (unsigned int)sd[i].count, (unsigned int)sd[i].code_length);
+          print_string(i);
+          printf("\"\n");
+        }
+      }
     }
   }
+#endif
 
-  for (i = 0 ; i < num_codes ; i++)
-    sd[i].inst_found = 0;
   symbol_ptr = symbol_array;
   prior_is_cap = 0;
-  InitEncoder(max_regular_code_length, 
-      MAX_INSTANCES_FOR_MTF_QUEUE + (uint32_t)(max_regular_code_length - sd[ranked_symbols[0]].code_length) + 1,
-      cap_encoded, UTF8_compliant, use_mtf, use_mtfg);
+  temp_char = 0xFF;
+  if (UTF8_compliant != 0)
+    temp_char = 0x90;
+  InitEncoder(max_code_length, temp_char,
+      MAX_INSTANCES_FOR_REMOVE + (uint32_t)(max_regular_code_length - sd[ranked_symbols[0]].code_length) + 1,
+      cap_encoded, UTF8_compliant, use_mtf);
 
   if (fd != 0) {
     if ((outbuf = (uint8_t *)malloc(in_size * 2 + 100000)) == 0) {
-      fprintf(stderr,"Encoded data memory allocation failed\n");
+      fprintf(stderr, "Error - encoded data memory allocation failed\n");
       return(0);
     }
   }
@@ -3487,23 +2651,22 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   // BYTE 5:  7=1, 6-0=stride
 
   SetOutBuffer(outbuf);
-  WriteOutCharNum(0);
-  WriteOutBuffer((uint8_t)(4.0 * log2((double)file_size) + 1.0));
-  WriteOutBuffer((cap_encoded << 7) | (UTF8_compliant << 6) | (use_mtf << 5) | (mtf_queue_miss_code_length[2] - 1));
+  WriteOutBuffer((uint8_t)(12.5 * (log2((double)(dictionary_size + 0x400)) - 10.0)) + 1);
+  WriteOutBuffer((cap_encoded << 7) | (UTF8_compliant << 6) | (use_mtf << 5) | (queue_miss_code_length[2] - 1));
   temp_char = (((format & 0xFE) != 0) << 5) | (sd[ranked_symbols[0]].code_length - 1);
-  if (mtf_queue_miss_code_length[3] != mtf_queue_miss_code_length[2])
+  if (queue_miss_code_length[3] != queue_miss_code_length[2])
     temp_char |= 0x40;
-  if (mtf_queue_miss_code_length[4] != mtf_queue_miss_code_length[3])
+  if (queue_miss_code_length[4] != queue_miss_code_length[3])
     temp_char |= 0x80;
   WriteOutBuffer(temp_char);
   i = 7;
   do {
-    temp_char = (temp_char << 1) | (mtf_queue_miss_code_length[i] != mtf_queue_miss_code_length[i-1]);
+    temp_char = (temp_char << 1) | (queue_miss_code_length[i] != queue_miss_code_length[i - 1]);
   } while (--i != 4);
-  WriteOutBuffer((temp_char << 5) | (mtf_queue_miss_code_length[2] - max_regular_code_length));
+  WriteOutBuffer((temp_char << 5) | (queue_miss_code_length[2] - max_regular_code_length));
   i = 15;
   do {
-    temp_char = (temp_char << 1) | (mtf_queue_miss_code_length[i] != mtf_queue_miss_code_length[i-1]);
+    temp_char = (temp_char << 1) | (queue_miss_code_length[i] != queue_miss_code_length[i - 1]);
   } while (--i != 7);
   WriteOutBuffer(temp_char);
   i = 0xFF;
@@ -3521,7 +2684,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     for (j = 2 ; j <= max_code_length ; j++) {
       sym_list_bits[i][j] = 2;
       if (0 == (sym_list_ptrs[i][j] = (uint32_t *)malloc(sizeof(uint32_t) * 4))) {
-        fprintf(stderr,"FATAL ERROR - symbol list malloc failure\n");
+        fprintf(stderr, "Error - symbol list memory allocation failed\n");
         return(0);
       }
       nsob[i][j] = 0;
@@ -3532,134 +2695,138 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     bin_code_length[i] = max_code_length;
     symbol_lengths[i] = 0;
   } while (i--);
-  found_first_symbol = 0;
-  prior_end = 0;
-  num_grammar_rules = 1;
 
 #ifdef PRINTON
-  fprintf(stderr,"\nuse_mtf %u, mcl %u mrcl %u \n",
-      (unsigned int)use_mtf,(unsigned int)max_code_length,(unsigned int)max_regular_code_length);
+  fprintf(stderr, "use_mtf %u, mcl %u mrcl %u\n",
+      (unsigned int)use_mtf, (unsigned int)max_code_length, (unsigned int)max_regular_code_length);
 #endif
+
+  for (i = 0 ; i < num_more_than_15_inst_definitions ; i++)
+    sd[ranked_symbols[i]].count = sd[ranked_symbols[i]].code_length + MAX_INSTANCES_FOR_REMOVE;
+  for (i = 0 ; i < num_codes ; i++)
+    sd[i].hits = 0;
+  num_transmits = queue_size = queue_size_cap = queue_offset = found_first_symbol = prior_end = 0;
+  num_grammar_rules = 1;
 
   if ((UTF8_compliant != 0) || (cap_encoded != 0)) {
     cap_symbol_defined = 0;
     cap_lock_symbol_defined = 0;
     while (symbol_ptr < first_define_ptr) {
       symbol = *symbol_ptr++;
-      symbol_count = sd[symbol].count;
-      symbol_inst = sd[symbol].inst_found++;
+      symbol_inst = sd[symbol].hits++;
       if (symbol_inst == 0) {
         if (embed_define(symbol, 0) == 0)
           return(0);
       }
-      else if (symbol_count <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        if (use_mtf != 0) {
-          if (manage_mtf_queue(symbol, symbol_inst, symbol_count, 0) == 0)
-            return(0);
-        }
-        else
-          manage_mtf_symbol(symbol, symbol_inst, symbol_count, 0);
-        prior_symbol = symbol;
-      }
       else {
         if ((sd[symbol].type & 8) != 0) {
           if (prior_is_cap == 0)
-            manage_mtfg_queue(symbol, 0);
+            update_queue(symbol, 0);
           else
-            manage_mtfg_queue_prior_cap(symbol, 0);
+            update_queue_prior_cap(symbol, 0);
         }
         else {
-          if (prior_is_cap == 0)
-            EncodeDictType(LEVEL0);
-          else
-            EncodeDictType(LEVEL0_CAP);
+          EncodeDictType(prior_is_cap);
           encode_dictionary_symbol(symbol);
-          if (sd[symbol].type & 4) {
-            remove_dictionary_symbol(symbol, sd[symbol].code_length);
-            add_symbol_to_mtfg_queue(symbol);
+          if (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE) {
+            if (sd[symbol].count == sd[symbol].hits)
+              remove_dictionary_symbol(symbol, sd[symbol].code_length);
+            else if (use_mtf != 0) {
+              if ((sd[symbol].type & 4) != 0) {
+                if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0))
+                    EncodeGoMtf(sd[symbol].count, 0, 1);
+                  remove_dictionary_symbol(symbol, sd[symbol].code_length);
+                  add_symbol_to_queue(symbol);
+                }
+                else
+                  EncodeGoMtf(sd[symbol].count, 0, 0);
+              }
+            }
+          }
+          else if ((sd[symbol].type & 4) != 0) {
+            if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 1);
+              remove_dictionary_symbol(symbol, sd[symbol].code_length);
+              add_symbol_to_queue(symbol);
+            }
+            else
+              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 0);
           }
         }
         prior_is_cap = sd[symbol].type & 1;
         prior_symbol = symbol;
+        num_transmits++;
       }
       prior_end = sd[symbol].ends;
 #ifdef PRINTON
       if (((symbol_ptr - symbol_array) & 0x1FFFFF) == 0)
-        fprintf(stderr,"Encoded %u of %u level 0 symbols\r",
-            (unsigned int)(symbol_ptr - symbol_array),(unsigned int)(first_define_ptr - symbol_array));
+        fprintf(stderr, "Encoded %u of %u level 0 symbols\r",
+            (unsigned int)(symbol_ptr - symbol_array), (unsigned int)(first_define_ptr - symbol_array));
 #endif
     }
   }
   else {
     while (symbol_ptr < first_define_ptr) {
       symbol = *symbol_ptr++;
-      symbol_count = sd[symbol].count;
-      symbol_inst = sd[symbol].inst_found++;
+      symbol_inst = sd[symbol].hits++;
       if (symbol_inst == 0) {
         if (embed_define_binary(symbol, 0) == 0)
           return(0);
       }
-      else if (symbol_count <= MAX_INSTANCES_FOR_MTF_QUEUE) {
-        if (use_mtf != 0) {
-          if (manage_mtf_queue(symbol, symbol_inst, symbol_count, 0) == 0)
-            return(0);
-        }
-        else
-          manage_mtf_symbol(symbol, symbol_inst, symbol_count, 0);
-      }
       else {
         if ((sd[symbol].type & 8) != 0)
-          manage_mtfg_queue(symbol, 0);
+          update_queue(symbol, 0);
         else {
-          EncodeDictType(LEVEL0);
+          EncodeDictType(0);
           encode_dictionary_symbol(symbol);
-          if (sd[symbol].type & 4) {
-            remove_dictionary_symbol(symbol, sd[symbol].code_length);
-            add_symbol_to_mtfg_queue(symbol);
+          if (sd[symbol].count <= MAX_INSTANCES_FOR_REMOVE) {
+            if (sd[symbol].count == sd[symbol].hits)
+              remove_dictionary_symbol(symbol, sd[symbol].code_length);
+            else if (use_mtf != 0) {
+              if ((sd[symbol].type & 4) != 0) {
+                if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+                  if ((sd[symbol].hits + 1 != sd[symbol].count) || ((sd[symbol].type & 0x80) != 0))
+                    EncodeGoMtf(sd[symbol].count, 0, 1);
+                  remove_dictionary_symbol(symbol, sd[symbol].code_length);
+                  add_symbol_to_queue(symbol);
+                }
+                else
+                  EncodeGoMtf(sd[symbol].count, 0, 0);
+              }
+            }
+          }
+          else if ((sd[symbol].type & 4) != 0) {
+            if (transmits[num_transmits].distance != 0xFFFFFFFF) {
+              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 1);
+              remove_dictionary_symbol(symbol, sd[symbol].code_length);
+              add_symbol_to_queue(symbol);
+            }
+            else
+              EncodeGoMtf(sd[symbol].code_length + MAX_INSTANCES_FOR_REMOVE, 0, 0);
           }
         }
+        num_transmits++;
       }
       prior_end = sd[symbol].ends;
 #ifdef PRINTON
       if (((symbol_ptr - symbol_array) & 0x1FFFFF) == 0)
-        fprintf(stderr,"Encoded %u of %u level 0 symbols\r",
-            (unsigned int)(symbol_ptr - symbol_array),(unsigned int)(first_define_ptr - symbol_array));
+        fprintf(stderr, "Encoded %u of %u level 0 symbols\r",
+            (unsigned int)(symbol_ptr - symbol_array), (unsigned int)(first_define_ptr - symbol_array));
 #endif
     }
   }
 
   // send EOF and flush output
-  if (prior_is_cap == 0)
-    EncodeDictType(LEVEL0);
-  else
-    EncodeDictType(LEVEL0_CAP);
-  if (cap_encoded != 0) {
-    if (sd[prior_symbol].type & 0x20) {
-      if (sd[prior_symbol].type & 0x80)
-        EncodeFirstChar(end_char, 2, prior_end);
-      else if (sd[prior_symbol].type & 0x40)
-        EncodeFirstChar(end_char, 3, prior_end);
-      else
-        EncodeFirstChar(end_char, 1, prior_end);
-    }
-    else
-      EncodeFirstChar(end_char, 0, prior_end);
-  }
+  EncodeDictType(0);
+  if (cap_encoded != 0)
+    EncodeFirstChar(end_char, (sd[prior_symbol].type & 0x60) >> 5, prior_end);
   else if (UTF8_compliant != 0)
     EncodeFirstChar(end_char, 0, prior_end);
   else
     EncodeFirstCharBinary(end_char, prior_end);
   code_length = bin_code_length[end_char];
-  if (max_code_length != code_length)
-    EncodeLongDictionarySymbol(0, fbob[end_char][max_code_length], sum_nbob[end_char], max_code_length - code_length, 1);
-  else {
-    uint16_t bins_per_symbol
-        = (nbob[end_char][code_length] >> (bin_code_length[end_char] - code_length)) / nsob[end_char][code_length];
-    if ((nbob[end_char][code_length] >> (bin_code_length[end_char] - code_length))
-        - nsob[end_char][code_length] * bins_per_symbol != 0)
-      bins_per_symbol++;
-    EncodeShortDictionarySymbol(fbob[end_char][max_code_length], sum_nbob[end_char], bins_per_symbol);
-  }
+  EncodeShortDictionarySymbol(fbob[end_char][max_code_length], sum_nbob[end_char], nbob[end_char][code_length]);
   FinishEncoder();
   i = 0xFF;
   if (UTF8_compliant != 0)
@@ -3671,6 +2838,8 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   free(symbol_array);
   free(sd);
   free(ranked_symbols);
+  free(ranked_symbols2);
+  free(transmits);
   *outsize_ptr = ReadOutCharNum();
   if (fd != 0) {
     size_t writesize = 0;
