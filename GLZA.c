@@ -29,11 +29,12 @@ limitations under the License.
 
 void print_usage() {
   fprintf(stderr,"ERROR - Invalid format\n");
-  fprintf(stderr," Use GLZA c|d [-c#] [-d0] [-l0] [-m#] [-p#] [-r#] [-s] [-v0|1] [-w0] [-C0|1] [-D#]\n");
+  fprintf(stderr," Use GLZA c|d [-c#] [-d0] [-f] [-l0] [-m#] [-p#] [-r#] [-s] [-v0|1] [-w0] [-C0|1] [-D#]\n");
   fprintf(stderr,"   <infile> <outfile>\n");
   fprintf(stderr," where:\n");
   fprintf(stderr,"   -c#   sets the cost of a new grammar rule in bits\n");
   fprintf(stderr,"   -d0   disables delta transformation\n");
+  fprintf(stderr,"   -f    enables faster compression mode\n");
   fprintf(stderr,"   -l0   disables capital letter lock transformation\n");
   fprintf(stderr,"   -m0|1 overrides the program's decision on whether to use MTF queues\n");
   fprintf(stderr,"         -m0 disables MTF, -m1 enables MTF\n");
@@ -69,6 +70,7 @@ int main(int argc, char* argv[])
   params.cap_encoded = 0;
   params.cap_lock_disabled = 0;
   params.delta_disabled = 0;
+  params.fast_mode = 0;
   params.print_dictionary = 0;
   params.cycle_size_limit = 0.0;
   params.max_rules = 0x900000;
@@ -106,6 +108,10 @@ int main(int argc, char* argv[])
     else if (*(argv[arg_num] + 1) == 'd') {
       if (*(argv[arg_num] + 2) == '0')
         params.delta_disabled = 1;
+      arg_num++;
+    }
+    else if (*(argv[arg_num] + 1) == 'f') {
+      params.fast_mode = 1;
       arg_num++;
     }
     else if (*(argv[arg_num] + 1) == 'l') {

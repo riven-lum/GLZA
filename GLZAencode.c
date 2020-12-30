@@ -2768,7 +2768,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
 
   rules_reduced = 0;
   if (num_symbols_defined != 0) {
-    for (i = 0 ; i < start_my_symbols + num_symbols_defined; i++)
+    for (i = start_my_symbols ; i < start_my_symbols + num_symbols_defined; i++)
       if (sd[i].count == 1)
         rules_reduced++;
   }
@@ -3355,7 +3355,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     }
   }
 
-  if (mtf_queue_miss_code_length[10] == max_regular_code_length)
+  if ((use_mtf != 0) && (mtf_queue_miss_code_length[10] == max_regular_code_length))
     max_regular_code_length--;
   for (i = 2 ; i < 16 ; i++)
     if (mtf_queue_miss_code_length[i] <= max_regular_code_length)
@@ -3412,7 +3412,7 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
       code_length = code_length_limit;
     if (code_length > max_code_length)
       code_length = max_code_length;
-    while (remaining_code_space - (1 << (30 - code_length))
+    while (remaining_code_space
         < (int32_t)((num_definitions_to_code - i - 1 - num_mtf_symbol_definitions) * min_code_space))
       code_length++;
     if (code_length > max_regular_code_length) {

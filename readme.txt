@@ -29,10 +29,11 @@ GLZAencode encodes the grammar using a variation of the Grammatical Ziv-Lempel f
 GLZAdecode decodes the data.
 
 Usage:
-   GLZA c|d [-c#] [-d#] [-l#] [-m#] [-p#] [-r#] [-t#] [-v#] [-w0] [-C#] [-D#] <infilename> <outfilename>
+   GLZA c|d [-c#] [-d#] [-f] [-l#] [-m#] [-p#] [-r#] [-t#] [-v#] [-w0] [-C#] [-D#] <infilename> <outfilename>
      where
        -c# sets the production cost (default is to estimate it)
        -d0 disables delta transformation
+       -f  enables faster compression
        -l0 disables capital letter lock transformation
        -m0 disables "selective" MTF dictionary coding
        -m1 forces "selective" MTF dictionary encoding
