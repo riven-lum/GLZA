@@ -2439,6 +2439,12 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
     remaining_symbols_to_code -= symbol_inst;
 
     if ((i != 0) && (sd[ranked_symbols[i - 1]].code_length > code_length)) {
+      if (index_last_length[code_length] == -1) {
+        uint32_t temp_code_length = code_length - 1;
+        while (index_last_length[temp_code_length] == -1)
+          temp_code_length--;
+        index_last_length[code_length] = index_last_length[temp_code_length];
+      }
       sd[ranked_symbols[++index_last_length[code_length]]].code_length = code_length;
       while (index_last_length[++code_length] == -1); // do nothing
       index_last_length[code_length]++;
