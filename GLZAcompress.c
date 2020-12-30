@@ -1045,10 +1045,12 @@ void *rank_scores_thread_fast(void *arg) {
             }
             position = next_position;
           }
-          while (position != num_candidates) {
-            candidates_index[position] = candidates_index[position + 1];
+          max_position = (num_candidates & 0xFF00) + (uint8_t)(num_candidates + candidates_index_starts[section]);
+          while (position != max_position) {
+            next_position = (position & 0xFF00) + (uint8_t)(position + 1);
+            candidates_index[position] = candidates_index[next_position];
             candidates_position[candidates_index[position]] = position;
-            position++;
+            position = next_position;
           }
           candidates_index[position] = score_index;
         }
