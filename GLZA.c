@@ -58,12 +58,12 @@ int main(int argc, char* argv[])
   uint8_t mode;
   uint8_t *inbuf, *outbuf = NULL;
   int32_t arg_num;
-  clock_t start_time;
   size_t insize, outsize;
+  struct timespec start_time, end_time;
   FILE *fd_in, *fd_out;
 
 
-  start_time = clock();
+  clock_gettime(CLOCK_MONOTONIC, &start_time);
   params.user_set_profit_ratio_power = 0;
   params.user_set_production_cost = 0;
   params.user_set_RAM_size = 0;
@@ -223,6 +223,8 @@ int main(int argc, char* argv[])
         (long unsigned int)insize,(long unsigned int)outsize,8.0*(float)insize/(float)outsize);
   }
   fclose(fd_out);
-  fprintf(stderr," in %.3f seconds.\n",(float)(clock()-start_time)/CLOCKS_PER_SEC);
+  clock_gettime(CLOCK_MONOTONIC, &end_time);
+  fprintf(stderr," in %.3lf seconds.\n", (float)(end_time.tv_sec * 1000000000L + end_time.tv_nsec
+      - (start_time.tv_sec * 1000000000L + start_time.tv_nsec)) / 1e9);
   return(EXIT_SUCCESS);
 }

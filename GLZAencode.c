@@ -2509,90 +2509,32 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   mtfg_queue_192_offset = 0;
 
   verbose = 0;
+  use_mtfg = 0;
   use_mtf = 2;
   if (params != 0) {
     verbose = params->print_dictionary;
     use_mtf = params->use_mtf;
   }
-  use_mtfg = 0;
-  grammar_size = 0;
+  base_bits = 8;
 
   in_char_ptr = inbuf;
   end_char_ptr = inbuf + in_size;
   format = *in_char_ptr++;
-  cap_encoded = (format == 1) ? 1 : 0; 
-  UTF8_compliant = 1;
-  max_UTF8_value = 0x7F;
-
-  // parse the file to determine UTF8_compliant
-  while (in_char_ptr != end_char_ptr) {
-    if (*in_char_ptr >= INSERT_SYMBOL_CHAR) {
-      if (*(in_char_ptr+1) != DEFINE_SYMBOL_CHAR)
-        in_char_ptr += 4;
-      else {
-        UTF8_compliant = 0;
-        break;
-      }
+  if ((format & 0x81) == 1) {
+    cap_encoded = (format >> 1) & 1;
+    UTF8_compliant = (format >> 2) & 1;
+    format = 1;
+    if (UTF8_compliant != 0) {
+      base_bits = *in_char_ptr++;
+      max_UTF8_value = 0x7F;
     }
-    else if (*in_char_ptr >= 0x80) {
-      if (*in_char_ptr < 0xC0) {
-        UTF8_compliant = 0;
-        break;
-      }
-      else if (*in_char_ptr < 0xE0) {
-        if ((*(in_char_ptr+1) < 0x80) || (*(in_char_ptr+1) >= 0xC0)) {
-          UTF8_compliant = 0;
-          break;
-        }
-        else {
-          UTF8_value = 0x40 * (*in_char_ptr & 0x1F) + (*(in_char_ptr+1) & 0x3F);
-          if (UTF8_value > max_UTF8_value)
-            max_UTF8_value = UTF8_value;
-          in_char_ptr += 2;
-        }
-      }
-      else if (*in_char_ptr < 0xF0) {
-        if ((*(in_char_ptr+1) < 0x80) || (*(in_char_ptr+1) >= 0xC0)
-            || (*(in_char_ptr+2) < 0x80) || (*(in_char_ptr+2) >= 0xC0)) {
-          UTF8_compliant = 0;
-          break;
-        }
-        else {
-          UTF8_value = 0x1000 * (*in_char_ptr & 0xF) + 0x40 * (*(in_char_ptr+1) & 0x3F) + (*(in_char_ptr+2) & 0x3F);
-          if (UTF8_value > max_UTF8_value)
-            max_UTF8_value = UTF8_value;
-          in_char_ptr += 3;
-        }
-      }
-      else if (*in_char_ptr < 0xF8) {
-        if ((*(in_char_ptr+1) < 0x80) || (*(in_char_ptr+1) >= 0xC0) || (*(in_char_ptr+2) < 0x80)
-            || (*(in_char_ptr+2) >= 0xC0) || (*(in_char_ptr+3) < 0x80) || (*(in_char_ptr+3) >= 0xC0)) {
-          UTF8_compliant = 0;
-          break;
-        }
-        else {
-          UTF8_value = 0x40000 * (*in_char_ptr & 0x7) + 0x1000 * (*(in_char_ptr+1) & 0x3F)
-              + 0x40 * (*(in_char_ptr+2) & 0x3F) + (*(in_char_ptr+3) & 0x3F);
-          if (UTF8_value > max_UTF8_value)
-            max_UTF8_value = UTF8_value;
-          in_char_ptr += 4;
-        }
-      }
-      else {
-        UTF8_compliant = 0;
-        break;
-      }
-    }
-    else
-      in_char_ptr++;
-    grammar_size++;
   }
-  in_char_ptr = inbuf + 1;
-  end_char_ptr = inbuf + in_size;
-  if (UTF8_compliant == 0)
-    grammar_size = in_size - 1;
+  else {
+    cap_encoded = 0;
+    UTF8_compliant = 0;
+  }
 
-  symbol_array = (uint32_t *)malloc(sizeof(uint32_t) * (grammar_size + 1));
+  symbol_array = (uint32_t *)malloc(sizeof(uint32_t) * in_size);
   if (symbol_array == 0) {
     fprintf(stderr,"Symbol memory allocation failed\n");
     return(0);
@@ -2603,9 +2545,6 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
   first_define_ptr = 0;
 
   if (UTF8_compliant != 0) {
-    base_bits = 7;
-    while ((max_UTF8_value >> base_bits) != 0)
-      base_bits++;
     start_my_symbols = 1 << base_bits;
     num_base_symbols = start_my_symbols;
     while (in_char_ptr < end_char_ptr) {
@@ -2643,11 +2582,12 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
           UTF8_value = 0x40 * (temp_char & 0x1F);
         UTF8_value += *in_char_ptr++ & 0x3F;
         *symbol_ptr++ = UTF8_value;
+        if (UTF8_value > max_UTF8_value)
+          max_UTF8_value = UTF8_value;
       }
     }
   }
   else {
-    base_bits = 8;
     start_my_symbols = 0x100;
     num_base_symbols = 0x100;
     while (in_char_ptr < end_char_ptr) {
@@ -2672,22 +2612,15 @@ uint8_t GLZAencode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_
         *symbol_ptr++ = ((uint32_t)DEFINE_SYMBOL_CHAR << 24) + num_symbols_defined++;
       }
     }
-    grammar_size = symbol_ptr - symbol_array;
   }
-#ifdef PRINTON
-  fprintf(stderr,"cap encoded %u, UTF8 compliant %u\n",(unsigned int)cap_encoded,(unsigned int)UTF8_compliant);
-#endif
 
+  grammar_size = symbol_ptr - symbol_array;
   if (first_define_ptr == 0)
     first_define_ptr = symbol_ptr;
 
   end_symbol_ptr = symbol_ptr;
   *end_symbol_ptr = UNIQUE_CHAR;
   num_codes = start_my_symbols + num_symbols_defined;
-#ifdef PRINTON
-  fprintf(stderr,"Read %u symbols including %u definition symbols\n",(unsigned int)grammar_size,
-      (unsigned int)num_symbols_defined);
-#endif
 
   if (0 == (sd = (struct symbol_data *)malloc(sizeof(struct symbol_data) * (num_codes + 1)))) {
     fprintf(stderr,"Symbol data memory allocation failed\n");
