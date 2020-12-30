@@ -70,10 +70,10 @@ double calculate_order_1_entropy(uint32_t symbol_counts[0x100], uint32_t order_1
 }
 
 
-uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
+uint8_t GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr, uint8_t ** outbuf) {
   const uint32_t CHARS_TO_WRITE = 0x40000;
   uint8_t this_char, prev_char, next_char, user_cap_encoded, user_cap_lock_encoded, user_delta_encoded, stride;
-  uint8_t *in_char_ptr, *end_char_ptr, *out_char_ptr, *outbuf;
+  uint8_t *in_char_ptr, *end_char_ptr, *out_char_ptr;
   uint32_t i, j, k;
   uint32_t num_AZ, num_az_pre_AZ, num_az_post_AZ, num_spaces;
   uint32_t order_1_counts[0x100][0x100];
@@ -87,7 +87,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
   user_cap_lock_encoded = 0;
   user_delta_encoded = 0;
 
-  outbuf = (uint8_t *)malloc(2 * insize);
+  *outbuf = (uint8_t *)malloc(2 * insize + 1);
+  if (*outbuf == 0)
+    return(0);
 
   end_char_ptr = inbuf + insize;
   num_AZ = 0;
@@ -123,11 +125,13 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
     }
   }
 
-  out_char_ptr = outbuf;
+  out_char_ptr = *outbuf;
 
   if (((num_AZ && (4 * num_az_post_AZ > num_AZ) && (num_az_post_AZ > num_az_pre_AZ)
       && (num_spaces > insize / 50)) && (user_cap_encoded != 1)) || (user_cap_encoded == 2)) {
+#ifdef PRINTON
     fprintf(stderr,"Converting textual data\n");
+#endif
     *out_char_ptr++ = 1;
     in_char_ptr = inbuf;
     while (in_char_ptr != end_char_ptr) {
@@ -234,10 +238,12 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
 
     double min_entropy = best_stride_entropy;
 
+#ifdef PRINTON
     if (stride)
       fprintf(stderr,"Applying %u byte delta transformation\n",(unsigned int)stride);
     else
       fprintf(stderr,"Converting data\n");
+#endif
 
     if (stride == 0) {
       *out_char_ptr++ = 0;
@@ -306,7 +312,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
         }
         order_1_entropy = calculate_order_1_entropy(symbol_counts, order_1_counts);
         if (order_1_entropy < best_stride_entropy) {
+#ifdef PRINTON
           fprintf(stderr,"Big endian\n");
+#endif
           *out_char_ptr++ = 0x14;
           in_char_ptr = inbuf + ((end_char_ptr - inbuf - 4) & ~1);
           uint16_t value = (*(in_char_ptr + 2) << 8) + *(in_char_ptr + 3);
@@ -320,7 +328,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
           }
         }
         else {
+#ifdef PRINTON
           fprintf(stderr,"No carry\n");
+#endif
           *out_char_ptr++ = 4;
           in_char_ptr = end_char_ptr - 2;
           while (--in_char_ptr >= inbuf)
@@ -367,7 +377,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
         }
         order_1_entropy = calculate_order_1_entropy(symbol_counts, order_1_counts);
         if (order_1_entropy < best_stride_entropy) {
+#ifdef PRINTON
           fprintf(stderr,"Little endian\n");
+#endif
           *out_char_ptr++ = 0x34;
           in_char_ptr = inbuf + ((end_char_ptr - inbuf - 4) & ~1);
           uint16_t value = (*(in_char_ptr + 3) << 8) + *(in_char_ptr + 2);
@@ -381,7 +393,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
           }
         }
         else {
+#ifdef PRINTON
           fprintf(stderr,"No carry\n");
+#endif
           *out_char_ptr++ = 4;
           in_char_ptr = end_char_ptr - 2;
           while (--in_char_ptr >= inbuf)
@@ -536,7 +550,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
             }
             order_1_entropy = calculate_order_1_entropy(symbol_counts, order_1_counts);
             if (order_1_entropy < min_entropy) {
+#ifdef PRINTON
               fprintf(stderr,"Two channel big endian\n");
+#endif
               *out_char_ptr++ = 0x58;
               in_char_ptr = inbuf + ((end_char_ptr - inbuf - 6) & ~1);
               while (in_char_ptr >= inbuf) {
@@ -548,7 +564,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
               }
             }
             else {
+#ifdef PRINTON
               fprintf(stderr,"No carry\n");
+#endif
               *out_char_ptr++ = 8;
               in_char_ptr = end_char_ptr - 4;
               while (--in_char_ptr >= inbuf)
@@ -667,7 +685,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
             }
             order_1_entropy = calculate_order_1_entropy(symbol_counts, order_1_counts);
             if (order_1_entropy < min_entropy) {
+#ifdef PRINTON
               fprintf(stderr,"Two channel little endian\n");
+#endif
               *out_char_ptr++ = 0x78;
               in_char_ptr = inbuf + ((end_char_ptr - inbuf - 6) & ~1);
               while (in_char_ptr >= inbuf) {
@@ -679,7 +699,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
               }
             }
             else {
+#ifdef PRINTON
               fprintf(stderr,"No carry\n");
+#endif
               *out_char_ptr++ = 8;
               in_char_ptr = end_char_ptr - 4;
               while (--in_char_ptr >= inbuf)
@@ -877,7 +899,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
           order_1_entropy = calculate_order_1_entropy(symbol_counts, order_1_counts);
 
           if ((saved_entropy[0] < min_entropy) && (saved_entropy[0] < order_1_entropy)) {
+#ifdef PRINTON
             fprintf(stderr,"Big endian\n");
+#endif
             *out_char_ptr++ = 0x18;
             in_char_ptr = inbuf + ((end_char_ptr - inbuf - 8) & ~3);
             uint32_t value = (*(in_char_ptr + 4) << 24) + (*(in_char_ptr + 5) << 16)
@@ -895,7 +919,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
             }
           }
           else if (order_1_entropy < min_entropy) {
+#ifdef PRINTON
             fprintf(stderr,"Little endian\n");
+#endif
             *out_char_ptr++ = 0x38;
             in_char_ptr = inbuf + ((end_char_ptr - inbuf - 8) & ~3);
             uint32_t value = (*(in_char_ptr + 7) << 24) + (*(in_char_ptr + 6) << 16)
@@ -913,7 +939,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
             }
           }
           else {
+#ifdef PRINTON
             fprintf(stderr,"No carry\n");
+#endif
             *out_char_ptr++ = 8;
             in_char_ptr = end_char_ptr - 4;
             while (--in_char_ptr >= inbuf)
@@ -922,7 +950,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
         }
       }
       else {
+#ifdef PRINTON
         fprintf(stderr,"No carry\n");
+#endif
         *out_char_ptr++ = 8;
         in_char_ptr = end_char_ptr - 4;
         while (--in_char_ptr >= inbuf)
@@ -1067,7 +1097,9 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
     }
   }
   else {
+#ifdef PRINTON
     fprintf(stderr,"Converting data\n");
+#endif
     *out_char_ptr++ = 0;
     in_char_ptr = inbuf;
     while (in_char_ptr != end_char_ptr) {
@@ -1080,10 +1112,10 @@ uint8_t * GLZAformat(size_t insize, uint8_t * inbuf, size_t * outsize_ptr) {
     }
   }
 
-  *outsize_ptr = out_char_ptr - outbuf;
-  if ((outbuf = (uint8_t *)realloc(outbuf, *outsize_ptr)) == 0) {
+  *outsize_ptr = out_char_ptr - *outbuf;
+  if ((*outbuf = (uint8_t *)realloc(*outbuf, *outsize_ptr)) == 0) {
     fprintf(stderr,"ERROR - Compressed output buffer memory reallocation failed\n");
-    exit(EXIT_FAILURE);
+    return(0);
   }
-  return(outbuf);
+  return(1);
 }

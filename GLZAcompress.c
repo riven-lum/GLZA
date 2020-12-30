@@ -1446,7 +1446,7 @@ void *substitute_thread(void *arg) {
 }
 
 
-uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_ptr) {
+uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_ptr, uint8_t ** outbuf) {
   const uint32_t MAX_SYMBOLS_DEFINED = 0x00900000;
   const uint8_t INSERT_SYMBOL_CHAR = 0xFE;
   const uint8_t DEFINE_SYMBOL_CHAR = 0xFF;
@@ -1457,7 +1457,7 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
   uint32_t *search_match_ptr, *match_strings, *match_string_start_ptr, *node_string_start_ptr, *base_node_child_num_ptr;
   uint16_t scan_cycle = 0;
   uint8_t this_char, format, user_set_RAM_size, user_set_profit_ratio_power, user_set_production_cost, create_words;
-  uint8_t *free_RAM_ptr, *outbuf;
+  uint8_t *free_RAM_ptr;
   double d_file_symbols, prior_min_score, new_min_score, order_0_entropy, log_file_symbols, RAM_usage;
   float prior_cycle_start_ratio, prior_cycle_end_ratio;
 
@@ -1488,12 +1488,12 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
     if (start_symbol_ptr == 0) {
       fprintf(stderr,"ERROR - Insufficient RAM to compress - unable to allocate %Iu bytes\n",
           (size_t)((available_RAM * 10) / 9));
-      exit(EXIT_FAILURE);
+      return(0);
     }
     else if (available_RAM < 5.0 * (double)in_size) {
       fprintf(stderr,"ERROR - Insufficient RAM to compress - program requires at least %Iu MB\n",
           (size_t)(((uint64_t)in_size * 5 + 999999)/1000000));
-      exit(EXIT_FAILURE);
+      return(0);
     }
   }
   else {
@@ -1511,10 +1511,12 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
     if ((start_symbol_ptr == 0) || (available_RAM < 5.0 * (double)in_size)) {
       fprintf(stderr,"ERROR - Insufficient RAM to compress - unable to allocate %Iu bytes\n",
           (size_t)((available_RAM * 10) / 9));
-      exit(EXIT_FAILURE);
+      return(0);
     }
   }
+#ifdef PRINTON
   fprintf(stderr,"Allocated %Iu bytes for data processing\n",(size_t)available_RAM);
+#endif
 
   in_symbol_ptr = start_symbol_ptr;
 
@@ -1584,7 +1586,9 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
       profit_ratio_power = 0.0;
   }
 
+#ifdef PRINTON
   fprintf(stderr,"cap encoded: %u, UTF8 compliant %u\n",(unsigned int)cap_encoded,(unsigned int)UTF8_compliant);
+#endif
 
   // parse the file to determine num_compound_symbols and max_UTF8_value
   num_file_symbols = 0;
@@ -1627,8 +1631,10 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
       }
       num_file_symbols++;
     }
+#ifdef PRINTON
     fprintf(stderr,"Found %u symbols, %u defines, maximum unicode value 0x%x\n",
         (unsigned int)num_file_symbols,(unsigned int)num_compound_symbols,(unsigned int)max_UTF8_value);
+#endif
   }
   else {
     num_simple_symbols = 0x100;
@@ -1654,7 +1660,9 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
       }
       num_file_symbols++;
     }
+#ifdef PRINTON
     fprintf(stderr,"Found %u symbols, %u defines\n",(unsigned int)num_file_symbols,(unsigned int)num_compound_symbols);
+#endif
   }
   end_symbol_ptr = in_symbol_ptr;
   *end_symbol_ptr = 0xFFFFFFFE;
@@ -1752,13 +1760,16 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
       double this_symbol_entropy = log_file_symbols - log2(d_symbol_count);
       order_0_entropy += d_symbol_count * this_symbol_entropy;
     }
+#ifdef PRINTON
     fprintf(stderr,"%u: %u syms, dict. size %u, %.4f bits/sym, o0e %u bytes\n",
         (unsigned int)++scan_cycle,(unsigned int)num_file_symbols,(unsigned int)num_compound_symbols,
         (float)(order_0_entropy/d_file_symbols),(unsigned int)(order_0_entropy*0.125));
+#endif
 
     // setup to build the suffix tree
     base_node_child_num_ptr = base_string_nodes_child_node_num;
-    while (base_node_child_num_ptr < base_string_nodes_child_node_num + next_new_symbol_number * BASE_NODES_CHILD_ARRAY_SIZE) {
+    while (base_node_child_num_ptr
+        < base_string_nodes_child_node_num + next_new_symbol_number * BASE_NODES_CHILD_ARRAY_SIZE) {
       *base_node_child_num_ptr = 0;
       *(base_node_child_num_ptr + 1) = 0;
       *(base_node_child_num_ptr + 2) = 0;
@@ -1836,7 +1847,9 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
       pthread_join(rank_scores_thread1, NULL);
       prior_cycle_end_ratio = (float)(in_symbol_ptr - start_symbol_ptr) / (float)(end_symbol_ptr - start_symbol_ptr);
 
+#ifdef PRINTON
       fprintf(stderr,"Read %u symbols, start %.4f",(unsigned int)(in_symbol_ptr-cycle_start_ptr),prior_cycle_start_ratio);
+#endif
       goto jump_loc;
     }
 
@@ -1993,9 +2006,11 @@ uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_p
         while ((int)this_symbol >= 0) {
           if (this_symbol <= main_max_symbol) {
             atomic_store_explicit(&scan_symbol_ptr, in_symbol_ptr, memory_order_relaxed);
+#ifdef PRINTON
             if ((next_string_node_num & 0xFFFF) == 0)
               fprintf(stderr,"Main processed %u of %u symbols \r",
                   (uint32_t)(in_symbol_ptr-1-cycle_start_ptr),(uint32_t)(end_symbol_ptr-start_symbol_ptr));
+#endif
             add_suffix(this_symbol, in_symbol_ptr, &next_string_node_num);
             if (next_string_node_num < main_string_nodes_limit)
               this_symbol = *in_symbol_ptr++;
@@ -2021,80 +2036,130 @@ done_building_lcp_tree:
     pthread_create(&rank_scores_thread1,NULL,rank_scores_thread,(void *)&rank_scores_buffer[0]);
     while (atomic_load_explicit(&rank_scores_read_index, memory_order_acquire) != 0) /* wait */ ;
 
+#ifdef PRINTON
     fprintf(stderr,"                                              \r");
     fprintf(stderr,".");
+#endif
     score_symbol_tree(0, main_max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread1,NULL);
     pthread_create(&build_lcp_thread1,NULL,build_lcp_thread,(char *)&lcp_thread_data[6]);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(main_max_symbol + 1, lcp_thread_data[0].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread2,NULL);
     pthread_create(&build_lcp_thread2,NULL,build_lcp_thread,(char *)&lcp_thread_data[7]);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[0].max_symbol + 1, lcp_thread_data[1].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread3,NULL);
     pthread_create(&build_lcp_thread3,NULL,build_lcp_thread,(char *)&lcp_thread_data[8]);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[1].max_symbol + 1, lcp_thread_data[2].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread4,NULL);
     pthread_create(&build_lcp_thread4,NULL,build_lcp_thread,(char *)&lcp_thread_data[9]);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[2].max_symbol + 1, lcp_thread_data[3].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread5,NULL);
     pthread_create(&build_lcp_thread5,NULL,build_lcp_thread,(char *)&lcp_thread_data[10]);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[3].max_symbol + 1, lcp_thread_data[4].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread6,NULL);
     pthread_create(&build_lcp_thread6,NULL,build_lcp_thread,(char *)&lcp_thread_data[11]);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[4].max_symbol + 1, lcp_thread_data[5].max_symbol);
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread1,NULL);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[5].max_symbol + 1, lcp_thread_data[6].max_symbol);
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread2,NULL);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[6].max_symbol + 1, lcp_thread_data[7].max_symbol);
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread3,NULL);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[7].max_symbol + 1, lcp_thread_data[8].max_symbol);
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread4,NULL);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[8].max_symbol + 1, lcp_thread_data[9].max_symbol);
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread5,NULL);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[9].max_symbol + 1, lcp_thread_data[10].max_symbol);
 
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     pthread_join(build_lcp_thread6,NULL);
+#ifdef PRINTON
     fprintf(stderr,".");
+#endif
     score_symbol_tree(lcp_thread_data[10].max_symbol + 1, lcp_thread_data[11].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
@@ -2103,15 +2168,19 @@ done_building_lcp_tree:
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
     pthread_join(rank_scores_thread1,NULL);
 
+#ifdef PRINTON
     fprintf(stderr,"\rRead %u symbols, start %.4f",(unsigned int)(in_symbol_ptr-cycle_start_ptr),prior_cycle_start_ratio);
+#endif
 
     prior_cycle_end_ratio = (float)(in_symbol_ptr-start_symbol_ptr)/(float)(end_symbol_ptr-start_symbol_ptr);
 
 jump_loc:
 
     if (num_candidates) {
+#ifdef PRINTON
       fprintf(stderr," score[0-%hu] = %.5f-%.5f\n",(unsigned short int)num_candidates-1,
           candidates[candidates_index[0]].score,candidates[candidates_index[num_candidates-1]].score);
+#endif
 
       free_RAM_ptr = (uint8_t *)(end_symbol_ptr + 1);
       match_nodes = (struct match_node *)free_RAM_ptr;
@@ -2290,7 +2359,9 @@ jump_loc:
       }
 
       // scan the data, following prefix tree
+#ifdef PRINTON
       fprintf(stderr,"Overlap search\r");
+#endif
 
       uint32_t prior_match_score_number[MAX_PRIOR_MATCHES];
       uint32_t *prior_match_end_ptr[MAX_PRIOR_MATCHES]; 
@@ -2519,7 +2590,9 @@ main_overlap_check_loop_end:
         i1++;
       }
 
+#ifdef PRINTON
       fprintf(stderr,"Replacing data with new dictionary symbols\r");
+#endif
       // scan the data following the prefix tree and substitute new symbols on end matches (child is 0)
       if (end_symbol_ptr - start_symbol_ptr >= 1000000) {
         stop_symbol_ptr = start_symbol_ptr + ((end_symbol_ptr - start_symbol_ptr) >> 3);
@@ -2841,8 +2914,10 @@ main_symbol_substitution_loop_end:
       *end_symbol_ptr = 0xFFFFFFFE;
       free_RAM_ptr = (uint8_t *)(end_symbol_ptr + 1);
     }
+#ifdef PRINTON
     else
       fprintf(stderr,"\n");
+#endif
 
     if (num_candidates) {
       if (scan_cycle > 1) {
@@ -2893,11 +2968,11 @@ main_symbol_substitution_loop_end:
       max_scores = 5000;
   } while ((num_candidates) && (num_simple_symbols + num_compound_symbols + MAX_SCORES < MAX_SYMBOLS_DEFINED));
 
-  if ((outbuf = (uint8_t *)malloc(4 * (end_symbol_ptr - start_symbol_ptr) + 1)) == 0) {
+  if ((*outbuf = (uint8_t *)malloc(4 * (end_symbol_ptr - start_symbol_ptr) + 1)) == 0) {
     fprintf(stderr,"ERROR - Compressed output buffer memory allocation failed\n");
-    exit(EXIT_FAILURE);
+    return(0);
   }
-  in_char_ptr = outbuf;
+  in_char_ptr = *outbuf;
   *in_char_ptr++ = format;
   in_symbol_ptr = start_symbol_ptr;
   if (UTF8_compliant) {
@@ -2968,13 +3043,15 @@ main_symbol_substitution_loop_end:
     }
   }
 
-  in_size = in_char_ptr - outbuf;
-  if ((outbuf = (uint8_t *)realloc(outbuf, in_size)) == 0) {
+  in_size = in_char_ptr - *outbuf;
+  if ((*outbuf = (uint8_t *)realloc(*outbuf, in_size)) == 0) {
     fprintf(stderr,"ERROR - Compressed output buffer memory reallocation failed\n");
-    exit(EXIT_FAILURE);
+    return(0);
   }
   *outsize_ptr = in_size;
   free(start_symbol_ptr);
+#ifdef PRINTON
   fprintf(stderr,"%u grammar productions created.\n", num_compound_symbols);
-  return(outbuf);
+#endif
+  return((uint8_t *)1);
 }

@@ -35,6 +35,9 @@ uint16_t FreqSymType[4][4], FreqMtfQueueNum[2][14], FreqMtfQueuePos[2][14][64], 
 uint16_t FreqSID[2][16], FreqINST[2][16][38], FreqFirstChar[4][0x100][0x100], FreqFirstCharBinary[0x100][0x100];
 const uint32_t MTF_QUEUE_SIZE = 64;
 
+uint32_t ReadLow() {return(low);}
+uint32_t ReadRange() {return(range);}
+
 
 void StartModelSymType(uint8_t use_mtf, uint8_t use_mtfg) {
   uint8_t i = 3;
@@ -496,13 +499,16 @@ void InitBaseSymbolCap(uint8_t BaseSymbol, uint8_t max_symbol, uint8_t new_symbo
   } while (j1--);
   if ((BaseSymbol & 0xFE) == 0x42) {
     j1 = 'z';
-    do {
-      if ((*cap_symbol_defined_ptr | *cap_lock_symbol_defined_ptr) == 0) {
+    if ((*cap_symbol_defined_ptr | *cap_lock_symbol_defined_ptr) == 0) {
+      do {
         InitSymbolFirstChar('C', j1);
         if (RangeScaleFirstChar[0][j1])
           InitTrailingCharBin('C', j1, symbol_lengths[j1]);
-      }
-    } while (j1-- != 'a');
+      } while (j1-- != 'a');
+      do {
+        InitSymbolFirstChar('C', j1);
+      } while (j1-- != 0);
+    }
     if (BaseSymbol == 'C')
       *cap_symbol_defined_ptr = 1;
     else
