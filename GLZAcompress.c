@@ -37,10 +37,7 @@ limitations under the License.
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 
-const uint8_t INSERT_SYMBOL_CHAR = 0xFE;
-const uint8_t DEFINE_SYMBOL_CHAR = 0xFF;
 const uint32_t START_MY_SYMBOLS = 0x00080000;
 const uint32_t MAX_WRITE_SIZE = 0x200000;
 const uint32_t MAX_PRIOR_MATCHES = 20;
@@ -49,7 +46,6 @@ const uint32_t BASE_NODES_CHILD_ARRAY_SIZE = 16;
 const uint32_t NUM_PRECALCULATED_INSTANCE_LOGS = 10000;
 const uint32_t NUM_PRECALCULATED_MATCH_RATIO_LOGS = 2000;
 const uint32_t MAX_SCORES = 30000;
-const uint32_t MAX_SYMBOLS_DEFINED = 0x00900000;
 
 static struct string_node {
   uint32_t symbol;
@@ -122,7 +118,7 @@ uint32_t *base_string_nodes_child_node_num, *best_score_last_match_ptr;
 uint32_t substitute_data[0x10000];
 uint16_t node_ptrs_num, num_candidates, candidates_index[30000];
 uint8_t cap_encoded, UTF8_compliant, candidate_bad[30000];
-uint8_t *char_buffer, *in_char_ptr, *end_char_ptr;
+uint8_t *in_char_ptr, *end_char_ptr;
 double log2_num_symbols_plus_substitution_cost, min_score, production_cost, profit_ratio_power;
 double new_symbol_cost[2000], log2_instances[10000];
 double *symbol_entropy;
@@ -1395,7 +1391,6 @@ void *substitute_thread(void *arg) {
   uint32_t data = 0;
   uint16_t substitute_data_index = 0;
   uint16_t local_write_index = 0;
-//  uint32_t * old_data_ptr = start_symbol_ptr;
   old_data_ptr = start_symbol_ptr;
 
   atomic_store_explicit(&substitute_data_read_index, substitute_data_index, memory_order_release);
@@ -1451,28 +1446,18 @@ void *substitute_thread(void *arg) {
 }
 
 
-void print_usage() {
-  fprintf(stderr,"Invalid format - Use GLZAcompress [-c#] [-p#] [-r#] [-w0] <infile> <outfile>\n");
-  fprintf(stderr," where -c# sets the grammar production cost in bits\n");
-  fprintf(stderr,"       -p# sets the profit power ratio.  0.0 is most compressive, larger\n");
-  fprintf(stderr,"           values favor longer strings\n");
-  fprintf(stderr,"       -r# sets memory usage in millions of bytes\n");
-  fprintf(stderr,"       -w0 disables first cycle \"word\" only deduplication\n");
-  return;
-}
-
-
-int main(int argc, char* argv[]) {
-  FILE *fd_in, *fd_out;
+uint8_t * GLZAcompress(size_t in_size, uint8_t * char_buffer, size_t * outsize_ptr) {
+  const uint32_t MAX_SYMBOLS_DEFINED = 0x00900000;
+  const uint8_t INSERT_SYMBOL_CHAR = 0xFE;
+  const uint8_t DEFINE_SYMBOL_CHAR = 0xFF;
   uint64_t available_RAM;
-  uint32_t in_size, num_file_symbols, next_new_symbol_number, num_compound_symbols, i2;
+  uint32_t num_file_symbols, next_new_symbol_number, num_compound_symbols, i2;
   uint32_t UTF8_value, max_UTF8_value, symbol, num_symbols_to_copy, num_simple_symbols_used;
   uint32_t first_symbol_number, node_score_number, suffix_node_number, next_string_node_num, string_node_num_limit;
   uint32_t *search_match_ptr, *match_strings, *match_string_start_ptr, *node_string_start_ptr, *base_node_child_num_ptr;
-  int32_t arg_num;
   uint16_t scan_cycle = 0;
   uint8_t this_char, format, user_set_RAM_size, user_set_profit_ratio_power, user_set_production_cost, create_words;
-  uint8_t *free_RAM_ptr, *write_ptr;
+  uint8_t *free_RAM_ptr, *outbuf;
   double d_file_symbols, prior_min_score, new_min_score, order_0_entropy, log_file_symbols, RAM_usage;
   float prior_cycle_start_ratio, prior_cycle_end_ratio;
 
@@ -1482,62 +1467,12 @@ int main(int argc, char* argv[]) {
   pthread_t find_substitutions_threads[7];
 
 
-  clock_t start_time = clock();
-
   for (i1 = 0 ; i1 < MAX_SCORES ; i1++)
     candidate_bad[i1] = 0;
   user_set_RAM_size = 0;
   user_set_profit_ratio_power = 0;
   user_set_production_cost = 0;
   create_words = 1;
-  arg_num = 1;
-  if (argc < 3) {
-    print_usage();
-    exit(EXIT_FAILURE);
-  }
-  while (*argv[arg_num] ==  '-') {
-    if (*(argv[arg_num]+1) == 'c') {
-      production_cost = (double)atof(argv[arg_num++]+2);
-      user_set_production_cost = 1;
-    }
-    else if (*(argv[arg_num]+1) == 'p') {
-      profit_ratio_power = (double)atof(argv[arg_num++]+2);
-      user_set_profit_ratio_power = 1;
-    }
-    else if (*(argv[arg_num]+1) == 'r') {
-      user_set_RAM_size = 1;
-      RAM_usage = (double)atof(argv[arg_num++]+2);
-      if (RAM_usage < 60.0) {
-        fprintf(stderr,"ERROR: -r value must be >= 60.0 (MB)\n");
-        exit(EXIT_FAILURE);
-      }
-    }
-    else if (*(argv[arg_num]+1) == 'w') {
-      if (*(argv[arg_num++]+2) == '0')
-        create_words = 0;
-      else {
-        fprintf(stderr,"ERROR: -w value must be 0\n");
-        exit(EXIT_FAILURE);
-      }
-    }
-    else {
-      fprintf(stderr,"ERROR - Invalid '-' format.  Only -m<value>, -p<value> and -r<value> allowed\n");
-      exit(EXIT_FAILURE);
-    }
-    if (argc < arg_num + 2) {
-      print_usage();
-      exit(EXIT_FAILURE);
-    }
-  }
-
-  if ((fd_in=fopen(argv[arg_num],"rb")) == NULL) {
-    fprintf(stderr,"Error - unable to open input file '%s'\n",argv[arg_num]);
-    exit(EXIT_FAILURE);
-  }
-  arg_num++;
-  fseek(fd_in, 0, SEEK_END);
-  in_size = ftell(fd_in);
-  rewind(fd_in);
 
   // Determine whether the RAM can be allocated, if not reduce size until malloc successful or RAM too small
   uint64_t max_memory_usage;
@@ -1581,13 +1516,7 @@ int main(int argc, char* argv[]) {
   }
   fprintf(stderr,"Allocated %Iu bytes for data processing\n",(size_t)available_RAM);
 
-  char_buffer = (uint8_t *)start_symbol_ptr + 4 * (uint64_t)in_size;
   in_symbol_ptr = start_symbol_ptr;
-
-  i1 = fread(char_buffer,1,in_size,fd_in);
-  fflush(fd_in);
-  fclose(fd_in);
-  fprintf(stderr,"Read %u byte input file\n",(unsigned int)i1);
 
   // parse the file to determine UTF8_compliant
   num_compound_symbols = 0;
@@ -1596,11 +1525,6 @@ int main(int argc, char* argv[]) {
   cap_encoded = (format == 1) ? 1 : 0;
   in_char_ptr = char_buffer + 1;
   end_char_ptr = char_buffer + in_size;
-
-  if (in_char_ptr >= end_char_ptr) {
-    num_candidates = 0;
-    goto write_file;
-  }
 
   do {
     if (*in_char_ptr >= INSERT_SYMBOL_CHAR) {
@@ -1882,8 +1806,6 @@ int main(int argc, char* argv[]) {
     uint32_t * cycle_start_ptr = in_symbol_ptr;
 
     next_string_node_num = 1;
-    fprintf(stderr,"Common prefix scan 0 - %x\r",(unsigned int)(next_new_symbol_number-1));
-
     uint32_t main_string_nodes_limit;
     if ((scan_cycle == 1) && cap_encoded && create_words) {
       max_scores = 30000;
@@ -1912,11 +1834,9 @@ int main(int argc, char* argv[]) {
       atomic_store_explicit(&rank_scores_write_index, ++node_ptrs_num, memory_order_release);
       while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
       pthread_join(rank_scores_thread1, NULL);
-
-      fprintf(stderr,"Read %u of %u symbols, start %.4f\n",(unsigned int)(in_symbol_ptr-cycle_start_ptr),
-          (unsigned int)(end_symbol_ptr-start_symbol_ptr),prior_cycle_start_ratio);
-
       prior_cycle_end_ratio = (float)(in_symbol_ptr - start_symbol_ptr) / (float)(end_symbol_ptr - start_symbol_ptr);
+
+      fprintf(stderr,"Read %u symbols, start %.4f",(unsigned int)(in_symbol_ptr-cycle_start_ptr),prior_cycle_start_ratio);
       goto jump_loc;
     }
 
@@ -2101,79 +2021,80 @@ done_building_lcp_tree:
     pthread_create(&rank_scores_thread1,NULL,rank_scores_thread,(void *)&rank_scores_buffer[0]);
     while (atomic_load_explicit(&rank_scores_read_index, memory_order_acquire) != 0) /* wait */ ;
 
-    fprintf(stderr,"Score section 1                               \r");
+    fprintf(stderr,"                                              \r");
+    fprintf(stderr,".");
     score_symbol_tree(0, main_max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
-    fprintf(stderr,"Wait thread 1  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread1,NULL);
     pthread_create(&build_lcp_thread1,NULL,build_lcp_thread,(char *)&lcp_thread_data[6]);
-    fprintf(stderr,"Score section 2\r");
+    fprintf(stderr,".");
     score_symbol_tree(main_max_symbol + 1, lcp_thread_data[0].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
-    fprintf(stderr,"Wait thread 2  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread2,NULL);
     pthread_create(&build_lcp_thread2,NULL,build_lcp_thread,(char *)&lcp_thread_data[7]);
-    fprintf(stderr,"Score section 3\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[0].max_symbol + 1, lcp_thread_data[1].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
-    fprintf(stderr,"Wait thread 3  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread3,NULL);
     pthread_create(&build_lcp_thread3,NULL,build_lcp_thread,(char *)&lcp_thread_data[8]);
-    fprintf(stderr,"Score section 4\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[1].max_symbol + 1, lcp_thread_data[2].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
-    fprintf(stderr,"Wait thread 4  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread4,NULL);
     pthread_create(&build_lcp_thread4,NULL,build_lcp_thread,(char *)&lcp_thread_data[9]);
-    fprintf(stderr,"Score section 5\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[2].max_symbol + 1, lcp_thread_data[3].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
-    fprintf(stderr,"Wait thread 5  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread5,NULL);
     pthread_create(&build_lcp_thread5,NULL,build_lcp_thread,(char *)&lcp_thread_data[10]);
-    fprintf(stderr,"Score section 6\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[3].max_symbol + 1, lcp_thread_data[4].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
-    fprintf(stderr,"Wait thread 6  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread6,NULL);
     pthread_create(&build_lcp_thread6,NULL,build_lcp_thread,(char *)&lcp_thread_data[11]);
-    fprintf(stderr,"Score section 7\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[4].max_symbol + 1, lcp_thread_data[5].max_symbol);
 
-    fprintf(stderr,"Wait thread 7  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread1,NULL);
-    fprintf(stderr,"Score section 8\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[5].max_symbol + 1, lcp_thread_data[6].max_symbol);
 
-    fprintf(stderr,"Wait thread 8  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread2,NULL);
-    fprintf(stderr,"Score section 9\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[6].max_symbol + 1, lcp_thread_data[7].max_symbol);
 
-    fprintf(stderr,"Wait thread 9  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread3,NULL);
-    fprintf(stderr,"Score section 10\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[7].max_symbol + 1, lcp_thread_data[8].max_symbol);
 
-    fprintf(stderr,"Wait thread 10  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread4,NULL);
-    fprintf(stderr,"Score section 11\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[8].max_symbol + 1, lcp_thread_data[9].max_symbol);
 
-    fprintf(stderr,"Wait thread 11  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread5,NULL);
-    fprintf(stderr,"Score section 12\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[9].max_symbol + 1, lcp_thread_data[10].max_symbol);
 
-    fprintf(stderr,"Wait thread 12  \r");
+    fprintf(stderr,".");
     pthread_join(build_lcp_thread6,NULL);
-    fprintf(stderr,"Score section 13\r");
+    fprintf(stderr,".");
     score_symbol_tree(lcp_thread_data[10].max_symbol + 1, lcp_thread_data[11].max_symbol);
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
 
@@ -2182,16 +2103,14 @@ done_building_lcp_tree:
     while (node_ptrs_num != atomic_load_explicit(&rank_scores_read_index, memory_order_acquire)) /* wait */ ;
     pthread_join(rank_scores_thread1,NULL);
 
-    fprintf(stderr,"Read %u of %u symbols, start %.4f\n",(unsigned int)(in_symbol_ptr-cycle_start_ptr),
-        (unsigned int)(end_symbol_ptr-start_symbol_ptr),prior_cycle_start_ratio);
+    fprintf(stderr,"\rRead %u symbols, start %.4f",(unsigned int)(in_symbol_ptr-cycle_start_ptr),prior_cycle_start_ratio);
 
     prior_cycle_end_ratio = (float)(in_symbol_ptr-start_symbol_ptr)/(float)(end_symbol_ptr-start_symbol_ptr);
 
 jump_loc:
 
     if (num_candidates) {
-      fprintf(stderr,"Common prefix scan 0 - %x, score[0 - %hu] = %.5f - %.5f\n",
-          (unsigned int)(next_new_symbol_number-1),(unsigned short int)num_candidates-1,
+      fprintf(stderr," score[0-%hu] = %.5f-%.5f\n",(unsigned short int)num_candidates-1,
           candidates[candidates_index[0]].score,candidates[candidates_index[num_candidates-1]].score);
 
       free_RAM_ptr = (uint8_t *)(end_symbol_ptr + 1);
@@ -2922,6 +2841,8 @@ main_symbol_substitution_loop_end:
       *end_symbol_ptr = 0xFFFFFFFE;
       free_RAM_ptr = (uint8_t *)(end_symbol_ptr + 1);
     }
+    else
+      fprintf(stderr,"\n");
 
     if (num_candidates) {
       if (scan_cycle > 1) {
@@ -2972,94 +2893,88 @@ main_symbol_substitution_loop_end:
       max_scores = 5000;
   } while ((num_candidates) && (num_simple_symbols + num_compound_symbols + MAX_SCORES < MAX_SYMBOLS_DEFINED));
 
-write_file:
-  if ((fd_out = fopen(argv[arg_num],"wb+")) == NULL) {
-    fprintf(stderr,"ERROR - unable to open output file '%s'\n",argv[arg_num]);
+  if ((outbuf = (uint8_t *)malloc(4 * (end_symbol_ptr - start_symbol_ptr) + 1)) == 0) {
+    fprintf(stderr,"ERROR - Compressed output buffer memory allocation failed\n");
     exit(EXIT_FAILURE);
   }
-  if (in_size) {
-    in_char_ptr = char_buffer;
-    *in_char_ptr++ = format;
-    in_symbol_ptr = start_symbol_ptr;
-    if (UTF8_compliant) {
-      while (in_symbol_ptr != end_symbol_ptr) {
-        uint32_t symbol_value;
-        symbol_value = *in_symbol_ptr++;
-        if (symbol_value < 0x80)
-          *in_char_ptr++ = (uint8_t)symbol_value;
-        else if (symbol_value < 0x800) {
-          *in_char_ptr++ = 0xC0 + (symbol_value >> 6);
-          *in_char_ptr++ = 0x80 + (symbol_value & 0x3F);
-        }
-        else if (symbol_value < 0x10000) {
-          *in_char_ptr++ = 0xE0 + (symbol_value >> 12);
-          *in_char_ptr++ = 0x80 + ((symbol_value >> 6) & 0x3F);
-          *in_char_ptr++ = 0x80 + (symbol_value & 0x3F);
-        }
-        else if (symbol_value < START_MY_SYMBOLS) {
-          *in_char_ptr++ = 0xF0 + (symbol_value >> 18);
-          *in_char_ptr++ = 0x80 + ((symbol_value >> 12) & 0x3F);
-          *in_char_ptr++ = 0x80 + ((symbol_value >> 6) & 0x3F);
-          *in_char_ptr++ = 0x80 + (symbol_value & 0x3F);
-        }
-        else if ((int)symbol_value >= 0) {
-          symbol_value -= START_MY_SYMBOLS;
-          *in_char_ptr++ = INSERT_SYMBOL_CHAR;
-          *in_char_ptr++ = (uint8_t)((symbol_value >> 16) & 0xFF);
-          *in_char_ptr++ = (uint8_t)((symbol_value >> 8) & 0xFF);
-          *in_char_ptr++ = (uint8_t)(symbol_value & 0xFF);
-        }
-        else {
-          symbol_value -= 0x80000000 + START_MY_SYMBOLS;
-          *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
-          *in_char_ptr++ = (uint8_t)((symbol_value >> 16) & 0xFF);
-          *in_char_ptr++ = (uint8_t)((symbol_value >> 8) & 0xFF);
-          *in_char_ptr++ = (uint8_t)(symbol_value & 0xFF);
-        }
+  in_char_ptr = outbuf;
+  *in_char_ptr++ = format;
+  in_symbol_ptr = start_symbol_ptr;
+  if (UTF8_compliant) {
+    while (in_symbol_ptr != end_symbol_ptr) {
+      uint32_t symbol_value;
+      symbol_value = *in_symbol_ptr++;
+      if (symbol_value < 0x80)
+        *in_char_ptr++ = (uint8_t)symbol_value;
+      else if (symbol_value < 0x800) {
+        *in_char_ptr++ = 0xC0 + (symbol_value >> 6);
+        *in_char_ptr++ = 0x80 + (symbol_value & 0x3F);
+      }
+      else if (symbol_value < 0x10000) {
+        *in_char_ptr++ = 0xE0 + (symbol_value >> 12);
+        *in_char_ptr++ = 0x80 + ((symbol_value >> 6) & 0x3F);
+        *in_char_ptr++ = 0x80 + (symbol_value & 0x3F);
+      }
+      else if (symbol_value < START_MY_SYMBOLS) {
+        *in_char_ptr++ = 0xF0 + (symbol_value >> 18);
+        *in_char_ptr++ = 0x80 + ((symbol_value >> 12) & 0x3F);
+        *in_char_ptr++ = 0x80 + ((symbol_value >> 6) & 0x3F);
+        *in_char_ptr++ = 0x80 + (symbol_value & 0x3F);
+      }
+      else if ((int)symbol_value >= 0) {
+        symbol_value -= START_MY_SYMBOLS;
+        *in_char_ptr++ = INSERT_SYMBOL_CHAR;
+        *in_char_ptr++ = (uint8_t)((symbol_value >> 16) & 0xFF);
+        *in_char_ptr++ = (uint8_t)((symbol_value >> 8) & 0xFF);
+        *in_char_ptr++ = (uint8_t)(symbol_value & 0xFF);
+      }
+      else {
+        symbol_value -= 0x80000000 + START_MY_SYMBOLS;
+        *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
+        *in_char_ptr++ = (uint8_t)((symbol_value >> 16) & 0xFF);
+        *in_char_ptr++ = (uint8_t)((symbol_value >> 8) & 0xFF);
+        *in_char_ptr++ = (uint8_t)(symbol_value & 0xFF);
       }
     }
-    else {
-      while (in_symbol_ptr != end_symbol_ptr) {
-        uint32_t symbol_value;
-        symbol_value = *in_symbol_ptr++;
-        if (symbol_value < INSERT_SYMBOL_CHAR)
-          *in_char_ptr++ = (uint8_t)symbol_value;
-        else if (symbol_value == INSERT_SYMBOL_CHAR) {
-          *in_char_ptr++ = INSERT_SYMBOL_CHAR;
-          *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
-        }
-        else if (symbol_value == DEFINE_SYMBOL_CHAR) {
-          *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
-          *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
-        }
-        else if ((int)symbol_value >= 0) {
-          symbol_value -= 0x100;
-          *in_char_ptr++ = INSERT_SYMBOL_CHAR;
-          *in_char_ptr++ = (uint8_t)((symbol_value >> 16) & 0xFF);
-          *in_char_ptr++ = (uint8_t)((symbol_value >> 8) & 0xFF);
-          *in_char_ptr++ = (uint8_t)(symbol_value & 0xFF);
-        }
-        else {
-          symbol_value -= 0x80000000 + 0x100;
-          *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
-          *in_char_ptr++ = (uint8_t)((symbol_value >> 16) & 0xFF);
-          *in_char_ptr++ = (uint8_t)((symbol_value >> 8) & 0xFF);
-          *in_char_ptr++ = (uint8_t)(symbol_value & 0xFF);
-        }
-      }
-    }
-    in_size = in_char_ptr - char_buffer;
-    write_ptr = char_buffer;
-    while (write_ptr + MAX_WRITE_SIZE < char_buffer + in_size) {
-      fwrite(write_ptr,1,MAX_WRITE_SIZE,fd_out);
-      write_ptr += MAX_WRITE_SIZE;
-      fflush(fd_out);
-    }
-    fwrite(write_ptr,1,char_buffer+in_size-write_ptr,fd_out);
   }
-  fclose(fd_out);
+  else {
+    while (in_symbol_ptr != end_symbol_ptr) {
+      uint32_t symbol_value;
+      symbol_value = *in_symbol_ptr++;
+      if (symbol_value < INSERT_SYMBOL_CHAR)
+        *in_char_ptr++ = (uint8_t)symbol_value;
+      else if (symbol_value == INSERT_SYMBOL_CHAR) {
+        *in_char_ptr++ = INSERT_SYMBOL_CHAR;
+        *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
+      }
+      else if (symbol_value == DEFINE_SYMBOL_CHAR) {
+        *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
+        *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
+      }
+      else if ((int)symbol_value >= 0) {
+        symbol_value -= 0x100;
+        *in_char_ptr++ = INSERT_SYMBOL_CHAR;
+        *in_char_ptr++ = (uint8_t)((symbol_value >> 16) & 0xFF);
+        *in_char_ptr++ = (uint8_t)((symbol_value >> 8) & 0xFF);
+        *in_char_ptr++ = (uint8_t)(symbol_value & 0xFF);
+      }
+      else {
+        symbol_value -= 0x80000000 + 0x100;
+        *in_char_ptr++ = DEFINE_SYMBOL_CHAR;
+        *in_char_ptr++ = (uint8_t)((symbol_value >> 16) & 0xFF);
+        *in_char_ptr++ = (uint8_t)((symbol_value >> 8) & 0xFF);
+        *in_char_ptr++ = (uint8_t)(symbol_value & 0xFF);
+      }
+    }
+  }
+
+  in_size = in_char_ptr - outbuf;
+  if ((outbuf = (uint8_t *)realloc(outbuf, in_size)) == 0) {
+    fprintf(stderr,"ERROR - Compressed output buffer memory reallocation failed\n");
+    exit(EXIT_FAILURE);
+  }
+  *outsize_ptr = in_size;
   free(start_symbol_ptr);
-  fprintf(stderr,"%u grammar productions created in %0.3f seconds.\n",
-      num_compound_symbols,(float)(clock()-start_time)/CLOCKS_PER_SEC);
-  return(0);
+  fprintf(stderr,"%u grammar productions created.\n", num_compound_symbols);
+  return(outbuf);
 }
