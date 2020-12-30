@@ -173,7 +173,6 @@ struct symbol_ends_data {
   uint8_t start;
   uint8_t end;
 } *symbol_ends;
-//uint8_t first_cycle = 0;
 
 
 uint8_t get_UTF8_context(uint32_t symbol) {
@@ -4414,18 +4413,6 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
   pthread_t overlap_check_threads[7], find_substitutions_threads[7];
 
 
-  if ((0 == (symbol_counts = (uint32_t *)malloc(0x900000 * sizeof(uint32_t))))
-      || (0 == (overlap_check_data = (struct overlap_check *)malloc(8 * sizeof(struct overlap_check))))) {
-    fprintf(stderr, "ERROR - memory allocation failed\n");
-    return(0);
-  }
-
-  if (0 == (symbol_ends = (struct symbol_ends_data *)malloc(0x900000 * sizeof(struct symbol_ends_data)))) {
-    fprintf(stderr, "ERROR - memory allocation failed\n");
-    return(0);
-  }
-
-  // Determine whether the RAM can be allocated, if not reduce size until malloc successful or RAM too small
   uint64_t max_memory_usage;
   if (sizeof(uint32_t *) >= 8)
     max_memory_usage = 0x800000000;
@@ -4446,10 +4433,21 @@ uint8_t GLZAcompress(size_t in_size, size_t * outsize_ptr, uint8_t ** iobuf, str
   else {
     user_set_production_cost = 0;
     create_words = 1;
-    max_rules = 0x900000;
+    max_rules = 0xC00000;
     fast_mode = 0;
   }
 
+  if (max_rules > (in_size >> 4) + 0x100000)
+    max_rules = (in_size >> 4) + 0x100000;
+
+  if ((0 == (symbol_counts = (uint32_t *)malloc(max_rules * sizeof(uint32_t))))
+      || (0 == (symbol_ends = (struct symbol_ends_data *)malloc(max_rules * sizeof(struct symbol_ends_data))))
+      || (0 == (overlap_check_data = (struct overlap_check *)malloc(8 * sizeof(struct overlap_check))))) {
+    fprintf(stderr, "ERROR - memory allocation failed\n");
+    return(0);
+  }
+
+  // Determine whether the RAM can be allocated, if not reduce size until malloc successful or RAM too small
   if (fast_mode == 0) {
     max_scores = MAX_SCORES;
     if (0 == (rank_scores_data_ptr
@@ -5894,8 +5892,8 @@ done_building_lcp_tree:
         }
       }
 
-      if (num_compound_symbols + num_candidates > max_rules)
-        num_candidates = max_rules - num_compound_symbols;
+      if (num_simple_symbols + num_compound_symbols + num_candidates > max_rules)
+        num_candidates = max_rules - num_simple_symbols - num_compound_symbols;
 
       // build a prefix tree of the match strings
       base_child_ptr_array = (struct match_node **)free_RAM_ptr;
@@ -7023,7 +7021,7 @@ main_symbol_substitution_loop_end2:
     }
     if (max_scores > 100 * num_candidates)
       max_scores = 100 * num_candidates;
-  } while ((num_candidates != 0) && (num_compound_symbols < max_rules));
+  } while ((num_candidates != 0) && (num_simple_symbols + num_compound_symbols < max_rules));
 
   free(symbol_counts);
   if (fast_mode == 0)

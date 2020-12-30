@@ -30,7 +30,6 @@ limitations under the License.
 #include "GLZAmodel.h"
 
 const uint32_t CHARS_TO_WRITE = 0x40000;
-const uint32_t MAX_SYMBOLS_DEFINED = 0x00900000;
 const uint32_t MAX_U32_VALUE = 0xFFFFFFFF;
 const uint64_t MAX_U64_VALUE = 0xFFFFFFFFFFFFFFFF;
 
@@ -1844,7 +1843,7 @@ void *write_output_thread() {
 uint8_t * GLZAdecode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint8_t * outbuf, FILE * fd_out,
     struct param_data * params) {
   uint8_t sym_type, next_write_buffer, i, j;
-  uint32_t max_symbols_defined, new_string_index;
+  uint32_t new_string_index;
   struct sym_data * sym_data_ptr;
   pthread_t output_thread;
 
@@ -1902,9 +1901,6 @@ uint8_t * GLZAdecode(size_t in_size, uint8_t * inbuf, size_t * outsize_ptr, uint
     i = 0xFF;
   }
 
-  max_symbols_defined = dictionary_size >> 1;
-  if (max_symbols_defined > MAX_SYMBOLS_DEFINED)
-    max_symbols_defined = MAX_SYMBOLS_DEFINED;
   if ((0 == (symbol_strings = (uint8_t *)malloc(dictionary_size)))
       || (0 == (queue_data = (struct sym_data2 *)malloc(0x100 * sizeof(struct sym_data2))))) {
     fprintf(stderr, "ERROR - memory allocation failed\n");

@@ -74,7 +74,7 @@ int main(int argc, char* argv[])
   params.delta_disabled = 0;
   params.fast_mode = 1;
   params.print_dictionary = 0;
-  params.max_rules = 0x900000;
+  params.max_rules = 0xA00000;
   params.use_mtf = 2;
   params.create_words = 1;
   params.two_threads = 1;
@@ -100,8 +100,8 @@ int main(int argc, char* argv[])
     }
     else if (*(argv[arg_num] + 1) == 'D') {
       params.max_rules = (uint32_t)atoi(argv[arg_num++] + 2);
-      if (params.max_rules > 0x900000)
-        params.max_rules = 0x900000;
+      if (params.max_rules > 0xC00000)
+        params.max_rules = 0xC00000;
     }
     else if (*(argv[arg_num] + 1) == 'c') {
       params.production_cost = (double)atof(argv[arg_num++] + 2);
